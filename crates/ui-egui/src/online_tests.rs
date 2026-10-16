@@ -1,5 +1,5 @@
-//! Home ▸ Online in the window: nothing is asked of a server until the section opens, then each
-//! server once; the rows (name, where, shared or not, when opened); a server that can't be
+//! The files shared online from this computer, on their server's page of the home screen: nothing
+//! is asked of a server until a page opens, then each server once; the rows (name, where, shared or not, when opened); a server that can't be
 //! reached; opening a file as its owner (its tab shows when it arrives); the row menu (stop and
 //! start sharing, copy the code and the link, rename, remove with its confirmation, forget); a
 //! file that is gone; the marks on tabs of files in a live session; toasts that name a file that
@@ -172,10 +172,15 @@ fn harness(records: Vec<Value>) -> (Harness, Shared) {
     (h, script)
 }
 
-/// Open the Online section from the sidebar; what it shows once the servers answered.
+/// Open the page of share.example from the sidebar; what it shows once the servers answered.
 fn open(h: &mut Harness) -> Vec<Shape> {
+    open_page(h, "share.example")
+}
+
+/// Open the page of the server called `name` from the sidebar.
+fn open_page(h: &mut Harness, name: &str) -> Vec<Shape> {
     let shapes = h.frames(1);
-    h.click(text_center(&shapes, "Online"));
+    h.click(text_center(&shapes, name));
     h.frames(4)
 }
 
@@ -208,14 +213,19 @@ fn owned_requests(script: &Shared) -> Vec<(String, usize)> {
 fn nothing_is_asked_until_the_section_opens_then_each_server_once() {
     let (mut h, script) = harness(vec![record(SERVER, "a", true), record(OTHER, "b", false), record(SERVER, "c", false)]);
     let shapes = h.frames(2);
-    assert!(has_text(&shapes, "Recents") && has_text(&shapes, "Online") && !has_text(&shapes, "Online files"));
+    // Each server of the files shared from here has its page, after your own servers.
+    for t in ["Recents", "Servers", figcraft_engine::servers::host(figcraft_engine::live::DEFAULT_SERVER), "share.example", "127.0.0.1:47900"] {
+        assert!(has_text(&shapes, t), "the sidebar has {t:?}");
+    }
+    assert!(!has_text(&shapes, "Online files"));
     assert!(script.lock().unwrap().asked.is_empty(), "the home screen alone asks nothing");
     let shapes = open(&mut h);
     assert!(has_text(&shapes, "Online files") && !has_text(&shapes, "Open files"));
     assert_eq!(owned_requests(&script), [(SERVER.to_string(), 2), (OTHER.to_string(), 1)]);
-    for t in ["File a", "File b", "File c", "share.example · Shared · Opened 2026-10-12", "127.0.0.1:47900 · Not shared · Opened 2026-10-12"] {
+    for t in ["File a", "File c", "share.example · Shared · Opened 2026-10-12"] {
         assert!(has_text(&shapes, t), "the list shows {t:?}: {:?}", texts(&shapes).iter().map(|t| t.0.clone()).collect::<Vec<_>>());
     }
+    assert!(!has_text(&shapes, "File b"), "a file on another server is on that server's page");
     let inspect = h.app.inspect();
     assert_eq!(
         (&inspect["online"]["open"], &inspect["online"]["files"][0]["state"], &inspect["online"]["files"][0]["hasOwnerToken"]),
@@ -229,6 +239,10 @@ fn nothing_is_asked_until_the_section_opens_then_each_server_once() {
     let (_, delay) = h.frame(vec![]);
     assert!(delay >= Duration::from_secs(1));
     assert_eq!(script.lock().unwrap().asked.len(), 2);
+    // The other server's page lists its file (the servers were asked already).
+    let shapes = open_page(&mut h, "127.0.0.1:47900");
+    assert!(has_text(&shapes, "File b") && has_text(&shapes, "127.0.0.1:47900 · Not shared · Opened 2026-10-12") && !has_text(&shapes, "File a"));
+    assert_eq!(script.lock().unwrap().asked.len(), 2);
     // Leaving and coming back asks again, once.
     let shapes = h.frames(1);
     let shapes = click(&mut h, &shapes, "Recents");
@@ -240,7 +254,7 @@ fn nothing_is_asked_until_the_section_opens_then_each_server_once() {
 #[test]
 fn an_empty_list_says_how_files_get_there_and_asks_no_server() {
     let (mut h, script) = harness(vec![]);
-    let shapes = open(&mut h);
+    let shapes = open_page(&mut h, figcraft_engine::servers::host(figcraft_engine::live::DEFAULT_SERVER));
     assert!(has_text(&shapes, "Nothing online yet. Use Share on a file to put it online and it is listed here."));
     assert!(script.lock().unwrap().asked.is_empty());
 }

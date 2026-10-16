@@ -29,6 +29,19 @@ use crate::{EngineError, Result, Session, bad, spec};
 /// Most servers you stay signed in to.
 pub const MAX_ACCOUNTS: usize = 50;
 
+/// How a server says your sessions there ended (an admin ended them, or took you off the server):
+/// the start of the reason the connection closes with (`figcraft_collab_net::hub::SIGNED_OUT`).
+pub const SIGNED_OUT: &str = "You were signed out of this server";
+
+/// What the transport says when the server no longer takes your session token.
+const SIGN_IN_ENDED: &str = "your sign-in to this server ended";
+
+/// `reason` (a session's end, a refusal, a failed request) says your sign-in to that server is
+/// over: it is forgotten, and nothing tries it again.
+pub fn session_ended(reason: &str) -> bool {
+    reason.starts_with(SIGNED_OUT) || reason.contains(SIGN_IN_ENDED)
+}
+
 /// You, signed in to a server (see the module docs).
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -52,7 +65,7 @@ impl std::fmt::Debug for SignedIn {
 }
 
 impl SignedIn {
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         json!({"server": self.server, "account": self.account, "name": self.name, "email": self.email, "admin": self.admin, "expires": self.expires})
     }
 }
@@ -101,11 +114,43 @@ pub fn server_of(link: &str) -> Option<String> {
     }
 }
 
+impl crate::live::Live {
+    /// The file this session is in on a server with accounts, as you are a member of it: the
+    /// server (as [`server_key`] keeps it) and the file's id there. From the file you published, or
+    /// the link you joined with.
+    pub fn account_file(&self) -> Option<(String, String)> {
+        let file_of = |link: &str| -> Option<String> {
+            // A sealed file's link carries its key after `#`.
+            let query = link.split('#').next()?.split_once('?')?.1;
+            query.split('&').filter_map(|p| p.split_once('=')).find(|(k, _)| *k == "file").map(|(_, v)| v.to_string())
+        };
+        let (server, file) = match (&self.published, &self.info) {
+            (Some(p), _) => {
+                let server = if self.server.trim().is_empty() { server_of(&p.edit).unwrap_or_default() } else { self.server.clone() };
+                (server, p.file.clone())
+            }
+            (None, Some(i)) => (server_of(&i.link).unwrap_or_default(), file_of(&i.link).unwrap_or_default()),
+            (None, None) => return None,
+        };
+        (!server.trim().is_empty() && !file.is_empty()).then(|| (server_key(&server), file))
+    }
+
+    /// The server this session's file is on ([`server_key`]), or empty.
+    pub(crate) fn account_server(&self) -> String {
+        match self.account_file() {
+            Some((server, _)) => server,
+            None if !self.joined.is_empty() => self.joined.clone(),
+            None if !self.server.trim().is_empty() => server_key(&self.server),
+            None => String::new(),
+        }
+    }
+}
+
 impl Session {
-    /// The server a command means: its `server`, else the one in Preferences.
+    /// The server a command means: its `server`, else the first server
+    /// ([`home_server`](Self::home_server)).
     pub(crate) fn account_server(&self, cmd: &str, p: &Value) -> Result<String> {
-        let s = string(p, "server").unwrap_or_else(|| self.prefs.publish_server.clone());
-        let s = if s.trim().is_empty() { crate::live::DEFAULT_SERVER.to_string() } else { s };
+        let s = string(p, "server").unwrap_or_else(|| self.home_server());
         if s.trim().is_empty() {
             return Err(bad(cmd, "no server: give `server` (wss://host/) or set one in Preferences"));
         }
@@ -116,6 +161,29 @@ impl Session {
     pub fn signed_in(&self, server: &str) -> Option<&SignedIn> {
         let key = server_key(server);
         self.prefs.accounts.iter().find(|a| a.server == key)
+    }
+
+    /// Your sign-in to `server` is over (`reason`: the server signed you out, or no longer takes
+    /// the session): it is forgotten here, and the app asks you to sign in again
+    /// (`account.signedOut`) rather than trying it again.
+    pub(crate) fn signed_out(&mut self, server: &str, reason: &str) {
+        if self.forget_sign_in(server, reason) {
+            self.request_ui("account.signedOut", json!({"server": server_key(server), "reason": reason}));
+        }
+    }
+
+    /// Forget your sign-in to `server` because of `reason` (the outcome the UI shows); false when
+    /// there was none.
+    pub(crate) fn forget_sign_in(&mut self, server: &str, reason: &str) -> bool {
+        if server.is_empty() || self.signed_in(server).is_none() {
+            return false;
+        }
+        let key = server_key(server);
+        self.prefs.accounts.retain(|a| a.server != key);
+        self.live.unsaved = true;
+        self.share_sign_ins();
+        self.accounts.last = Some(Err(reason.to_string()));
+        true
     }
 
     /// Tell the link where you are signed in (before it joins or publishes).
@@ -189,6 +257,10 @@ impl Session {
         };
         let session = me.session.clone();
         let reply = match self.net(NetRequest::Account { server: server.to_string(), session, req })?.0 {
+            NetReply::Account(Err(why)) if session_ended(&why) => {
+                self.signed_out(server, &why);
+                return Err(EngineError::Other(why));
+            }
             NetReply::Account(r) => r.map_err(EngineError::Other)?,
             _ => return Err(EngineError::Other("the link answered something else".into())),
         };
@@ -198,15 +270,19 @@ impl Session {
         }
     }
 
-    /// The file in front, on a server with accounts: its server and id.
-    fn account_file(&self, cmd: &str) -> Result<(String, String)> {
-        let live = self.live();
-        let published = live.published.as_ref().ok_or_else(|| bad(cmd, "the file in front isn't on a server (publish it first)"))?;
-        let server = if live.server.trim().is_empty() { server_of(&published.edit).unwrap_or_default() } else { live.server.clone() };
-        if server.is_empty() {
-            return Err(bad(cmd, "the file in front isn't on a server (publish it first)"));
+    /// The file command `cmd` means, on a server with accounts: its server and id. `file` (with
+    /// `server`, default the first server) names one; else the file in front.
+    fn account_file(&self, cmd: &str, p: &Value) -> Result<(String, String)> {
+        if let Some(file) = string(p, "file") {
+            return Ok((self.account_server(cmd, p)?, file));
         }
-        Ok((server_key(&server), published.file.clone()))
+        self.live().account_file().ok_or_else(|| bad(cmd, "the file in front isn't on a server (publish it first)"))
+    }
+
+    /// The file in front is on a server where you are signed in: its server and id (the Share
+    /// popover shows its people then).
+    pub fn people_file(&self) -> Option<(String, String)> {
+        self.live().account_file().filter(|(server, _)| self.signed_in(server).is_some())
     }
 }
 
@@ -221,7 +297,7 @@ fn flow_id(f: &Flow) -> &'static str {
     }
 }
 
-fn info_json(info: &ServerInfo) -> Value {
+pub(crate) fn info_json(info: &ServerInfo) -> Value {
     let providers: Vec<Value> = info
         .providers
         .iter()
@@ -415,17 +491,17 @@ fn files(s: &mut Session, p: &Value) -> Result<Value> {
     }
 }
 
-fn member_json(m: &Member) -> Value {
+pub(crate) fn member_json(m: &Member) -> Value {
     json!({"account": m.account, "name": m.name, "email": m.email, "role": role_id(m.role)})
 }
 
-fn invited_json(i: &Invited) -> Value {
+pub(crate) fn invited_json(i: &Invited) -> Value {
     json!({"email": i.email, "role": role_id(i.role)})
 }
 
-fn members(s: &mut Session, _p: &Value) -> Result<Value> {
+fn members(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "collab.members";
-    let (server, file) = s.account_file(CMD)?;
+    let (server, file) = s.account_file(CMD, p)?;
     match s.account_request(CMD, &server, AccountReq::Members { file: file.clone() })? {
         AccountReply::Members { members, invited } => Ok(json!({
             "server": server,
@@ -437,14 +513,14 @@ fn members(s: &mut Session, _p: &Value) -> Result<Value> {
     }
 }
 
-fn role(cmd: &str, p: &Value) -> Result<Role> {
+pub(crate) fn role(cmd: &str, p: &Value) -> Result<Role> {
     let r = string(p, "role").unwrap_or_else(|| "editor".into());
     Role::parse(&r).ok_or_else(|| bad(cmd, "`role` is owner, editor or viewer"))
 }
 
 fn invite(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "collab.invite";
-    let (server, file) = s.account_file(CMD)?;
+    let (server, file) = s.account_file(CMD, p)?;
     let email = req_string(CMD, p, "email")?;
     let role = role(CMD, p)?;
     s.account_request(CMD, &server, AccountReq::Invite { file, email: email.clone(), role })?;
@@ -456,7 +532,7 @@ fn invite(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn set_role(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "collab.setRole";
-    let (server, file) = s.account_file(CMD)?;
+    let (server, file) = s.account_file(CMD, p)?;
     let account = req_string(CMD, p, "account")?;
     let role = role(CMD, p)?;
     s.account_request(CMD, &server, AccountReq::SetRole { file, account: account.clone(), role })?;
@@ -467,7 +543,7 @@ fn set_role(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn remove_member(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "collab.removeMember";
-    let (server, file) = s.account_file(CMD)?;
+    let (server, file) = s.account_file(CMD, p)?;
     let req = match (string(p, "account"), string(p, "email")) {
         (Some(account), _) => AccountReq::RemoveMember { file, account },
         (None, Some(email)) => AccountReq::Uninvite { file, email },
@@ -528,28 +604,28 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "collab.members",
             "People in file",
-            "{} → {server, file, members: [{account, name, email, role}], invited: [{email, role}]}: who is in the file in front (on a server with accounts)",
+            "{file?, server? (a file of yours there; default: the file in front)} → {server, file, members: [{account, name, email, role}], invited: [{email, role}]}: who is in a file on a server with accounts",
             false,
             members
         ),
         spec!(
             "collab.invite",
             "Invite to file",
-            "{email, role? (owner | editor | viewer; default editor)} → {invited, role}: lets someone into the file in front by email (owners): at once if they signed in to the server before, else when they first do",
+            "{email, role? (owner | editor | viewer; default editor), file?, server?} → {invited, role}: lets someone into the file in front (or `file` on `server`) by email (owners): at once if they signed in to the server before, else when they first do",
             false,
             invite
         ),
         spec!(
             "collab.setRole",
             "Change role",
-            "{account, role} → {account, role}: owners change a member's role (a file keeps at least one owner)",
+            "{account, role, file?, server?} → {account, role}: owners change a member's role (a file keeps at least one owner)",
             false,
             set_role
         ),
         spec!(
             "collab.removeMember",
             "Remove from file",
-            "{account | email} → {removed}: owners take a member out of the file in front (they are disconnected at once) or take an invite back",
+            "{account | email, file?, server?} → {removed}: owners take a member out of the file in front (or `file` on `server`) (they are disconnected at once) or take an invite back",
             false,
             remove_member
         ),

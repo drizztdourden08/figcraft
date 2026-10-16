@@ -44,7 +44,8 @@ pub fn request_as_admin(
         _ => None,
     })? {
         SignInReply::SignedIn(_) => {}
-        SignInReply::Refused { reason } => return Err(format!("{REFUSED}{reason}")),
+        // As an account connection says it: the app forgets the sign-in and asks again.
+        SignInReply::Refused { reason } => return Err(format!("your sign-in to this server ended ({reason}): sign in again")),
         _ => return Err("the server didn't sign this session in".into()),
     }
     managed(ws, "", requests, limits)

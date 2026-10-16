@@ -1,4 +1,5 @@
-//! Home ▸ Online: the files you put on a server from this computer (`collab.files`), each with
+//! The files you put on a server from this computer (`collab.files`), on that server's page of the
+//! home screen ([`crate::account_ui::page`]), each with
 //! where it is, whether others get in and when it was last opened. A row opens its file as its
 //! owner; its menu starts or stops sharing, copies the join code or link, renames it on the
 //! server, removes it from the server (confirmed) or forgets it here. Nothing is asked of a
@@ -6,7 +7,7 @@
 //! background (the answer wakes the window), and one that can't be reached says so while the
 //! list shows what this computer remembers.
 
-use egui::{Align2, CornerRadius, Rect, Sense, Ui, pos2, vec2};
+use egui::{CornerRadius, Rect, Sense, Ui, pos2, vec2};
 use figcraft_engine::live::utc_date;
 use figcraft_engine::online::{FileState, OnlineFile, ServerProblem, server_host};
 use serde_json::{Value, json};
@@ -81,42 +82,44 @@ fn open(app: &mut FigApp, f: &OnlineFile) {
     }
 }
 
-/// The Online section of the home screen, in `main`.
-pub fn section(app: &mut FigApp, ui: &mut Ui, main: Rect, t: &Tokens) {
+/// Files you shared on `server` from this computer are recorded.
+pub fn has_files(app: &FigApp, server: &str) -> bool {
+    app.session.prefs.online_files.iter().any(|f| figcraft_engine::online::same_server(&f.server, server))
+}
+
+/// The files you shared on `server` from this computer (on that server's page of the home
+/// screen): asked about when the page shows, then listed with what this computer remembers.
+pub fn list(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     let ctx = ui.ctx().clone();
     // Shown again after something else was: ask the servers.
     let frame = ctx.cumulative_frame_nr();
     if app.ui.online.drawn.replace(frame).is_none_or(|d| d.saturating_add(1) < frame) {
         refresh(app, &ctx);
     }
-    ui.painter().text(main.min, Align2::LEFT_TOP, tr("Online files"), semibold(18.0), t.text);
-    let body = Rect::from_min_max(pos2(main.min.x, main.min.y + 40.0), pos2(main.min.x + main.width().min(720.0), main.max.y));
-    ui.scope_builder(egui::UiBuilder::new().max_rect(body).layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
-        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-        ui.spacing_mut().item_spacing.y = 6.0;
-        widgets::label(
-            ui,
-            tr("The files you shared or published online from this computer. They stay on their server until you remove them."),
-            t.text_secondary,
-        );
-        status(app, ui, t);
-        if let Some(session) = app.ui.live.home_join {
-            crate::live::join_status(app, ui, t, session);
+    ui.label(egui::RichText::new(tr("Online files")).font(semibold(12.0)).color(t.text_secondary));
+    widgets::label(
+        ui,
+        tr("The files you shared or published online from this computer. They stay on their server until you remove them."),
+        t.text_secondary,
+    );
+    status(app, ui, t);
+    if let Some(session) = app.ui.live.home_join {
+        crate::live::join_status(app, ui, t, session);
+    }
+    let files: Vec<OnlineFile> =
+        app.session.prefs.online_files.iter().filter(|f| figcraft_engine::online::same_server(&f.server, server)).cloned().collect();
+    if files.is_empty() {
+        ui.add_space(8.0);
+        widgets::label(ui, tr("Nothing online yet. Use Share on a file to put it online and it is listed here."), t.text_secondary);
+        return;
+    }
+    ui.add_space(6.0);
+    let busy = app.session.waiting_for(MANAGE);
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        for f in &files {
+            row(app, ui, t, f, busy);
         }
-        let files = app.session.prefs.online_files.clone();
-        if files.is_empty() {
-            ui.add_space(8.0);
-            widgets::label(ui, tr("Nothing online yet. Use Share on a file to put it online and it is listed here."), t.text_secondary);
-            return;
-        }
-        ui.add_space(6.0);
-        let busy = app.session.waiting_for(MANAGE);
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            for f in &files {
-                row(app, ui, t, f, busy);
-            }
-        });
     });
 }
 
@@ -316,7 +319,7 @@ pub fn inspect(app: &FigApp) -> Value {
         .map(|f| json!({"file": f.file, "name": f.name, "detail": detail(f), "shared": f.shared.is_some(), "state": f.state, "hasOwnerToken": true}))
         .collect();
     json!({
-        "open": app.ui.home_view.section == crate::home::Section::Online,
+        "open": matches!(app.ui.home_view.section, crate::home::Section::Server(_)),
         "files": files,
         "checking": app.session.waiting_for(FILES),
         "problems": app.session.live.servers.len(),

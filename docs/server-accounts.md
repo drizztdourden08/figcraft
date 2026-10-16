@@ -545,12 +545,31 @@ they had.
 
 ## Day to day
 
-People sign in from the app: the app's sign-in (when they connect to the server, or from its
-settings) lists the server's providers; **Sign in** opens the provider's page in the system
-browser, and the app comes back signed in. Where an app can't open a browser (`figcraft-cli`,
-agents through MCP), the device flow shows a code to type on another device; an `external`
-provider asks for the token. *The sign-in in the app and the CLI is being built (step 4 of
-[`accounts-and-e2e.md`](accounts-and-e2e.md#steps)); the server side described here is done.*
+People add the server in the app under **Preferences ▸ Servers** (a name and its address,
+`wss://figcraft.example.com/`); the browser build that a server hosts uses that server only. The
+home screen then has a page for the server, under **Servers** in its sidebar:
+
+- **Signing in**: the page lists the server's providers. One with a page shows **Sign in** (or
+  **Sign in with *Label*** when there are several): the provider's page opens in the system
+  browser, the page says *Finish signing in in your browser* (with **Cancel**) and comes back
+  signed in. One with the device flow shows the code to type (*Enter this code at …*, **Copy
+  code**, **Open the page**); in the browser build every sign-in uses the code. An `external`
+  provider shows a field for the token. A sign-in kept from before is checked when the page
+  opens, without asking anything; one the server no longer takes asks you to sign in again.
+  **Sign out** is on the same page.
+- **Your files here**: the files you are in, with your role; a click opens one (as a member, no
+  link needed). The people button at a row's end shows who is in it and lets owners change roles,
+  remove people, take invites back and **Invite** by email. **Put an open file here** publishes an
+  open file to the server as yours.
+- **Server admin** (admins only): **People** (end someone's sessions, **Remove…** them from the
+  server; when they are the last owner of files, **Make someone else owner** or **Remove
+  anyway**, and files left without an owner say so with **Give it an owner**), **Files** (each
+  file's members; change roles, add someone by email with a role) and **Status**.
+- The **Share** popover of a file on the server shows its **People** in the same way. To put a
+  file on the server from there, choose the server under **Online** and **Put on *server***.
+
+`figcraft-cli` and agents (MCP) use the same commands: `servers.*`, `account.*`, `collab.members`
+and the others below, `admin.*`.
 
 - **Publishing** a file to the server while signed in makes the publisher its **owner**; no server
   key is needed. A person owns at most 1,000 files on one server. With `accounts` the file gets no

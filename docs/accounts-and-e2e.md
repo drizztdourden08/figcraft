@@ -5,7 +5,7 @@ are built**: `crates/auth` (the sign-in types, the `IdentityProvider` and `Gate`
 `[auth]` and `[e2e]` settings, and with its `providers` feature the `oidc` and `external` providers
 and their registry), `Info` and `SignIn`, and accounts on `figcraft-server`: people and sessions,
 members and invites per file, roles in sessions, account connections, admins (see
-[`server.md`](server.md#accounts-sign-in)). **Step 4 is built** in the engine and the transport: `account.info`, `account.signIn` (browser with PKCE and a loopback redirect, device code with `account.signInPoll`, token), `account.signOut`, `account.status`, `account.files`, and `collab.members`, `collab.invite`, `collab.setRole`, `collab.removeMember` for the file in front; session tokens are kept with the preferences (like owner tokens) and sent before each hello on that server; publishing while signed in makes the file yours, and members join with a link that carries no secret. The app's screens for it come next. **Step 6 is built**: `crates/collab-seal` (file keys
+[`server.md`](server.md#accounts-sign-in)). **Step 4 is built** in the engine and the transport: `account.info`, `account.signIn` (browser with PKCE and a loopback redirect, device code with `account.signInPoll`, token), `account.signOut`, `account.status`, `account.files`, and `collab.members`, `collab.invite`, `collab.setRole`, `collab.removeMember` for the file in front; session tokens are kept with the preferences (like owner tokens) and sent before each hello on that server; publishing while signed in makes the file yours, and members join with a link that carries no secret. The app's screens are built too: Preferences ▸ Servers lists the remote servers you use (`servers.add`, `servers.remove`, `servers.move`, `servers.list`); the home screen has a page for each, where you sign in (a cached sign-in is checked silently with `account.check`; the browser flow, a device code, or a token field, one per provider), see your files there and their people, put an open file there, and (admins) use the server's admin tools (`admin.people`, `admin.files`, `admin.fileMembers`, `admin.setFileRole`, `admin.addFileMember`, `admin.removePerson`, `admin.endSessions`, `admin.status`); the Share popover shows a file's people. A session the server ends (`SIGNED_OUT`) forgets the sign-in and asks for it again. **Step 6 is built**: `crates/collab-seal` (file keys
 and keyrings, sealing and opening values and changes, entry ids, device keys and HPKE wrapping,
 link keys, recovery keys). **Step 7 is built**: sealed files on `figcraft-server` (`[e2e]` accepts
 `off`, `optional` and `required`): the session server for sealed files (`OpaqueReplica` and
@@ -823,7 +823,7 @@ members and keyrings and builds the providers from its config.
 1. **This document.**
 2. `crates/auth`, `Info`, and the server advertising it (no visible change).
 3. OpenID Connect provider, accounts on the server (people, sessions, members, roles).
-4. Sign-in in the app and `figcraft-cli` (browser, device, token flows), the Share dialog's people.
+4. Sign-in in the app and `figcraft-cli` (browser, device, token flows), the Share dialog's people. *(Built: see the status above.)*
 5. `external` provider and its reference verifier (built: the provider with step 3, the example
    verifier in `examples/auth-verifier/`).
 6. `crates/collab-seal`.

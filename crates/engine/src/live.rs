@@ -365,6 +365,10 @@ pub enum NetRequest {
     /// A request on your account at the server at `server`, signed in with `session`
     /// ([`LiveLink::accounts`]).
     Account { server: String, session: String, req: AccountReq },
+    /// A request as an admin of the server at `server` (their email is in its `admins`), signed in
+    /// with `session` ([`LiveLink::accounts`]): people, files and their members, the server's
+    /// status.
+    Admin { server: String, session: String, req: Admin },
 }
 
 impl NetRequest {
@@ -374,7 +378,7 @@ impl NetRequest {
             NetRequest::Plugins { .. } => crate::plugin_directory::NO_DIRECTORY,
             NetRequest::Library { .. } | NetRequest::Upload(_) => NO_TEAM_LIBRARIES,
             NetRequest::Hosting { .. } | NetRequest::Share { .. } => NO_HOSTING,
-            NetRequest::Info { .. } | NetRequest::SignIn { .. } | NetRequest::Account { .. } => NO_ACCOUNTS,
+            NetRequest::Info { .. } | NetRequest::SignIn { .. } | NetRequest::Account { .. } | NetRequest::Admin { .. } => NO_ACCOUNTS,
         }
     }
 
@@ -389,6 +393,7 @@ impl NetRequest {
             NetRequest::Info { .. } => |why| NetReply::Info(Err(why)),
             NetRequest::SignIn { .. } => |why| NetReply::SignIn(Err(why)),
             NetRequest::Account { .. } => |why| NetReply::Account(Err(why)),
+            NetRequest::Admin { .. } => |why| NetReply::Admin(Err(why)),
         }
     }
 
@@ -411,6 +416,9 @@ impl NetRequest {
             (NetRequest::Account { server: a, req: x, .. }, NetRequest::Account { server: b, req: y, .. }) => {
                 a == b && discriminant(x) == discriminant(y)
             }
+            (NetRequest::Admin { server: a, req: x, .. }, NetRequest::Admin { server: b, req: y, .. }) => {
+                a == b && discriminant(x) == discriminant(y)
+            }
             _ => false,
         }
     }
@@ -429,6 +437,7 @@ pub enum NetReply {
     Info(std::result::Result<ServerAbout, String>),
     SignIn(std::result::Result<SignInReply, String>),
     Account(std::result::Result<AccountReply, String>),
+    Admin(std::result::Result<AdminReply, String>),
 }
 
 /// What a session without the network says about signing in to servers.
@@ -550,8 +559,8 @@ pub trait LiveLink: Send {
     fn share(&mut self, _server: &str, _file: &str, _owner: &str, _revoke: &[String], _create: bool) -> std::result::Result<Option<Shared>, String> {
         Err(NO_HOSTING.into())
     }
-    /// See [`NetRequest::Info`], [`NetRequest::SignIn`] and [`NetRequest::Account`]; waits for the
-    /// server. Errors never echo a token.
+    /// See [`NetRequest::Info`], [`NetRequest::SignIn`], [`NetRequest::Account`] and
+    /// [`NetRequest::Admin`]; waits for the server. Errors never echo a token.
     fn accounts(&mut self, req: NetRequest) -> NetReply {
         req.failure()(NO_ACCOUNTS.into())
     }
@@ -581,7 +590,7 @@ pub trait LiveLink: Send {
     /// Send `req` and wait for the answer (through the methods above).
     fn request(&mut self, req: NetRequest) -> NetReply {
         match req {
-            req @ (NetRequest::Info { .. } | NetRequest::SignIn { .. } | NetRequest::Account { .. }) => self.accounts(req),
+            req @ (NetRequest::Info { .. } | NetRequest::SignIn { .. } | NetRequest::Account { .. } | NetRequest::Admin { .. }) => self.accounts(req),
             NetRequest::Share { server, file, owner, revoke, create } => NetReply::Share(self.share(&server, &file, &owner, &revoke, create)),
             NetRequest::Plugins { server, req } => NetReply::Plugins(self.plugins(&server, req)),
             NetRequest::Library { link, req } => NetReply::Library(self.library(&link, req)),
@@ -654,6 +663,9 @@ pub struct Live {
     /// The address of the server this session's file was published to, or is yours on (empty
     /// otherwise; it may carry the server's key: never shown).
     pub server: String,
+    /// The server of the link this session joined ([`crate::accounts::server_key`]; empty for one
+    /// this app hosts or publishes): where a sign-in it was refused for belongs.
+    pub joined: String,
     /// The file you published to a server in this session, or one of yours you opened again
     /// (`collab.openFile`: without its owner token, which stays in the record), with its links.
     pub published: Option<Published>,
@@ -1047,7 +1059,14 @@ impl Session {
         let open = self.docs.iter().find(|d| Some(d.uid) == live.doc_uid).map(|d| d.doc.name.as_str());
         let behind = open.or(live.file_name()).filter(|_| live.tab != front).map(|n| format!(" {n}")).unwrap_or_default();
         match e {
-            Event::Status(Status::Failed { reason }) => self.live_fail(id, reason),
+            Event::Status(Status::Failed { reason }) => {
+                // A sign-in the server no longer takes: forgotten here, and the app asks again.
+                if crate::accounts::session_ended(&reason) {
+                    let server = live.account_server();
+                    self.signed_out(&server, &reason);
+                }
+                self.live_fail(id, reason)
+            }
             Event::Status(Status::Off) => {
                 self.live.end(id);
             }
@@ -1113,6 +1132,10 @@ impl Session {
             // order.
             Event::Sync(msg) => live.deferred.push(msg),
             Event::Ended { reason } => {
+                if crate::accounts::session_ended(&reason) {
+                    let server = live.account_server();
+                    self.signed_out(&server, &reason);
+                }
                 self.message = Some(if behind.is_empty() { reason } else { format!("{}: {reason}", behind.trim_start()) });
                 self.live.end(id);
             }
@@ -2007,8 +2030,9 @@ pub(crate) fn start_join(
     };
     let (id, ()) = s.live.start(cmd, |l, id| l.join_resuming(id, &link, &name, resume).map_err(|e| bad(cmd, e)))?;
     let server = share.as_ref().map(|s| s.server.clone()).unwrap_or_default();
+    let joined = crate::accounts::server_of(&link).map(|s| crate::accounts::server_key(&s)).unwrap_or_default();
     // The session's file opens in a tab of its own; until then the join shows on this one.
-    s.live.open(Live { id, status: Status::Connecting, tab, server, published, share, ..Live::default() });
+    s.live.open(Live { id, status: Status::Connecting, tab, server, joined, published, share, ..Live::default() });
     Ok(id)
 }
 

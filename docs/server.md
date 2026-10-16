@@ -51,9 +51,10 @@ Releases also ship it ready-built for Linux (`figcraft-server-<version>-linux-x8
 figcraft-server --data /srv/figcraft key
 ```
 
-prints the address to publish to, `ws://<host>:47900/?key=<server key>`. In the desktop app,
-**File ▸ Publish to server…** (or **Share ▸ Advanced ▸ Publish to another server…**) asks for that address and the
-file's name. The open file is uploaded as a new file and the tab keeps syncing through the
+prints the address to publish to, `ws://<host>:47900/?key=<server key>`. Agents and scripts
+publish with it (`collab.publish {server, name?}`); in the desktop app the operator's Publish to
+server dialog (the `collab.publish` menu command, run from the Actions palette) asks for that
+address and the file's name. The open file is uploaded as a new file and the tab keeps syncing through the
 server; until the upload is done the tab is read-only ("Publishing…" in the toolbar). The Share
 popover then shows an **edit link** and a **view link** to copy. Agents do the same with
 `collab.publish {server, name?}` ([`mcp.md`](mcp.md#live-sessions)).
@@ -65,7 +66,8 @@ On a server [open to the public](#running-a-public-server) the address alone is 
 (`wss://figcraft.example.com/`): the dialog asks the server first and shows that no key is needed,
 who runs it ("Hosted by …" and a link to its terms) and how long unopened files are kept. Publishing
 then also gives an **owner token**, shown once with the links in a **File published** window. The
-app keeps it with your preferences and lists the file under [Home ▸ Online](#your-online-files),
+app keeps it with your preferences and lists the file on [the server's page of the home
+screen](#your-online-files),
 where it can be opened, shared, renamed and removed later without the token in hand; copy it if
 you want to manage the file from another computer or a script (`collab.manageFile` from
 [MCP](mcp.md#live-sessions)). The Share popover shows the server's line
@@ -74,11 +76,12 @@ and the date the server deletes the file unless someone opens it.
 ## Sharing with a join code
 
 **Share ▸ Online ▸ Start sharing** in the app (`collab.share`) is the short way to do all of the
-above on a server open to the public: it publishes the open file to the server in **Preferences ▸
-Server for online sharing** (the FigCraft server unless you put yours there; Reset goes back; empty
-turns online sharing off), then shows a **join code** such as `K7M-2QX-9TD` in place of the links.
+above on a server open to the public: it publishes the open file to the server chosen under
+**Online** (your servers are listed in **Preferences ▸ Servers**; the FigCraft server unless you
+changed the list; with no server, only the local network is offered), then shows a **join code** such as `K7M-2QX-9TD` in place of the links.
 Someone else types it under **Share ▸ Join with a code** (or on the home screen, or
-`collab.join {code}`) with the same server in their Preferences, and is in the file. The popover
+`collab.join {code}`) with the same server first in their Preferences ▸ Servers, and is in the
+file. The popover
 switches between the code that lets people edit and the one that only lets them view.
 
 The file is its owner's: the app keeps the file's first links and its owner token for itself and
@@ -89,10 +92,12 @@ copy they have), and the owner stays in the file, which stays on the server, ope
 **Start sharing** again gives the same file new links and codes. **Share ▸ Advanced ▸ Remove from
 server…** (it asks first) takes the file off the server; closing the tab or quitting changes
 nothing on the server, and the file is still yours afterwards: see
-[Your online files](#your-online-files). To use **your** server for this, set its address
-(`wss://figcraft.example.com/`) in Preferences on every machine that shares or joins; a server
-that needs its key is reached under **Advanced ▸ Publish to another server…**, or with
-`collab.share {server: "wss://…/?key=…"}`, and gets codes too.
+[Your online files](#your-online-files). To use **your** server for this, add its address
+(`wss://figcraft.example.com/`) in Preferences ▸ Servers on every machine that shares or joins
+(first in the list for typed codes); a server that needs its key is reached with
+`collab.share {server: "wss://…/?key=…"}`, and gets codes too. On a server with
+[accounts](server-accounts.md) files have members instead: **Put on *server*** publishes the file
+as yours and the popover shows its people.
 
 - **A code is a name for one share link**: nine symbols, 45 random bits, from an alphabet without
   look-alike characters (typing ignores case, spaces and dashes). The server hands one out when
@@ -121,7 +126,8 @@ A file you put on a server without its key is yours, and stays where it is when 
 the app quits. The app remembers each one **with your preferences on this computer** (never in the
 document): the server, the file's id and name, its owner token, your own links to it, when you put
 it there and last opened it, and the code and links others join with while it is shared. The home
-screen lists them under **Online**:
+screen lists them on each server's page (under **Servers** in its sidebar; a server that isn't in
+Preferences ▸ Servers still has a page while you have files there), as **Online files**:
 
 - **A row** shows the file's name, the server, **Shared** or **Not shared**, and when you last
   opened it. Clicking it opens the file as its owner, in step with the server, in a tab of its

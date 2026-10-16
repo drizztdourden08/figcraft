@@ -313,7 +313,9 @@ impl LiveLink for NetLink {
                 NetRequest::Upload(o) => NetReply::Upload(upload(o, &limits)),
                 NetRequest::Hosting { server, file, owner, req } => NetReply::Hosting(hosting(&server, &file, &owner, req, &limits)),
                 NetRequest::Share { server, file, owner, revoke, create } => NetReply::Share(share(&server, &file, &owner, &revoke, create, &limits)),
-                req @ (NetRequest::Info { .. } | NetRequest::SignIn { .. } | NetRequest::Account { .. }) => accounts(req, &limits),
+                req @ (NetRequest::Info { .. } | NetRequest::SignIn { .. } | NetRequest::Account { .. } | NetRequest::Admin { .. }) => {
+                    accounts(req, &limits)
+                }
             };
             inbox.push(Event::Net { job, reply: Box::new(reply) });
         });
@@ -391,7 +393,8 @@ impl LiveLink for NetLink {
     }
 }
 
-/// What the server says it accepts, a sign-in step, or a request on your account there.
+/// What the server says it accepts, a sign-in step, a request on your account there, or one as
+/// its admin.
 fn accounts(req: NetRequest, limits: &NetLimits) -> NetReply {
     match req {
         NetRequest::Info { server } => NetReply::Info(Endpoint::parse(&server).and_then(|(e, _)| manage::about(&e, limits, CONNECT))),
@@ -399,6 +402,11 @@ fn accounts(req: NetRequest, limits: &NetLimits) -> NetReply {
         NetRequest::Account { server, session, req } => NetReply::Account(
             Endpoint::parse(&server)
                 .and_then(|(e, _)| manage::account(&e, &session, vec![req], limits, CONNECT))
+                .and_then(|r| r.into_iter().next().ok_or_else(|| "the server didn't answer".to_string())),
+        ),
+        NetRequest::Admin { server, session, req } => NetReply::Admin(
+            Endpoint::parse(&server)
+                .and_then(|(e, _)| manage::request_as_admin(&e, &session, vec![req], limits, CONNECT))
                 .and_then(|r| r.into_iter().next().ok_or_else(|| "the server didn't answer".to_string())),
         ),
         other => other.failure()("not an account request".into()),
