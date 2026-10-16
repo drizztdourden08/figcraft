@@ -12,12 +12,23 @@
 //!   provider needs, supplied by the server so this crate opens no sockets).
 //! - [`policy`]: who may sign in once a provider vouched for them, and who is an admin.
 //! - [`config`]: the `[auth]` and `[e2e]` settings of `server.toml`.
+//! - With the `providers` feature: [`oidc`] (any OpenID Connect issuer; Google and GitLab are
+//!   presets), [`external`] (a verifier the operator runs) and the [`registry`] that builds them
+//!   from `[[auth.provider]]` and takes kinds of your own.
 //! - [`Gate`]: what a host asks before a connection's first message: what it accepts and who this
 //!   is. [`Links`] is today's behaviour (no accounts).
 
 pub mod config;
+#[cfg(feature = "providers")]
+pub mod external;
+#[cfg(feature = "providers")]
+pub mod jwt;
+#[cfg(feature = "providers")]
+pub mod oidc;
 pub mod policy;
 pub mod provider;
+#[cfg(feature = "providers")]
+pub mod registry;
 pub mod wire;
 
 pub use config::{AuthConfig, E2eConfig, ProviderConfig};
@@ -61,5 +72,8 @@ impl Gate for Links {
     }
 }
 
+#[cfg(test)]
+#[cfg(feature = "providers")]
+mod providers_tests;
 #[cfg(test)]
 mod tests;
