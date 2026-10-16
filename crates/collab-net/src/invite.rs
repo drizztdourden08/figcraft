@@ -14,6 +14,13 @@
 //! A join by code names the server to ask and the code:
 //! `figcraft://join?server=<ws(s)://…>&code=<code>` ([`Invite::parse_join`]); the server says which
 //! file and token the code stands for.
+//!
+//! A sealed (end-to-end encrypted) file's link carries its key after `#`: `…&token=…#k=<key>`
+//! (and a member's link on a server with accounts `…&file=…#k=<key>`). The fragment never leaves
+//! the app: it isn't in the WebSocket request ([`Invite::endpoint`]), in a hello or in any error,
+//! and `Debug` doesn't print the key ([`FileKey`]).
+
+use figcraft_collab_seal::{FileKey, link_fragment, parse_link_fragment};
 
 /// Where a session or a server listens: `ws://host:port/path` or `wss://…` (TLS).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +41,9 @@ pub struct Invite {
     pub file: String,
     /// The link's secret.
     pub token: String,
+    /// A sealed file's key, from the link's `#k=…` (`None`: the file isn't sealed, or the link
+    /// doesn't say).
+    pub key: Option<FileKey>,
 }
 
 /// Longest link accepted (anything longer isn't one of ours).
@@ -109,23 +119,36 @@ impl Endpoint {
 impl Invite {
     /// An invite for a plain `ws://host/` endpoint.
     pub fn new(host: impl Into<String>, file: impl Into<String>, token: impl Into<String>) -> Self {
-        Self { server: Endpoint::plain(host), file: file.into(), token: token.into() }
+        Self { server: Endpoint::plain(host), file: file.into(), token: token.into(), key: None }
     }
 
-    /// The `figcraft://join?…` link (without `&token=…` for a member's link: [`member`](Self::member)).
+    /// The same invite with a sealed file's key (its links end with `#k=…`).
+    pub fn with_key(mut self, key: Option<FileKey>) -> Self {
+        self.key = key;
+        self
+    }
+
+    /// `#k=…` for a sealed file, else nothing.
+    fn fragment(&self) -> String {
+        self.key.as_ref().map(|k| format!("#{}", link_fragment(k))).unwrap_or_default()
+    }
+
+    /// The `figcraft://join?…` link (without `&token=…` for a member's link: [`member`](Self::member);
+    /// with `#k=…` for a sealed file).
     pub fn link(&self) -> String {
         let token = if self.member() { String::new() } else { format!("&token={}", self.token) };
+        let key = self.fragment();
         if self.server.is_plain() {
-            format!("figcraft://join?host={}&file={}{token}", self.server.host, self.file)
+            format!("figcraft://join?host={}&file={}{token}{key}", self.server.host, self.file)
         } else {
-            format!("figcraft://join?server={}&file={}{token}", self.server.url(), self.file)
+            format!("figcraft://join?server={}&file={}{token}{key}", self.server.url(), self.file)
         }
     }
 
-    /// The same session as a WebSocket URL.
+    /// The same session as a WebSocket URL (with `#k=…` for a sealed file: never sent).
     pub fn url(&self) -> String {
         let token = if self.member() { String::new() } else { format!("&token={}", self.token) };
-        format!("{}?file={}{token}", self.server.url(), self.file)
+        format!("{}?file={}{token}{}", self.server.url(), self.file, self.fragment())
     }
 
     /// A link without a secret: on a server with accounts, members join by who they are.
@@ -158,6 +181,15 @@ impl Invite {
         if link.len() > MAX_LINK {
             return Err(NOT.into());
         }
+        // A sealed file's key, after `#` (other fragments are ignored).
+        let (link, key) = match link.split_once('#') {
+            Some((link, fragment)) if fragment.split('&').any(|p| p.starts_with("k=")) => {
+                let key = parse_link_fragment(fragment).map_err(|_| "the invite link's key (after #k=) isn't one: copy the whole link again")?;
+                (link, Some(key))
+            }
+            Some((link, _)) => (link, None),
+            None => (link, None),
+        };
         let (scheme, rest) = link.split_once("://").ok_or(NOT)?;
         let (server, query) = if scheme.eq_ignore_ascii_case("figcraft") {
             let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
@@ -181,7 +213,7 @@ impl Invite {
         if let Some(code) = get("code") {
             let code = figcraft_collab::code::normalize(&code).ok().filter(|c| c.len() == figcraft_collab::code::ONLINE_LEN);
             let code = code.ok_or("the link's join code isn't one")?;
-            return Ok((Invite { server, file: String::new(), token: String::new() }, Some(code)));
+            return Ok((Invite { server, file: String::new(), token: String::new(), key }, Some(code)));
         }
         let file = get("file").filter(|f| valid_id(f, 1, 64)).ok_or("the invite link has no valid file id")?;
         // No token: a member's link on a server with accounts (who you are lets you in).
@@ -190,7 +222,7 @@ impl Invite {
             Some(t) if valid_id(&t, 16, 128) => t,
             Some(_) => return Err("the invite link has no valid token".into()),
         };
-        Ok((Invite { server, file, token }, None))
+        Ok((Invite { server, file, token, key }, None))
     }
 }
 

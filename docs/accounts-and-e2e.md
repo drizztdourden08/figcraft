@@ -11,7 +11,10 @@ link keys, recovery keys). **Step 7 is built**: sealed files on `figcraft-server
 `off`, `optional` and `required`): the session server for sealed files (`OpaqueReplica` and
 `OpaqueServer` in `crates/collab`), the sealed session messages, publishing, storing, compacting
 and catching up on sealed files (see *Protocol additions* and [`server.md`](server.md#sealed-files)).
-The app doesn't seal yet (step 8). Sections say what is built as the implementation lands. Builds on [`collab-protocol.md`](collab-protocol.md)
+**Step 8 is built**: sealing in the app (see *Sealing in the app*): `collab.publish {sealed}` and
+`collab.share {sealed}` publish a sealed file (with the server's key, as anyone may on an open
+server, or as yours when signed in), its links carry the key after `#k=`, the transport seals and
+opens around the sync client, and the publisher's app keeps the key with its preferences. Sections say what is built as the implementation lands. Builds on [`collab-protocol.md`](collab-protocol.md)
 (live sessions) and [`server.md`](server.md) (running `figcraft-server`).
 
 Goal: a `figcraft-server` can (1) let people in by **who they are** instead of only by share links,
@@ -335,6 +338,55 @@ list if one was set, the entries there when its order was last set, the order, t
 since, removals from the whole list), so a client that joins later opens the same document as one
 that saw every batch. `Reject` fixes are the current sealed values of what the batch touched.
 
+### Sealing in the app (built, step 8)
+
+- **Where it happens.** In the transport (`crates/collab-net`, `sealing.rs`), shared by the native
+  guest and the browser driver: what the engine's sync client sends is sealed on its way out
+  (`Changes` → `SealedChanges`, `Presence` → `SealedPresence` with the app's client id once the
+  welcome said it, a chat `Signal` → `SealedSignal`; a spotlight stays plain) and what arrives is
+  opened (`SealedWelcome`, `SealedChanges`, `SealedReject` → `Welcome`, `Changes`, `Reject`;
+  `SealedPresence` and `SealedSignal` → plain ones with the sender's id). The engine only ever sees
+  plain messages. `message::client_version()` announces `sealed`.
+- **Skipping what doesn't open.** A change that doesn't open (a wrong key, changed bytes, an entry
+  name that doesn't hash to its id) is left out of its batch and the rest is applied. The server
+  orders every batch and sends everyone the same bytes, and opening is deterministic (the same
+  keyring, file id and slot open a value or don't), so every app leaves out exactly the same
+  changes, in the same place: their copies stay the same. Presence or a chat that doesn't open is
+  dropped. A welcome whose document opens to nothing means the key is wrong: the join ends ("The
+  link's key doesn't open this file").
+- **Mismatches.** Without a key, a sealed welcome ends the join ("join it with its whole link,
+  including the key after #k="); join codes can't carry the key, so the app makes none for sealed
+  files (their share links only). With a key, a plain welcome or plain changes end the join (a
+  server that hands out a file meant to be sealed in the clear isn't trusted with it), and plain
+  presence and chat are dropped.
+- **Links mode.** The key travels in the link's fragment:
+  `figcraft://join?server=…&file=…&token=…#k=…` (a member's link on a server with accounts:
+  `…&file=…#k=…`). `Invite` parses it into `key`; it is never in the WebSocket request, a hello, an
+  error or `Debug`.
+- **Publishing.** `collab.publish {server, sealed?}` (and `collab.share {sealed?}` online): `true`
+  seals (refused before anything is sent when the server's `Info` says `e2e` is `off`, or the
+  server is older than accounts), `false` doesn't, and without it the file is sealed when the
+  server says `required`. The app makes a `FileKey`, picks a 16-hex-digit file id, seals
+  `Replica::snapshot()` and the name for it, and publishes with `Admin::PublishSealed` (server key,
+  or open hosting) or `AccountReq::PublishSealed` (signed in), with a new id when the server says
+  the id is taken; then it joins the file sealed. `Published`'s links (and the links
+  `collab.share` makes) end with `#k=…`.
+- **Keys kept by the publisher (accounts mode, until step 9).** The engine keeps each published
+  sealed file's key with the preferences (`Prefs::file_keys`: server, file id, the `k=…` fragment;
+  passwords like owner tokens: on this computer only, in no command result other than the share
+  links, not in `Debug`). Joining a link without a fragment adds the kept key, so the owner opens
+  their files from `account.files` (`figcraft://join?server=…&file=…`) on this computer.
+- **Names.** `account.files` and `collab.files` open a sealed file's listed name
+  (`parse_sealed_name`) with the kept key or the record's link and say `sealed: true`; without a
+  key the name is "Encrypted file". `collab.manageFile {action: "rename"}` seals the new name
+  (`RenameSealed`); `createLink` adds the key to the new link. `collab.peers` says `sealed: true`
+  for a sealed session.
+- **Left for step 9 and later.** Members on a server with accounts get the key only through a link
+  that carries it (the owner's other devices too): per-device keyrings on the server, wrapping keys
+  for invited members, recovery and key rotation are step 9. A hostile editor's value that opens
+  but breaks a value rule still fails the sync client's strict check (the lenient value checks are
+  part of hardening, step 10), as do sealed team libraries.
+
 ## Crates
 
 | Crate | Layer | Holds |
@@ -365,7 +417,7 @@ members and keyrings and builds the providers from its config.
    verifier in `examples/auth-verifier/`).
 6. `crates/collab-seal`.
 7. **Built**: `OpaqueReplica` and `OpaqueServer` (in `crates/collab`) and sealed files on the server.
-8. Sealing in the app; sealed links.
+8. **Built**: sealing in the app; sealed links.
 9. Sealed files with accounts: keyrings, invites, devices, recovery.
 10. Edges (sealed team libraries, CLI and MCP) and hardening (editor signatures, key-change
     warnings).

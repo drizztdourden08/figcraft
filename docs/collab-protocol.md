@@ -186,6 +186,13 @@ welcome, and a client sends `Report` only to a server that sent it one. New vari
 at the end of an enum, and existing messages keep their fields, so nothing an older peer reads
 changes.
 
+**Sealed files** came later within version 2 the same way: a client that seals and opens the
+sealed session messages says so with the word `sealed` in its hello's `client_version`
+(`"0.6.0 signals hosting sealed"`); a sealed file refuses clients that don't, and plain files never
+send them sealed messages. The app's transport seals what its sync client sends and opens what
+arrives, so the client and the engine only see the plain messages (see
+[`accounts-and-e2e.md`](accounts-and-e2e.md#sealing-in-the-app-built-step-8)).
+
 **Join codes** came later within version 2 the same way: a connection that opens with `Resolve`
 asks a server which file a code opens, and `Admin code` asks it for a link's code. Both are new
 variants at the end of their enums, so everything an older peer reads is unchanged. A server from
@@ -953,8 +960,9 @@ chooses to share on the network; the default is the invite link with a random to
   tells nothing about files someone doesn't own; it counts against the address's message limit
   like any other). Everything else
   (listing files, other files' links, reports, blocks, the plugin directory's publishing) needs the
-  server key. Files are not end-to-end encrypted: the server reads what it keeps, and so can its
-  operator.
+  server key. Files are not end-to-end encrypted unless they are sealed: the server reads a plain
+  file it keeps, and so can its operator (sealed files:
+  [`accounts-and-e2e.md`](accounts-and-e2e.md#sealed-files)).
 - **Join codes** are weaker secrets than links by design (45 bits online, 44 on the local
   network): online they stand on the server's limits on wrong codes, locally on how fast a host
   takes connections (see *Sharing with a join code*). A code is never stored, logged or sent back
@@ -965,8 +973,8 @@ chooses to share on the network; the default is the invite link with a random to
   speak `wss://` to the proxy. Tokens and keys are never in the
   WebSocket request (only in the first message), so proxies don't log them, and the server logs
   file and link ids, never secrets.
-- **Not yet**: accounts and per-person permissions, audit logs, encryption at rest, end-to-end
-  encryption.
+- **Not yet**: audit logs, encryption at rest; end-to-end encryption is built for sealed files
+  (keys in links; keyrings per device with accounts come next).
 
 ## Implementation plan
 

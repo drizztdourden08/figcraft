@@ -1,6 +1,7 @@
 //! What joining a session means on any transport, shared by the native guest ([`crate::guest`])
 //! and the browser client: the join settings, how a connection ended and what follows, and taking
-//! in what the host sends.
+//! in what the host sends. A sealed file's messages are sealed and opened here too
+//! ([`outgoing`], and in [`take`]; see [`crate::sealing`]).
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -172,6 +173,17 @@ pub(crate) fn hello(cfg: &GuestConfig, resume: &Resuming) -> ClientMsg {
     hello
 }
 
+/// What the sync client (or the engine) sends on this connection, sealed when the file is: `None`
+/// when there is nothing to send yet (presence before the welcome said who this client is), an
+/// error when the session can't go on (a change that can't be sealed).
+pub(crate) fn outgoing(cfg: &GuestConfig, resume: &Resuming, msg: ClientMsg) -> Result<Option<ClientMsg>, String> {
+    if cfg.invite.key.is_none() {
+        return Ok(Some(msg));
+    }
+    let me = resume.lock().ok().and_then(|r| r.map(|r| r.client_id));
+    crate::sealing::outgoing(&cfg.invite, me, msg)
+}
+
 /// What a connection knows of the session (to tell the UI who's here).
 #[derive(Default)]
 pub(crate) struct Seen {
@@ -192,6 +204,12 @@ pub(crate) enum Taken {
 /// session. On the welcome, `welcomed` runs before the UI hears of it: what the sync client sends
 /// in answer must go out on this connection.
 pub(crate) fn take(m: ServerMsg, cfg: &GuestConfig, inbox: &Inbox, seen: &mut Seen, resume: &Resuming, welcomed: &dyn Fn()) -> Taken {
+    // A sealed file's messages, opened (or what can't be).
+    let m = match crate::sealing::incoming(&cfg.invite, m) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Taken::Continue,
+        Err(why) => return Taken::End(Outcome::Failed(why)),
+    };
     match m {
         ServerMsg::Welcome { session, client_id, seq, ref peers, access, .. } => {
             if let Ok(mut r) = resume.lock() {
@@ -270,8 +288,7 @@ pub(crate) fn take(m: ServerMsg, cfg: &GuestConfig, inbox: &Inbox, seen: &mut Se
         | ServerMsg::Resolved { .. }
         | ServerMsg::Info(_)
         | ServerMsg::Account(_) => {}
-        // Sealing in the app comes with its own step (docs/accounts-and-e2e.md); a server only
-        // sends these to clients that announce sealed files, which this one doesn't yet.
+        // Opened above (`crate::sealing::incoming`).
         ServerMsg::SealedWelcome { .. }
         | ServerMsg::SealedChanges(_)
         | ServerMsg::SealedReject { .. }

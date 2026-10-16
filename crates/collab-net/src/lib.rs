@@ -19,6 +19,7 @@ pub mod inbox;
 pub mod invite;
 mod join;
 pub mod limits;
+pub mod sealing;
 mod sessions;
 pub mod throttle;
 

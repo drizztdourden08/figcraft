@@ -360,7 +360,7 @@ fn publish_to_server(s: &mut Session, p: &Value) -> Result<Value> {
     let link = match server {
         // The server's address with its key: the file is kept there first.
         Some(server) if key.is_some() || (server.contains("key=") && !server.contains("token=")) => {
-            let opts = PublishOptions { server, key, name: doc.name.clone(), me: String::new(), doc: doc.clone(), share: false, session: None };
+            let opts = PublishOptions { server, key, name: doc.name.clone(), me: String::new(), doc: doc.clone(), share: false, session: None, sealed: Some(false) };
             let file = match s.net(NetRequest::Upload(opts))?.0 {
                 NetReply::Upload(r) => r.map_err(|e| bad(cmd, e))?,
                 _ => return Err(EngineError::Other("the server answered something else".into())),

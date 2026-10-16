@@ -240,7 +240,7 @@ pub fn share(
         .into_iter()
         .map(|r| if let AdminReply::Code { code } = r { Some(code) } else { None });
     let mut shared = |l: NewLink| SharedLink {
-        link: Invite { server: server.clone(), file: file.to_string(), token: l.token }.link(),
+        link: Invite { server: server.clone(), file: file.to_string(), token: l.token, key: None }.link(),
         id: l.link.id,
         code: codes.next().flatten(),
     };

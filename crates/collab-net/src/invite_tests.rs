@@ -104,9 +104,42 @@ fn bad_links_are_refused_without_echoing_them() {
     }
 }
 
+/// A sealed file's link carries its key after `#k=`: it reads back, but it is never in what is
+/// sent (the WebSocket URL), in `Debug` or in an error.
+#[test]
+fn sealed_links_carry_the_key_in_the_fragment_only() {
+    let key = figcraft_collab_seal::FileKey::generate().unwrap();
+    let fragment = figcraft_collab_seal::link_fragment(&key);
+    let secret = fragment.trim_start_matches("k=").to_string();
+    let i = invite().with_key(Some(key.clone()));
+    assert_eq!(i.link(), format!("{}#{fragment}", invite().link()));
+    assert_eq!(i.url(), format!("{}#{fragment}", invite().url()));
+    assert_eq!(Invite::parse(&i.link()), Ok(i.clone()));
+    assert_eq!(Invite::parse(&i.url()), Ok(i.clone()));
+    assert_eq!(Invite::parse(&format!("  <{}>  ", i.link())), Ok(i.clone()));
+    // Never sent, never printed.
+    assert_eq!(i.endpoint(), "ws://192.168.1.20:47900/");
+    assert!(!format!("{i:?}").contains(&secret), "{i:?}");
+    // A member's link (no token) on a server with accounts keeps the key too.
+    let member = Invite { token: String::new(), ..i.clone() };
+    assert!(member.link().ends_with(&format!("&file=0123456789abcdef#{fragment}")), "{}", member.link());
+    assert_eq!(Invite::parse(&member.link()), Ok(member));
+    // A link with a fragment that isn't a key reads as plain; a broken key is refused unechoed.
+    assert_eq!(Invite::parse(&format!("{}#section", invite().link())), Ok(invite()));
+    for bad in [format!("{}#k={}", invite().link(), &secret[1..]), format!("{}#k={secret}AA", invite().link()), format!("{}#k=", invite().link())] {
+        let e = Invite::parse(&bad).expect_err(&bad);
+        assert!(e.contains("key") && !e.contains(&secret[1..20]), "{e}");
+    }
+    // A join code with a key keeps the key for the file the code opens.
+    let (coded, code) = Invite::parse_join(&format!("figcraft://join?server=ws://10.0.0.5:47900/&code=K7M2QX9TD#{fragment}")).unwrap();
+    assert!(code.is_some());
+    assert_eq!(coded.key, Some(key));
+}
+
 proptest! {
     #[test]
     fn the_parsers_survive_anything(s in ".{0,300}") {
+        let _ = Invite::parse(&format!("figcraft://join?host=10.0.0.1:47900&file=abc#k={s}"));
         let _ = Invite::parse(&s);
         let _ = Invite::parse(&format!("figcraft://join?{s}"));
         let _ = Invite::parse(&format!("figcraft://join?server={s}"));
@@ -118,8 +151,10 @@ proptest! {
 
     #[test]
     fn valid_invites_round_trip(a in 1u8..255, port in 1u16.., file in "[a-f0-9]{1,64}", token in "[A-Za-z0-9_-]{16,128}", path in "(/[a-z0-9]{1,8}){0,3}", secure: bool) {
-        let i = Invite { server: Endpoint { host: format!("10.0.0.{a}:{port}"), path: format!("{path}/"), secure }, file, token };
+        let i = Invite { server: Endpoint { host: format!("10.0.0.{a}:{port}"), path: format!("{path}/"), secure }, file, token, key: None };
         prop_assert_eq!(Invite::parse(&i.link()), Ok(i.clone()));
-        prop_assert_eq!(Invite::parse(&i.url()), Ok(i));
+        prop_assert_eq!(Invite::parse(&i.url()), Ok(i.clone()));
+        let sealed = i.with_key(figcraft_collab_seal::FileKey::generate().ok());
+        prop_assert_eq!(Invite::parse(&sealed.link()), Ok(sealed));
     }
 }

@@ -9,6 +9,9 @@
 //! A join by code ([`GuestConfig::code`]) first asks the server which file the code opens on a
 //! connection of its own, then joins that file as with a link; a server that doesn't know the
 //! code (or can't be reached) ends the join with the reason.
+//!
+//! A sealed file (its link carries the key) is sealed and opened here exactly as the native guest
+//! does it (`crate::sealing`, through [`take`] and [`outgoing`]).
 
 use figcraft_collab::message::{self, ClientMsg, PROTOCOL, Presence, Resolve, ServerMsg};
 use figcraft_engine::live::{Event, Status};
@@ -16,7 +19,7 @@ use figcraft_engine::live::{Event, Status};
 use web_time::Instant;
 
 use crate::inbox::Inbox;
-use crate::join::{GuestConfig, Next, Outcome, Resuming, Seen, Taken, after, closed, hello, resolved, sign_in, take, unresolved};
+use crate::join::{GuestConfig, Next, Outcome, Resuming, Seen, Taken, after, closed, hello, outgoing, resolved, sign_in, take, unresolved};
 use crate::throttle::{PRESENCE_INTERVAL, Throttle, earliest};
 
 /// A WebSocket the driver opens, writes and closes; what it receives comes back through the
@@ -170,10 +173,8 @@ impl<S: Socket> Driver<S> {
             self.pending = Some(p);
             return;
         }
-        if let Some(p) = self.throttle.offer(p, now)
-            && !self.write(&ClientMsg::Presence(p), now)
-        {
-            self.end(Outcome::Retry("the connection dropped".into()), now);
+        if let Some(p) = self.throttle.offer(p, now) {
+            self.write_sealed(ClientMsg::Presence(p), now);
         }
     }
 
@@ -184,8 +185,20 @@ impl<S: Socket> Driver<S> {
         if !self.conn.as_ref().is_some_and(|c| c.welcomed) {
             return;
         }
-        if !self.write(&msg, now) {
-            self.end(Outcome::Retry("the connection dropped".into()), now);
+        self.write_sealed(msg, now);
+    }
+
+    /// Send a message of the sync client's or the engine's, sealed when the file is; the session
+    /// ends when it can't go (a broken connection, or a change that can't be sealed).
+    fn write_sealed(&mut self, msg: ClientMsg, now: Instant) {
+        match outgoing(&self.cfg, &self.resume, msg) {
+            Ok(Some(m)) => {
+                if !self.write(&m, now) {
+                    self.end(Outcome::Retry("the connection dropped".into()), now);
+                }
+            }
+            Ok(None) => {}
+            Err(why) => self.end(Outcome::Failed(why), now),
         }
     }
 
@@ -232,7 +245,9 @@ impl<S: Socket> Driver<S> {
             return self.end(Outcome::Retry("the host stopped answering".into()), now);
         }
         let ok = match self.throttle.take_due(now) {
-            Some(p) => self.write(&ClientMsg::Presence(p), now),
+            Some(p) => {
+                return self.write_sealed(ClientMsg::Presence(p), now);
+            }
             None if now >= last_sent + l.keepalive => self.write(&ClientMsg::Ping, now),
             None => true,
         };

@@ -354,8 +354,7 @@ mode = "optional"   # "off" (default): plain files only; "optional": both; "requ
 
 - `"off"` refuses sealed files, `"required"` refuses plain ones (publishing from an app that can't
   seal says so). Servers with share links only can keep sealed files too.
-- A sealed file works like any other: links, join codes (a code can't carry the key, so people
-  joining by code still need the key from its owner), members, renaming, removal, expiry, team
+- A sealed file works like any other: links, members, renaming, removal, expiry, team
   libraries, reports. Its session is ordered, checked and saved the same way; the server checks its
   **structure** (the layer tree, kinds of layers, ids) but can't read its **contents**: names,
   text, styles, comments, cursor chat, presence and its team library are ciphertext to it.
@@ -369,9 +368,12 @@ mode = "optional"   # "off" (default): plain files only; "optional": both; "requ
 - What sealing doesn't hide from you: how many layers a file has and their tree, each layer's kind
   (frame, text…), which properties change and when, value sizes (rounded up), who is connected and
   when. Details in [`accounts-and-e2e.md`](accounts-and-e2e.md#sealed-files).
+- Join codes can't carry the key: the app shares sealed files by link only (the key after `#`).
+- Before publishing a sealed file the app asks the server's `Info`: with `"off"` (or a server older
+  than accounts) it says so without sending anything; with `"required"` it seals by default.
 
-*The app's side (sealing, keys in links, keyrings with accounts) is being built (steps 8 and 9 of
-[`accounts-and-e2e.md`](accounts-and-e2e.md#steps)); the server side described here is done.*
+*The app seals files and joins them with keys in links (step 8 of
+[`accounts-and-e2e.md`](accounts-and-e2e.md#steps)); keyrings per device with accounts are step 9.*
 
 ## Configuration
 

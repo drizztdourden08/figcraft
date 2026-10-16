@@ -152,7 +152,7 @@ fn revoked_links_stop_working_at_once() {
     let endpoint = Endpoint::plain(addr.to_string());
     let ask = |req: Admin| manage::request(&endpoint, &key(dir.path()), vec![req], &NetLimits::default(), Duration::from_secs(5)).unwrap().remove(0);
     let AdminReply::Link(review) = ask(Admin::CreateLink { file: file.clone(), access: Access::View, label: "Review".into() }) else { panic!() };
-    let link = Invite { server: endpoint.clone(), file: file.clone(), token: review.token.clone() }.link();
+    let link = Invite { server: endpoint.clone(), file: file.clone(), token: review.token.clone(), key: None }.link();
     let mut b = join(&p.edit, "Bo");
     let mut c = join(&link, "Cy");
     pump(&mut [&mut a, &mut b, &mut c], "everyone in", |s| s.iter().all(|x| live(x)));

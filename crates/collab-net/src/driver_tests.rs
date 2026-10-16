@@ -412,3 +412,99 @@ fn joins_a_real_host_and_edits_with_it() {
     assert!(d.done());
     assert!(doc.contains(page));
 }
+
+/// A sealed file through the browser's driver: the plain messages the engine reads come out of
+/// the sealed ones a session server for sealed files sends, and what the engine sends goes out
+/// sealed (a spotlight plain); what doesn't open is dropped or skipped.
+#[test]
+fn a_sealed_file_is_sealed_and_opened_on_the_way() {
+    use figcraft_collab::message::{AcceptedOf, Signal};
+    use figcraft_collab::{OpaqueReplica, OpaqueServer, Replica};
+    use figcraft_collab_seal::{FileKey, Keyring, open_change, open_presence, open_signal, seal_change, seal_presence};
+
+    use crate::sealing::{NEEDS_KEY, NOT_SEALED};
+
+    let key = FileKey::generate().unwrap();
+    let ring = Keyring::from(key.clone());
+    let snapshot: Vec<_> = Replica::new(shared()).snapshot().unwrap().iter().map(|c| seal_change(&key, FILE, c).unwrap()).collect();
+    let mut server = OpaqueServer::with_state(OpaqueReplica::from_snapshot(&snapshot).unwrap(), TOKEN, Limits::default());
+    let ClientMsg::Hello(h) = Client::hello(FILE, TOKEN, "Ada", "") else { panic!("no hello") };
+    let (me, outs) = server.join(h).unwrap();
+    let sealed_welcome =
+        outs.into_iter().find_map(|o| if let Outgoing::To(_, w @ ServerMsg::SealedWelcome { .. }) = o { Some(w) } else { None }).unwrap();
+
+    // Without the key: the join ends, saying why.
+    let t0 = Instant::now();
+    let (mut bare, inbox) = start(Script::default(), t0);
+    bare.opened(t0);
+    bare.message(&encode(&sealed_welcome), t0);
+    assert!(bare.done());
+    assert!(statuses(&inbox.drain()).contains(&Status::Failed { reason: NEEDS_KEY.into() }));
+
+    // With it: the engine gets the plain welcome; the link it is told carries the key.
+    let inbox = Inbox::new(Arc::new(|| {}));
+    let mut d = Driver::start(Script::default(), GuestConfig::new(invite().with_key(Some(key.clone())), "Ada".into()), inbox.clone(), t0);
+    d.opened(t0);
+    let Some(ClientMsg::Hello(h)) = d.sock.sent.first() else { panic!("no hello") };
+    assert!(message::reads_sealed(&h.client_version));
+    assert!(d.sock.opened.iter().all(|u| !u.contains('#') && !u.contains("k=")), "the key isn't in the URL");
+    d.message(&encode(&sealed_welcome), t0);
+    let events = inbox.drain();
+    let link = events.iter().find_map(|e| if let Event::Welcome { info, .. } = e { Some(info.link.clone()) } else { None }).unwrap();
+    assert!(link.ends_with(&format!("#{}", figcraft_collab_seal::link_fragment(&key))), "{link}");
+    let plain = events.into_iter().find_map(|e| if let Event::Sync(w @ ServerMsg::Welcome { .. }) = e { Some(w) } else { None }).unwrap();
+    let mut client = Client::join(plain).unwrap();
+    assert_eq!(client.document().name, "Shared file");
+
+    // Out: presence and chat sealed for this client, a spotlight plain, changes sealed.
+    d.presence(cursor(1.0), t0);
+    let Some(ClientMsg::SealedPresence(blob)) = d.sock.sent.last() else { panic!("{:?}", d.sock.sent.last()) };
+    assert_eq!(open_presence(&ring, FILE, me, blob).unwrap(), cursor(1.0));
+    d.send(ClientMsg::Signal(Signal::chat("hi")), t0);
+    let Some(ClientMsg::SealedSignal(blob)) = d.sock.sent.last() else { panic!("{:?}", d.sock.sent.last()) };
+    assert_eq!(open_signal(&ring, FILE, me, blob).unwrap(), Signal::chat("hi"));
+    d.send(ClientMsg::Signal(Signal::spotlight(true)), t0);
+    assert_eq!(d.sock.sent.last(), Some(&ClientMsg::Signal(Signal::spotlight(true))));
+    let mut doc = client.document().clone();
+    doc.add_page("Two");
+    d.send(client.edit(&doc).unwrap().unwrap(), t0);
+    let batch = d.sock.sent.last().cloned().unwrap();
+    let ClientMsg::SealedChanges { changes, .. } = &batch else { panic!("{batch:?}") };
+    assert!(changes.iter().all(|c| open_change(&ring, FILE, c).is_ok()));
+    // The server takes it; what comes back is opened for the engine's client.
+    let back = server.receive(me, batch);
+    let accepted = back.into_iter().find_map(|o| if let Outgoing::All(m @ ServerMsg::SealedChanges(_)) = o { Some(m) } else { None }).unwrap();
+    d.message(&encode(&accepted), t0);
+    let Some(Event::Sync(ServerMsg::Changes(acc))) = inbox.drain().into_iter().find(|e| matches!(e, Event::Sync(_))) else { panic!("no changes") };
+    assert_eq!(acc.author, me);
+    client.receive(ServerMsg::Changes(acc), &figcraft_collab::NoRecompute).unwrap();
+    assert_eq!(client.pending(), 0);
+    assert_eq!(client.document().pages.len(), 2);
+
+    // In: a peer's sealed presence opens; one sealed for someone else's slot, or plain, is dropped.
+    d.message(&encode(&ServerMsg::SealedPresence { client_id: 77, blob: seal_presence(&key, FILE, 77, &cursor(5.0)).unwrap() }), t0);
+    d.message(&encode(&ServerMsg::SealedPresence { client_id: 78, blob: seal_presence(&key, FILE, 77, &cursor(6.0)).unwrap() }), t0);
+    d.message(&encode(&ServerMsg::Presence { client_id: 79, presence: cursor(7.0) }), t0);
+    let presence: Vec<(u32, Presence)> =
+        inbox.drain().into_iter().filter_map(|e| if let Event::Presence(id, p) = e { Some((id, p)) } else { None }).collect();
+    assert_eq!(presence, vec![(77, cursor(5.0))]);
+    // A change that doesn't open (sealed with another key) is skipped; the rest of its batch is
+    // applied. Every app skips the same one: the server sent everyone the same bytes.
+    let other = FileKey::generate().unwrap();
+    let mut doc = client.document().clone();
+    doc.add_page("Three");
+    let edit = client.edit(&doc).unwrap();
+    let Some(ClientMsg::Changes { changes, .. }) = edit else { panic!() };
+    let mut sealed: Vec<_> = changes.iter().map(|c| seal_change(&key, FILE, c).unwrap()).collect();
+    sealed.push(seal_change(&other, FILE, &changes[0]).unwrap());
+    let acc = ServerMsg::SealedChanges(AcceptedOf { seq: 2, author: 77, batch_id: 1, changes: sealed });
+    d.message(&encode(&acc), t0);
+    let Some(Event::Sync(ServerMsg::Changes(opened))) = inbox.drain().into_iter().find(|e| matches!(e, Event::Sync(_))) else { panic!() };
+    assert_eq!(opened.changes, changes, "the change that didn't open is gone");
+    assert!(!d.done());
+
+    // The server sends a sealed file's contents in the clear: the join ends.
+    d.message(&welcome(), t0);
+    assert!(d.done());
+    assert!(statuses(&inbox.drain()).contains(&Status::Failed { reason: NOT_SEALED.into() }));
+}
