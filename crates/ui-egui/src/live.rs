@@ -104,6 +104,9 @@ pub struct LiveUi {
     /// The join started from the home screen: what it is doing shows under the field, and its
     /// file's tab shows when it opens.
     pub home_join: Option<SessionId>,
+    /// The link that join was started with, when the home screen knows it (a file on a server's
+    /// page): Try again joins with it.
+    pub home_join_link: Option<String>,
     /// Remove from server… was clicked: its confirmation shows.
     pub confirm_remove: bool,
     /// What the server for online sharing said about its hosting (`collab.serverInfo`), and the
@@ -705,7 +708,19 @@ pub fn join_field(app: &mut FigApp, ui: &mut Ui, typed: &mut String, id: egui::I
 
 /// What join `session` is doing, under the field it was started from (the home screen): on its
 /// way, or why it failed.
-pub fn join_status(app: &FigApp, ui: &mut Ui, t: &Tokens, session: SessionId) {
+pub fn join_status(app: &mut FigApp, ui: &mut Ui, t: &Tokens, session: SessionId) {
+    // A sealed file whose key this device doesn't have yet: nothing is wrong, someone must let it
+    // in.
+    if app.session.waiting_for_access(session) {
+        widgets::label(ui, tr("Waiting for an owner or editor to open FigCraft and give this device access."), t.text_secondary);
+        if let Some(link) = app.ui.live.home_join_link.clone()
+            && widgets::button(ui, tr("Try again"), false, true).clicked()
+            && let Some(j) = app.run("collab.join", json!({"link": link}))
+        {
+            app.ui.live.home_join = j["session"].as_u64();
+        }
+        return;
+    }
     match app.session.live.get(session).map(|l| &l.status) {
         Some(Status::Connecting) => widgets::label(ui, tr("Joining…"), t.text_secondary),
         Some(Status::Failed { reason }) => widgets::label(ui, reason, t.danger),

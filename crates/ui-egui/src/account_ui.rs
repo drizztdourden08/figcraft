@@ -32,6 +32,8 @@ const SIGN_OUT: &str = "account.signOut";
 const CHECK: &str = "account.check";
 const FILES: &str = "account.files";
 const MEMBERS: &str = "collab.members";
+const DEVICES: &str = "account.devices";
+const DEVICE_CHANGES: [&str; 3] = ["account.revokeDevice", "account.recoveryKey", "account.recover"];
 const PEOPLE_CHANGE: [&str; 3] = ["collab.invite", "collab.setRole", "collab.removeMember"];
 
 /// Roles in the order the pickers show them (ids and labels).
@@ -62,6 +64,11 @@ pub struct ServerState {
     /// The file whose people show on the page, and them (`collab.members {file}`; null until
     /// they arrive).
     pub people: Option<(String, Value)>,
+    /// Your devices there (`account.devices`), asked once a run; a recovery key just made (shown
+    /// this once).
+    pub devices: Option<Value>,
+    devices_asked: bool,
+    pub recovery_key: Option<String>,
 }
 
 /// UI-only state of servers and accounts.
@@ -83,8 +90,9 @@ pub struct AccountUi {
     pub role_edit: Option<String>,
     pub invite_email: String,
     pub invite_role: usize,
-    /// A token being typed to sign in.
+    /// A token being typed to sign in, and a recovery key.
     pub token: String,
+    pub recovery_typed: String,
 }
 
 impl AccountUi {
@@ -174,6 +182,8 @@ fn ensure(app: &mut FigApp, ctx: &Context, server: &str) {
     if !signed {
         st.files = None;
         st.people = None;
+        st.devices = None;
+        st.devices_asked = false;
     }
     if signed && !checked && !app.session.waiting_for(CHECK) {
         app.ui.account.of(server).checked = true;
@@ -517,7 +527,10 @@ fn account_part(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     for f in &list {
         let (id, name) = (f["file"].as_str().unwrap_or_default(), f["name"].as_str().unwrap_or_default());
         let updated = figcraft_engine::live::utc_date(f["updated"].as_u64().unwrap_or(0));
-        let detail = format!("{} · {}", role_label(f["role"].as_str().unwrap_or_default()), updated.get(..10).unwrap_or(&updated));
+        let mut detail = format!("{} · {}", role_label(f["role"].as_str().unwrap_or_default()), updated.get(..10).unwrap_or(&updated));
+        if f["sealed"] == true {
+            detail = format!("{} · {detail}", tr("Encrypted"));
+        }
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::hover());
         let people = Rect::from_center_size(pos2(r.max.x - 18.0, r.center().y), vec2(24.0, 24.0));
         let resp = ui.interact(r.with_max_x(people.min.x - 4.0), ui.id().with(("server_file", id)), Sense::click());
@@ -543,10 +556,157 @@ fn account_part(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
         crate::live::join_status(app, ui, t, session);
     }
     put_here(app, ui, t, server, true);
+    devices(app, ui, t, server);
     if app.session.signed_in(server).is_some_and(|m| m.admin) {
         subheading(ui, t, tr("Server admin"));
         crate::admin_ui::tools(app, ui, t, server);
     }
+}
+
+/// Your devices on `server` (for end-to-end encrypted files): this one, the others and your
+/// recovery key, each revocable; making a recovery key (shown once), and using one on a device
+/// that has no access yet.
+fn devices(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
+    let ctx = ui.ctx().clone();
+    // Only a server that keeps sealed files has devices.
+    let sealing = app.ui.account.of(server).info.as_ref().is_some_and(|i| i["e2e"].as_str().is_some_and(|m| m != "off"));
+    if !sealing {
+        return;
+    }
+    subheading(ui, t, tr("Your devices"));
+    let st = app.ui.account.of(server);
+    let (list, asked) = (st.devices.clone(), st.devices_asked);
+    if list.is_none() && !asked && !app.session.waiting_for(DEVICES) {
+        app.ui.account.of(server).devices_asked = true;
+        load_devices(app, &ctx, server);
+    }
+    let Some(v) = list else {
+        if app.session.waiting_for(DEVICES) {
+            widgets::label(ui, tr("Asking the server…"), t.text_secondary);
+        } else if asked {
+            // It failed (the reason was shown): ask again on request.
+            ui.horizontal(|ui| {
+                widgets::label(ui, tr("Your devices couldn't be listed."), t.text_secondary);
+                if widgets::button(ui, tr("Try again"), false, true).clicked() {
+                    app.ui.account.of(server).devices_asked = false;
+                }
+            });
+        }
+        return;
+    };
+    if v["keyStore"] == "preferences" {
+        widgets::label(
+            ui,
+            tr("This computer has no keychain FigCraft can use: this device's key is kept with your preferences, which is less safe."),
+            t.warning,
+        );
+    }
+    let busy = DEVICE_CHANGES.iter().any(|c| app.session.waiting_for(c));
+    let mut revoke = None;
+    for d in v["devices"].as_array().cloned().unwrap_or_default() {
+        let id = d["id"].as_str().unwrap_or_default().to_string();
+        let name = if d["recovery"] == true { tr("Recovery key").to_string() } else { d["name"].as_str().unwrap_or_default().to_string() };
+        let seen = figcraft_engine::live::utc_date(d["seen"].as_u64().unwrap_or(0));
+        let day = seen.get(..10).unwrap_or(&seen).to_string();
+        ui.horizontal(|ui| {
+            ui.scope(|ui| {
+                ui.set_width(300.0);
+                let label = if d["thisDevice"] == true { trf("{name} (this device)", &[("name", &name)]) } else { name.clone() };
+                widgets::label(ui, &label, t.text);
+            });
+            ui.scope(|ui| {
+                ui.set_width(150.0);
+                widgets::label(ui, &trf("Last used {date}", &[("date", &day)]), t.text_secondary);
+            });
+            if widgets::button(ui, tr("Revoke"), false, !busy)
+                .on_hover_text(tr("Takes this device off your account: its keys stop working"))
+                .clicked()
+            {
+                revoke = Some(id.clone());
+            }
+        });
+    }
+    if let Some(device) = revoke {
+        let at = server.to_string();
+        app.run_background(
+            &ctx,
+            "account.revokeDevice",
+            json!({"server": server, "device": device}),
+            Box::new(move |app, ctx, _| {
+                app.toast(tr("Device revoked"));
+                load_devices(app, ctx, &at);
+            }),
+        );
+    }
+    // A recovery key just made: shown this once.
+    if let Some(key) = app.ui.account.of(server).recovery_key.clone() {
+        egui::Frame::NONE.fill(t.field).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+            widgets::label(ui, tr("Your recovery key. Write it down or keep it in a password manager: it is shown only this once."), t.text);
+            ui.label(RichText::new(&key).font(egui::FontId::monospace(14.0)).color(t.text));
+            ui.horizontal(|ui| {
+                if widgets::button(ui, tr("Copy"), false, true).clicked() {
+                    app.services.clipboard_set_text(&key);
+                    app.toast(tr("Recovery key copied"));
+                }
+                if widgets::button(ui, tr("I saved it"), true, true).clicked() {
+                    app.ui.account.of(server).recovery_key = None;
+                }
+            });
+        });
+        return;
+    }
+    let hint = tr("Lets a new device into your encrypted files when no other device is at hand");
+    if widgets::button(ui, tr("Make a recovery key"), false, !busy).on_hover_text(hint).clicked() {
+        let at = server.to_string();
+        app.run_background(
+            &ctx,
+            "account.recoveryKey",
+            json!({"server": server}),
+            Box::new(move |app, ctx, v| {
+                match v["recoveryKey"].as_str().filter(|_| v["created"] == true) {
+                    Some(key) => app.ui.account.of(&at).recovery_key = Some(key.to_string()),
+                    None => app.toast(tr("You have a recovery key already")),
+                }
+                load_devices(app, ctx, &at);
+            }),
+        );
+    }
+    ui.horizontal(|ui| {
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut app.ui.account.recovery_typed)
+                .password(true)
+                .hint_text(tr("Recovery key"))
+                .desired_width(220.0)
+                .id(egui::Id::new(("recovery_key", server))),
+        );
+        a11y::text(&field, tr("Recovery key"), "");
+        let filled = !app.ui.account.recovery_typed.trim().is_empty();
+        let hint = tr("On a device without access to your encrypted files");
+        if widgets::button(ui, tr("Use a recovery key"), false, filled && !busy).on_hover_text(hint).clicked() {
+            let key = std::mem::take(&mut app.ui.account.recovery_typed);
+            app.run_background(
+                &ctx,
+                "account.recover",
+                json!({"server": server, "recoveryKey": key.trim()}),
+                Box::new(|app, _, v| {
+                    let n = v["files"].as_array().map_or(0, Vec::len);
+                    app.toast(crate::i18n::trn("This device opens {n} encrypted files now", n, &[]));
+                }),
+            );
+        }
+    });
+}
+
+fn load_devices(app: &mut FigApp, ctx: &Context, server: &str) {
+    let at = server.to_string();
+    app.run_background(
+        ctx,
+        DEVICES,
+        json!({"server": server}),
+        Box::new(move |app, _, v| {
+            app.ui.account.of(&at).devices = Some(v);
+        }),
+    );
 }
 
 /// Open your file `file` on `server` (its member link), or bring its tab to the front.
@@ -560,6 +720,7 @@ fn open_file(app: &mut FigApp, server: &str, file: &str) {
     let link = format!("figcraft://join?server={server}&file={file}");
     if let Some(j) = app.run("collab.join", json!({"link": link})) {
         app.ui.live.home_join = j["session"].as_u64();
+        app.ui.live.home_join_link = Some(link);
     }
 }
 
