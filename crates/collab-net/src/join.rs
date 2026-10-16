@@ -270,6 +270,13 @@ pub(crate) fn take(m: ServerMsg, cfg: &GuestConfig, inbox: &Inbox, seen: &mut Se
         | ServerMsg::Resolved { .. }
         | ServerMsg::Info(_)
         | ServerMsg::Account(_) => {}
+        // Sealing in the app comes with its own step (docs/accounts-and-e2e.md); a server only
+        // sends these to clients that announce sealed files, which this one doesn't yet.
+        ServerMsg::SealedWelcome { .. }
+        | ServerMsg::SealedChanges(_)
+        | ServerMsg::SealedReject { .. }
+        | ServerMsg::SealedPresence { .. }
+        | ServerMsg::SealedSignal { .. } => {}
     }
     Taken::Continue
 }

@@ -461,7 +461,13 @@ impl Client {
             | ServerMsg::Resolved { .. }
             | ServerMsg::Info(_)
             | ServerMsg::SignIn(_)
-            | ServerMsg::Account(_) => Ok(Vec::new()),
+            | ServerMsg::Account(_)
+            // A sealed file's messages are opened into the plain ones before they get here.
+            | ServerMsg::SealedWelcome { .. }
+            | ServerMsg::SealedChanges(_)
+            | ServerMsg::SealedReject { .. }
+            | ServerMsg::SealedPresence { .. }
+            | ServerMsg::SealedSignal { .. } => Ok(Vec::new()),
             ServerMsg::Welcome { .. } if self.online => Err(Error::Protocol("already joined".into())),
             ServerMsg::Welcome { session, client_id, seq, catch_up, processed, peers, access } => {
                 if session != self.session || client_id != self.id {

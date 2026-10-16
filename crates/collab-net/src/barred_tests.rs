@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 
-use figcraft_collab::{Limits, Server};
+use figcraft_collab::{FileServer, Limits, Server};
 use figcraft_doc::Document;
 
 use super::{Admission, Backend, Closing, Hub, InFlight, Room};
@@ -17,11 +17,11 @@ impl Backend for Closes {
         Err("no".into())
     }
 
-    fn open(&mut self, _file: &str) -> Result<Server, String> {
+    fn open(&mut self, _file: &str) -> Result<FileServer, String> {
         Err("no".into())
     }
 
-    fn idle(&mut self, _file: &str, _server: &mut Server) -> bool {
+    fn idle(&mut self, _file: &str, _server: &mut FileServer) -> bool {
         true
     }
 
@@ -37,7 +37,7 @@ fn a_closed_file_forgets_whom_it_barred() {
     let mut hub = Hub {
         in_flight: InFlight(Default::default()),
         backend: Closes,
-        rooms: HashMap::from([("f".to_string(), Room::new(Server::new(doc, "", Limits::default())))]),
+        rooms: HashMap::from([("f".to_string(), Room::new(Server::new(doc, "", Limits::default()).into()))]),
         conns: HashMap::new(),
         local: None,
         outbox: Vec::new(),

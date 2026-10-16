@@ -98,7 +98,7 @@ fn until(secs: u64, what: &str, mut f: impl FnMut() -> bool) {
 }
 
 /// A client in `server` (as the hub would let it in).
-fn join(server: &mut Server) -> Client {
+fn join(server: &mut figcraft_collab::FileServer) -> Client {
     let ClientMsg::Hello(h) = Client::hello("f", "", "Ada", "#FF8800") else { panic!() };
     let (_, out) = server.join_as(h, Access::Edit).unwrap();
     let Some(Outgoing::To(_, w)) = out.into_iter().next() else { panic!() };
@@ -106,7 +106,7 @@ fn join(server: &mut Server) -> Client {
 }
 
 /// Rename the first page through `c`, as the server takes it.
-fn rename(server: &mut Server, c: &mut Client, name: &str) {
+fn rename(server: &mut figcraft_collab::FileServer, c: &mut Client, name: &str) {
     let mut d = c.document().clone();
     let page = d.first_page().unwrap();
     d.node_mut(page).unwrap().name = name.into();
@@ -255,7 +255,8 @@ fn a_file_cant_grow_past_its_cap_through_batches() {
 
 #[test]
 fn the_sessions_memory_of_batches_is_bounded_in_bytes() {
-    let mut server = Server::new(Document::new("Log"), "", Limits { max_log_bytes: 100_000, ..Limits::default() });
+    let mut server: figcraft_collab::FileServer =
+        Server::new(Document::new("Log"), "", Limits { max_log_bytes: 100_000, ..Limits::default() }).into();
     let mut c = join(&mut server);
     for i in 0..20 {
         rename(&mut server, &mut c, &format!("{i}{}", "y".repeat(30_000)));

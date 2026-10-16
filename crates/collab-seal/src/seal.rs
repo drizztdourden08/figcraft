@@ -2,23 +2,14 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use figcraft_collab::sealed::{EntryKey, MIN_PADDED, SEALED_HEADER as HEADER, SEALED_TAG as TAG, Sealed, padded_len};
 use figcraft_collab::{DocProp, Prop};
 use figcraft_doc::NodeId;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use zeroize::Zeroizing;
 
-use crate::change::EntryKey;
 use crate::keys::{FileKey, Keyring};
 use crate::{SealError, random};
-
-/// Largest plaintext [`seal`] takes: padded with its length prefix, it fills 64 MiB.
-pub const MAX_PLAINTEXT: usize = (1 << 26) - 4;
-/// Epoch (4) and nonce (24) in front of the ciphertext.
-const HEADER: usize = 4 + 24;
-/// The Poly1305 tag after it.
-const TAG: usize = 16;
-/// The smallest padded plaintext.
-const MIN_PADDED: usize = 64;
 /// What the associated data starts with (the format's version).
 const AD_PREFIX: &[u8] = b"figcraft sealed v1";
 
@@ -104,89 +95,6 @@ fn serde_name<T: Serialize>(v: &T) -> Result<String, SealError> {
     }
 }
 
-/// A sealed value: `epoch (u32 LE) ‖ nonce (24) ‖ ciphertext ‖ tag (16)`, XChaCha20-Poly1305 over
-/// the padded plaintext (see [`padded_len`]). Its length always says the padded size, so a server
-/// can check it and nothing else: [`Sealed::from_bytes`] (and deserializing) accepts only lengths a
-/// real sealed value has.
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(try_from = "SealedBytes", into = "SealedBytes")]
-pub struct Sealed(Vec<u8>);
-
-impl std::fmt::Debug for Sealed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Sealed(epoch {}, {} bytes)", self.epoch(), self.0.len())
-    }
-}
-
-/// Serde form of [`Sealed`]: bytes, or base64url in JSON.
-#[derive(Serialize, Deserialize)]
-#[serde(transparent)]
-struct SealedBytes(#[serde(with = "crate::bin")] Vec<u8>);
-
-impl TryFrom<SealedBytes> for Sealed {
-    type Error = SealError;
-    fn try_from(b: SealedBytes) -> Result<Sealed, SealError> {
-        Sealed::from_bytes(b.0)
-    }
-}
-
-impl From<Sealed> for SealedBytes {
-    fn from(s: Sealed) -> SealedBytes {
-        SealedBytes(s.0)
-    }
-}
-
-impl Sealed {
-    /// Check the shape of untrusted bytes (length only: whether they open is [`open`]'s job).
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Sealed, SealError> {
-        let padded = bytes.len().checked_sub(HEADER + TAG).ok_or(SealError::Malformed("sealed value"))?;
-        if !(MIN_PADDED..=MAX_PLAINTEXT + 4).contains(&padded) || padded_len(padded.saturating_sub(4)) != Some(padded) {
-            return Err(SealError::Malformed("sealed value"));
-        }
-        Ok(Sealed(bytes))
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.0
-    }
-
-    /// The epoch of the key it was sealed with.
-    pub fn epoch(&self) -> u32 {
-        let mut e = [0u8; 4];
-        if let Some(b) = self.0.get(..4) {
-            e.copy_from_slice(b);
-        }
-        u32::from_le_bytes(e)
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-/// The padded size of an `n`-byte plaintext: its 4-byte length prefix and the plaintext, rounded
-/// up to 64 B, 256 B, 1 KiB, then the next power of two (`None` above [`MAX_PLAINTEXT`]).
-pub fn padded_len(n: usize) -> Option<usize> {
-    if n > MAX_PLAINTEXT {
-        return None;
-    }
-    let framed = n + 4;
-    Some(match framed {
-        0..=64 => 64,
-        65..=256 => 256,
-        257..=1024 => 1024,
-        _ => framed.next_power_of_two(),
-    })
-}
-
 /// `u32 LE length ‖ plaintext ‖ zeros`, [`padded_len`] bytes.
 fn pad(plaintext: &[u8]) -> Result<Zeroizing<Vec<u8>>, SealError> {
     let size = padded_len(plaintext.len()).ok_or(SealError::TooLarge(plaintext.len()))?;
@@ -238,7 +146,7 @@ pub fn seal(key: &FileKey, file: &str, slot: &Slot, plaintext: &[u8]) -> Result<
     out.extend_from_slice(&key.epoch().to_le_bytes());
     out.extend_from_slice(nonce_bytes.as_slice());
     out.extend_from_slice(&ct);
-    Ok(Sealed(out))
+    Sealed::from_bytes(out).map_err(|_| SealError::Malformed("sealed value"))
 }
 
 /// Open a value sealed for `slot` of `file` with whichever key of `keyring` its epoch names.

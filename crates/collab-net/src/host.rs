@@ -8,7 +8,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 
 use figcraft_collab::message::{Access, ClientMsg, Hello, PROTOCOL, Peer, Presence, ServerMsg};
-use figcraft_collab::{Outgoing, Server, same_secret};
+use figcraft_collab::{FileServer, Outgoing, Server, same_secret};
 use figcraft_doc::Document;
 use figcraft_engine::live::{Event, PEOPLE};
 
@@ -58,7 +58,7 @@ impl Backend for OneFile {
         Ok(Admission { access: Access::Edit, link: None })
     }
 
-    fn open(&mut self, _: &str) -> Result<Server, String> {
+    fn open(&mut self, _: &str) -> Result<FileServer, String> {
         Err("this invite is for another file or an earlier session".into())
     }
 
@@ -101,7 +101,7 @@ impl Host {
         }
         let me = server.peers().find(|p| p.client_id == me).cloned().ok_or_else(|| io::Error::other("the host didn't join its own session"))?;
         let backend = OneFile { file: cfg.file.clone(), token: cfg.token };
-        let local = Local { file: cfg.file, server, id: me.client_id, inbox };
+        let local = Local { file: cfg.file, server: server.into(), id: me.client_id, inbox };
         let hosting = Hosting::start(listener, backend, cfg.limits, Some(local), Arc::new(figcraft_auth::Links))?;
         Ok(Host { hosting, me })
     }

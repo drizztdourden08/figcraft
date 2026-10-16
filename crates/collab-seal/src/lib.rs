@@ -29,16 +29,19 @@ mod recovery;
 mod seal;
 
 #[cfg(test)]
+mod sim_tests;
+#[cfg(test)]
 mod tests;
 
-pub use change::{
-    EntryKey, SealedChange, SealedEntry, is_container_tag, is_page_tag, kind_tag, node_kind_tag, open_change, open_presence, open_signal,
-    seal_change, seal_presence, seal_signal,
-};
+pub use change::{open_change, open_presence, open_signal, seal_change, seal_presence, seal_signal};
+// The data of sealed files lives in `figcraft-collab` (the session messages carry it).
 pub use device::{DeviceKeys, DevicePublic, Wrapped, unwrap, verify, wrap};
+pub use figcraft_collab::sealed::{
+    EntryKey, MAX_PLAINTEXT, Sealed, SealedChange, SealedEntry, is_container_tag, is_page_tag, kind_tag, node_kind_tag, padded_len,
+};
 pub use keys::{FileKey, Keyring, entry_id, link_fragment, parse_link_fragment};
 pub use recovery::RecoveryKey;
-pub use seal::{MAX_PLAINTEXT, Sealed, Slot, open, padded_len, seal};
+pub use seal::{Slot, open, seal};
 
 /// Why something couldn't be sealed, opened, decoded or unwrapped.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

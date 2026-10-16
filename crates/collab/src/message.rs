@@ -9,6 +9,7 @@ use figcraft_auth::{ServerInfo, SignIn, SignInReply};
 
 use crate::Error;
 use crate::change::Change;
+use crate::sealed::{Sealed, SealedChange};
 
 /// The protocol version a client announces in [`Hello`] (2: the welcome says what you may do, and
 /// connections can manage a server or use a file's team library).
@@ -24,6 +25,15 @@ pub const SIGNALS: &str = "signals";
 /// The word a client puts in its [`Hello::client_version`] when it reads [`ServerMsg::Hosting`] and
 /// [`ServerMsg::Reported`]: a server sends them only to clients that say so.
 pub const HOSTING: &str = "hosting";
+
+/// The word a client puts in its [`Hello::client_version`] when it reads the sealed session
+/// messages ([`ServerMsg::SealedWelcome`] and the rest): a sealed file refuses clients that don't.
+pub const SEALED: &str = "sealed";
+
+/// A [`Hello::client_version`] that announces [`SEALED`].
+pub fn reads_sealed(client_version: &str) -> bool {
+    client_version.split_whitespace().any(|w| w == SEALED)
+}
 
 /// The `client_version` this build announces: its version, then what it reads beyond the protocol.
 pub fn client_version() -> String {
@@ -186,14 +196,20 @@ impl Signal {
     }
 }
 
-/// A batch the server accepted: its sequence number, who sent it and their batch id.
+/// A batch the server accepted: its sequence number, who sent it and their batch id; its changes
+/// are [`Change`]s ([`Accepted`]) or, on a sealed file, [`SealedChange`]s ([`SealedAccepted`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Accepted {
+pub struct AcceptedOf<C> {
     pub seq: u64,
     pub author: u32,
     pub batch_id: u64,
-    pub changes: Vec<Change>,
+    pub changes: Vec<C>,
 }
+
+/// A batch of a plain file the server accepted.
+pub type Accepted = AcceptedOf<Change>;
+/// A batch of a sealed file the server accepted.
+pub type SealedAccepted = AcceptedOf<SealedChange>;
 
 /// What the server did with one client's batches: the last batch id it processed (accepted or
 /// refused; 0: none) and the ids of the latest refused ones (at most [`MAX_REFUSED`]).
@@ -218,16 +234,22 @@ impl Processed {
     }
 }
 
-/// How a [`ServerMsg::Welcome`] brings a client up to date.
+/// How a [`ServerMsg::Welcome`] (or [`ServerMsg::SealedWelcome`]) brings a client up to date.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum CatchUp {
-    /// The whole document ([`Replica::snapshot`](crate::Replica::snapshot)): a new participant,
-    /// or one whose missed batches are no longer in the server's log.
-    Snapshot(Vec<Change>),
+pub enum CatchUpOf<C> {
+    /// The whole document ([`Replica::snapshot`](crate::Replica::snapshot),
+    /// [`OpaqueReplica::snapshot`](crate::OpaqueReplica::snapshot)): a new participant, or one
+    /// whose missed batches are no longer in the server's log.
+    Snapshot(Vec<C>),
     /// The batches a reconnecting client missed, in order.
-    Delta(Vec<Accepted>),
+    Delta(Vec<AcceptedOf<C>>),
 }
+
+/// How a plain file's welcome brings a client up to date.
+pub type CatchUp = CatchUpOf<Change>;
+/// How a sealed file's welcome brings a client up to date.
+pub type SealedCatchUp = CatchUpOf<SealedChange>;
 
 /// Opens a connection that manages a server's files (instead of [`Hello`]): the server's admin
 /// key. Answered with [`AdminReply::Ready`] or `Refused`.
@@ -304,6 +326,15 @@ pub enum Admin {
     AddFileMember { file: String, email: String, role: Role },
     /// The server's version, sign-in settings and counts ([`AdminReply::ServerStatus`]).
     ServerStatus,
+    /// Keep a sealed document as a new file ([`AdminReply::Published`], or on an open hosting
+    /// connection [`AdminReply::Hosted`]). Values are sealed for the file's id, so the app picks
+    /// it: `file` is 16 random lowercase hex digits (a taken id is refused; pick another and seal
+    /// again). `name` is the file name sealed for slot `Meta { what: "name" }`; `snapshot` the
+    /// document in [`OpaqueReplica::snapshot`](crate::OpaqueReplica::snapshot) form. Refused on a
+    /// server whose `[e2e] mode` is `"off"`. Servers older than sealed files can't read it.
+    PublishSealed { file: String, name: Sealed, snapshot: Vec<SealedChange> },
+    /// Rename a sealed file: its new name sealed like [`Admin::PublishSealed`]'s.
+    RenameSealed { file: String, name: Sealed },
 }
 
 /// Someone who signed in on a server with accounts, as its admins see them ([`Admin::People`]).
@@ -811,6 +842,18 @@ pub enum AccountReq {
         file: String,
         token: String,
     },
+    /// Keep a sealed document as a new file you own ([`AccountReply::Published`]): as
+    /// [`Admin::PublishSealed`]. Servers older than sealed files can't read it.
+    PublishSealed {
+        file: String,
+        name: Sealed,
+        snapshot: Vec<SealedChange>,
+    },
+    /// Owners: rename a sealed file (its new name sealed like [`AccountReq::PublishSealed`]'s).
+    RenameSealed {
+        file: String,
+        name: Sealed,
+    },
 }
 
 /// The answer to an [`AccountReq`] (the first one on a connection answers [`OpenAccount`]).
@@ -893,6 +936,18 @@ pub enum ClientMsg {
     OpenAccount(OpenAccount),
     /// A request on an account connection.
     Account(AccountReq),
+    /// [`ClientMsg::Changes`] on a sealed file: one user action's changes, sealed.
+    SealedChanges {
+        base_seq: u64,
+        batch_id: u64,
+        changes: Vec<SealedChange>,
+    },
+    /// [`ClientMsg::Presence`] on a sealed file: the JSON of a [`Presence`] sealed for slot
+    /// `Presence { client }` with this client's id.
+    SealedPresence(Sealed),
+    /// A cursor chat [`Signal`] on a sealed file, sealed for slot `Signal { client }` (a spotlight
+    /// stays a plain [`ClientMsg::Signal`], so the server can tell newcomers who is spotlighting).
+    SealedSignal(Sealed),
 }
 
 /// Server → client.
@@ -968,6 +1023,36 @@ pub enum ServerMsg {
     SignIn(Box<SignInReply>),
     /// The answer to an account connection's request.
     Account(Box<AccountReply>),
+    /// [`ServerMsg::Welcome`] into a sealed file (only to clients whose hello announced
+    /// [`SEALED`]): the same, with the catch-up in sealed changes.
+    SealedWelcome {
+        session: u64,
+        client_id: u32,
+        seq: u64,
+        catch_up: SealedCatchUp,
+        processed: Processed,
+        peers: Vec<Peer>,
+        access: Access,
+    },
+    /// [`ServerMsg::Changes`] of a sealed file.
+    SealedChanges(SealedAccepted),
+    /// [`ServerMsg::Reject`] of a sealed file: the fixes are the current sealed values of what
+    /// the batch touched.
+    SealedReject {
+        batch_id: u64,
+        reason: String,
+        fixes: Vec<SealedChange>,
+    },
+    /// Someone's sealed presence ([`ClientMsg::SealedPresence`]), as they sent it.
+    SealedPresence {
+        client_id: u32,
+        blob: Sealed,
+    },
+    /// Someone's sealed cursor chat ([`ClientMsg::SealedSignal`]), to clients that read signals.
+    SealedSignal {
+        client_id: u32,
+        blob: Sealed,
+    },
 }
 
 /// `YYYY-MM-DD HH:MM UTC` for seconds since 1970 (how servers and apps show the times in these

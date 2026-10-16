@@ -39,7 +39,7 @@ fn publish(store: &mut Store, name: &str) -> (String, String, String) {
 }
 
 /// A client in `server` (as the hub would let it in) and what it was told.
-fn join(server: &mut Server, access: Access) -> Client {
+fn join(server: &mut figcraft_collab::FileServer, access: Access) -> Client {
     let ClientMsg::Hello(h) = Client::hello("f", "", "Ada", "#FF8800") else { panic!() };
     let (_, out) = server.join_as(h, access).unwrap();
     let Some(Outgoing::To(_, w)) = out.into_iter().next() else { panic!() };
@@ -47,7 +47,7 @@ fn join(server: &mut Server, access: Access) -> Client {
 }
 
 /// Rename the first page through `c`; the server takes the batch.
-fn rename(server: &mut Server, c: &mut Client, name: &str) {
+fn rename(server: &mut figcraft_collab::FileServer, c: &mut Client, name: &str) {
     let mut d = c.document().clone();
     let page = d.first_page().unwrap();
     d.node_mut(page).unwrap().name = name.into();
@@ -110,12 +110,12 @@ fn a_file_survives_a_crash_and_compacts() {
         }
         store.flush();
         // A crash: no compaction, nothing else written.
-        (id, server.replica().clone(), server.seq())
+        (id, server.plain().unwrap().replica().clone(), server.seq())
     };
     let mut store = Store::open(dir.path(), c).unwrap();
     assert!(store.problems().is_empty(), "{:?}", store.problems());
     let mut server = store.open(&id).unwrap();
-    assert_eq!(server.replica(), &before, "the log brought it back");
+    assert_eq!(server.plain().unwrap().replica(), &before, "the log brought it back");
     assert_eq!(server.seq(), seq);
     // Compaction: everyone left; the snapshot has it all and the log starts over.
     assert!(store.idle(&id, &mut server));
@@ -150,7 +150,7 @@ fn a_long_log_is_compacted_while_open() {
     drop(store);
     let mut store = Store::open(dir.path(), c).unwrap();
     let restored = store.open(&id).unwrap();
-    assert_eq!(restored.replica(), server.replica());
+    assert_eq!(restored.plain().unwrap().replica(), server.plain().unwrap().replica());
 }
 
 #[test]
@@ -193,8 +193,9 @@ fn damaged_files_are_skipped_and_reported() {
     assert!(!disk::temp_of(&folder(&good).join(SNAPSHOT)).exists(), "the leftover is gone");
     // C opens without the cut-short record, and says so.
     let server = store.open(&cut_log).unwrap();
-    let page = server.document().first_page().unwrap();
-    assert_eq!(server.document().node(page).unwrap().name, "Kept");
+    let doc = server.plain().unwrap().document();
+    let page = doc.first_page().unwrap();
+    assert_eq!(doc.node(page).unwrap().name, "Kept");
     assert!(store.problems().iter().any(|p| p.contains(&cut_log) && p.contains("cut short")));
     // Damage after startup: the file can't be opened, with a reason for the person joining.
     fs::write(folder(&good).join(SNAPSHOT), b"FCSN garbage").unwrap();
@@ -271,8 +272,8 @@ fn random_bytes_never_panic_the_readers() {
 }
 
 /// The first page's name in `server`'s document.
-fn page_name(server: &Server) -> String {
-    let d = server.replica().document();
+fn page_name(server: &figcraft_collab::FileServer) -> String {
+    let d = server.plain().unwrap().replica().document();
     d.node(d.first_page().unwrap()).unwrap().name.clone()
 }
 

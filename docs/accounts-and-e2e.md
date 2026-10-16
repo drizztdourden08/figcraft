@@ -7,7 +7,11 @@ and their registry), `Info` and `SignIn`, and accounts on `figcraft-server`: peo
 members and invites per file, roles in sessions, account connections, admins (see
 [`server.md`](server.md#accounts-sign-in)). **Step 4 is built** in the engine and the transport: `account.info`, `account.signIn` (browser with PKCE and a loopback redirect, device code with `account.signInPoll`, token), `account.signOut`, `account.status`, `account.files`, and `collab.members`, `collab.invite`, `collab.setRole`, `collab.removeMember` for the file in front; session tokens are kept with the preferences (like owner tokens) and sent before each hello on that server; publishing while signed in makes the file yours, and members join with a link that carries no secret. The app's screens for it come next. **Step 6 is built**: `crates/collab-seal` (file keys
 and keyrings, sealing and opening values and changes, entry ids, device keys and HPKE wrapping,
-link keys, recovery keys; not yet used by the server or the app). `[e2e]` accepts only `off` until sealing lands. Sections say what is built as the implementation lands. Builds on [`collab-protocol.md`](collab-protocol.md)
+link keys, recovery keys). **Step 7 is built**: sealed files on `figcraft-server` (`[e2e]` accepts
+`off`, `optional` and `required`): the session server for sealed files (`OpaqueReplica` and
+`OpaqueServer` in `crates/collab`), the sealed session messages, publishing, storing, compacting
+and catching up on sealed files (see *Protocol additions* and [`server.md`](server.md#sealed-files)).
+The app doesn't seal yet (step 8). Sections say what is built as the implementation lands. Builds on [`collab-protocol.md`](collab-protocol.md)
 (live sessions) and [`server.md`](server.md) (running `figcraft-server`).
 
 Goal: a `figcraft-server` can (1) let people in by **who they are** instead of only by share links,
@@ -267,6 +271,69 @@ keep talking to each other on everything they knew.
 | C → S | `OpenAccount` then `Account(AccountReq)` | Files, publish, members, invites, devices, keyrings |
 | S → C | `Account(AccountReply)` | |
 | C ↔ S | `SealedChanges`, `SealedWelcome`, `SealedReject`, `SealedPresence`, `SealedSignal` | The sealed counterparts of the session messages |
+| C → S | `Admin::PublishSealed`, `AccountReq::PublishSealed`, `…::RenameSealed` | Publish or rename a sealed file |
+
+### Sealed sessions (built, step 7)
+
+The messages, appended to `ClientMsg`, `ServerMsg`, `Admin` and `AccountReq` (postcard numbers
+them by position, so nothing before them moved):
+
+| Message | Fields |
+|---|---|
+| `ClientMsg::SealedChanges` | `base_seq: u64, batch_id: u64, changes: Vec<SealedChange>` (as `Changes`) |
+| `ClientMsg::SealedPresence(Sealed)` | the JSON of a `Presence`, sealed for `Slot::Presence { client: <own client id> }` |
+| `ClientMsg::SealedSignal(Sealed)` | a chat `Signal`, sealed for `Slot::Signal { client: <own client id> }`; a spotlight stays a plain `Signal` |
+| `ServerMsg::SealedWelcome` | `session, client_id, seq, catch_up: SealedCatchUp, processed, peers, access` (as `Welcome`) |
+| `ServerMsg::SealedChanges(SealedAccepted)` | `seq, author, batch_id, changes: Vec<SealedChange>` |
+| `ServerMsg::SealedReject` | `batch_id, reason, fixes: Vec<SealedChange>` |
+| `ServerMsg::SealedPresence` / `SealedSignal` | `client_id: u32, blob: Sealed`, passed on as the sender sent it |
+| `Admin::PublishSealed`, `AccountReq::PublishSealed` | `file: String, name: Sealed, snapshot: Vec<SealedChange>` |
+| `Admin::RenameSealed`, `AccountReq::RenameSealed` | `file: String, name: Sealed` |
+
+`SealedChange`, `Sealed`, `EntryKey` and `SealedEntry` live in `crates/collab` (`sealed`, data
+only; `figcraft-collab-seal` re-exports them and does the cryptography). How an app drives a
+sealed file:
+
+- **The file id.** Values are bound to the file id, so the app picks it before publishing: 16
+  random lowercase hex digits (the form the server's own ids have), sent as `PublishSealed`'s
+  `file`. A taken id is refused ("that file id is taken"): pick another and seal again. Every slot
+  below is sealed for that id (`seal(key, file_id, slot, …)`, `seal_change(key, file_id, change)`).
+- **Publishing.** `snapshot` is `Replica::snapshot()` with every change sealed (`seal_change`);
+  `name` is the file name sealed for `Slot::Meta { what: "name" }`. The server checks the snapshot's
+  structure (it must build a file with a page, within the layer cap) and keeps it. Plain publishing
+  is refused with `[e2e] mode = "required"`, sealed publishing with `"off"`. Listings
+  (`FileInfo::name`, `OwnedFile::name`, report and owner lists) show a sealed file's name as
+  `"sealed:" + base64url(sealed name)` (`sealed_name_text`; `parse_sealed_name` reads it back):
+  older apps show that text, newer ones open it.
+- **Joining.** A sealed file takes only clients whose `Hello::client_version` holds the word
+  `sealed` (`message::SEALED`; others are refused with "open it with a FigCraft that knows sealed
+  files"). The welcome is `SealedWelcome`; the app opens its catch-up (`open_change` on each
+  change) and hands the plain `Welcome` to its `Client`. Likewise `SealedChanges` → `Changes`,
+  `SealedReject` → `Reject` (a change that doesn't open is skipped, the same on every app), and
+  the other way `Changes` → `SealedChanges` (`seal_change`), `Presence` → `SealedPresence`, chat →
+  `SealedSignal`. `crates/collab-seal/src/sim_tests.rs` does exactly this around `Client` and is the
+  reference for the app's sealing layer.
+- **Mixing them up.** A plain `Changes` to a sealed file gets `Reject` ("this file is sealed…"), a
+  `SealedChanges` to a plain file `SealedReject` ("this file isn't sealed…"); plain presence to a
+  sealed file or sealed presence to a plain one is answered `Refused`; a plain chat to a sealed file
+  and a sealed one to a plain file are dropped.
+- **Team libraries** of a sealed file: `LibraryReq::Publish`'s archive is kept as the bytes it came
+  as (seal it for `Slot::Meta { what: "library" }`), each publish the next version; the app checks
+  it after opening it.
+
+What the server checks on a sealed batch (`OpaqueReplica::apply`, the rules of `Replica::apply`
+that need no values): a created node doesn't exist yet and its id is in the author's space (or was
+deleted: undo), a changed one exists; pages and only pages have no parent; no node becomes or stops
+being a page (`SetKind`'s tag); only container tags hold layers; positions are valid fractional
+keys; no layer goes inside itself; a deletion takes the subtree; the file keeps a page; the layer
+cap; `Set` never writes `Kind`, `Parent` or `Position` and `SetTree` only those two; named entries
+carry their sealed name; comment ids belong to their author's space (as on plain files; hashed
+style, variable and collection ids can't be checked, dev snapshots and images aren't on plain files
+either). Value rules (sizes, transforms, opacity) are the apps'. The snapshot it sends is the nodes
+in tree order, the document properties, then each keyed list as its readers rebuild it (a whole
+list if one was set, the entries there when its order was last set, the order, the entries added
+since, removals from the whole list), so a client that joins later opens the same document as one
+that saw every batch. `Reject` fixes are the current sealed values of what the batch touched.
 
 ## Crates
 
@@ -274,9 +341,16 @@ keep talking to each other on everything they knew.
 |---|---|---|
 | `crates/auth` | L2 | `Identity`, flows, `IdentityProvider`, `Fetch`, `Policy`, config types; the `oidc` and `external` providers behind the `providers` feature (the server enables it) |
 | `crates/collab-seal` | L2 | Key derivation, seal and open, entry hashing, padding, key wrapping |
-| `crates/collab-opaque` | L2 | `OpaqueReplica` and `OpaqueServer`: the session server for sealed files |
 
-`crates/collab` gains the new message types (data only); `crates/collab-net` runs `Info` and
+`crates/collab` gains the new message types and the sealed files' data (`sealed`: `Sealed`,
+`SealedChange`, `EntryKey`…), and its session server became generic over the synced state
+(`SessionServer<S: Synced>`): `Server` is `SessionServer<Replica>` as before, `OpaqueServer` is
+`SessionServer<OpaqueReplica>` (the structure of a sealed file, its values sealed), and
+`FileServer` is either, what the hub runs per open file. (The draft planned a crate of its own,
+`collab-opaque`; sharing the session code kept ordering, id spaces, the log, the journal, presence
+and signals one implementation.)
+
+`crates/collab-net` runs `Info` and
 `SignIn` before a connection's first message (in the connection's own thread, since providers are
 slow) and seals and opens around the client; `apps/figcraft-server` keeps people, sessions,
 members and keyrings and builds the providers from its config.
@@ -290,7 +364,7 @@ members and keyrings and builds the providers from its config.
 5. `external` provider and its reference verifier (built: the provider with step 3, the example
    verifier in `examples/auth-verifier/`).
 6. `crates/collab-seal`.
-7. `crates/collab-opaque` and sealed files on the server.
+7. **Built**: `OpaqueReplica` and `OpaqueServer` (in `crates/collab`) and sealed files on the server.
 8. Sealing in the app; sealed links.
 9. Sealed files with accounts: keyrings, invites, devices, recovery.
 10. Edges (sealed team libraries, CLI and MCP) and hardening (editor signatures, key-change

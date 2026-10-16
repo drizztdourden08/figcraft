@@ -42,8 +42,8 @@ owned it.
 
 What stays the same: the server key still manages the server (`figcraft-server key`, `files`,
 `links`, `reports`, `block-ip` and the other commands work as before), the plugin directory and
-team libraries work as before, and files are still stored unencrypted on the server (end-to-end
-encryption, `[e2e]`, comes later and must stay `"off"` for now). The desktop app's own sessions
+team libraries work as before, and files are stored unencrypted on the server unless they are
+sealed (`[e2e]`, see [`server.md`](server.md#sealed-files)). The desktop app's own sessions
 (hosting from the app, on the local network) don't change.
 
 A file published with the server key has no members. With `accounts` only admins can open it until
@@ -397,7 +397,7 @@ verify_url = "http://127.0.0.1:8787/verify"   # external only, required: https:/
 trust_email = false                 # as above, for answers without "email_verified"
 
 [e2e]
-mode = "off"                        # the only value accepted for now
+mode = "off"                        # "off" | "optional" | "required" (see server.md › Sealed files)
 ```
 
 Which keys each kind reads: `oidc` reads `label`, `preset`, `issuer`, `client_id`,
@@ -420,7 +420,7 @@ receive invites meant for that address, or become an admin.
   two providers with one id, a provider without a `kind`, an entry of `admins` or `allow_emails`
   that isn't an email address;
 - `open_publish` with an accounts mode;
-- an `[e2e]` mode other than `"off"` (sealed files aren't available yet);
+- an `[e2e]` mode other than `"off"`, `"optional"` or `"required"`;
 - each provider, built without the network: an unknown `kind` or `preset`, a missing `issuer` or
   `client_id`, an `issuer` that isn't `https://`, a secret file it can't read, both
   `client_secret` and `client_secret_file`, an unknown flow, `scopes` without `openid`, or a
@@ -533,9 +533,10 @@ anyone sign in as someone. Emails and names are personal data: treat the directo
 - **Admins** can open and manage every file and the server: list only the people who would hold the
   server key anyway. Admin rights follow the email, so they are only as safe as that email account
   and the provider's verification of it.
-- **Not end-to-end encrypted**: accounts decide who gets in; on the server, files are still stored
-  unencrypted, readable by the operator and anyone who can read the data directory. Sealed files
-  (`[e2e]`) come later. Tell the people using your server.
+- **Not end-to-end encrypted by default**: accounts decide who gets in; on the server, plain files
+  are stored unencrypted, readable by the operator and anyone who can read the data directory.
+  Sealed files (`[e2e] mode = "optional"` or `"required"`, see
+  [`server.md`](server.md#sealed-files)) are not. Tell the people using your server which it is.
 - **Tokens never in logs**: the log records sign-ins as `event=signed_in provider=… account=…` and
   refusals as `event=sign_in_refused provider=… reason=policy`, plus invites taken and files
   published by account id. Codes, ID tokens, session tokens and secrets are never logged, and travel

@@ -1,188 +1,23 @@
 //! Changes, presence and signals with their contents sealed.
 
-use figcraft_collab::{Change, DocProp, Entry, Json, Presence, Prop, Signal};
-use figcraft_doc::{NodeId, NodeKind};
-use serde::{Deserialize, Serialize};
+use figcraft_collab::sealed::{EntryKey, Sealed, SealedChange, SealedEntry, kind_tag};
+use figcraft_collab::{Change, Entry, Json, Presence, Prop, Signal};
 
 use crate::SealError;
 use crate::keys::{FileKey, Keyring, entry_id};
-use crate::seal::{Sealed, Slot, open, put_str, seal};
+use crate::seal::{Slot, open, seal};
 
-/// A document-level entry as the server of a sealed file sees it: the kind of entry, and its key
-/// with names (style, collection and variable ids, image hashes) replaced by their
-/// [`entry_id`]. Comment and dev snapshot keys are numbers and stay as they are.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum EntryKey {
-    Style(String),
-    Comment(u64),
-    Collection(String),
-    Variable(String),
-    DevSnapshot(NodeId),
-    Image(String),
-}
-
-impl EntryKey {
-    /// A tag byte, then the entry id (u32 LE length and text) or number (u64 LE).
-    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
-        match self {
-            EntryKey::Style(id) => {
-                out.push(1);
-                put_str(out, id);
-            }
-            EntryKey::Comment(n) => {
-                out.push(2);
-                out.extend_from_slice(&n.to_le_bytes());
-            }
-            EntryKey::Collection(id) => {
-                out.push(3);
-                put_str(out, id);
-            }
-            EntryKey::Variable(id) => {
-                out.push(4);
-                put_str(out, id);
-            }
-            EntryKey::DevSnapshot(id) => {
-                out.push(5);
-                out.extend_from_slice(&id.0.to_le_bytes());
-            }
-            EntryKey::Image(id) => {
-                out.push(6);
-                put_str(out, id);
-            }
-        }
-    }
-
-    /// Whether the key is a hashed name (then the [`SealedEntry`] carries the sealed name).
-    fn named(&self) -> bool {
-        !matches!(self, EntryKey::Comment(_) | EntryKey::DevSnapshot(_))
-    }
-
-    /// The entry with this key and `name` (for the named kinds).
-    fn entry(&self, name: Option<String>) -> Result<Entry, SealError> {
-        Ok(match (self, name) {
-            (EntryKey::Style(_), Some(n)) => Entry::Style(n),
-            (EntryKey::Collection(_), Some(n)) => Entry::Collection(n),
-            (EntryKey::Variable(_), Some(n)) => Entry::Variable(n),
-            (EntryKey::Image(_), Some(n)) => Entry::Image(n),
-            (EntryKey::Comment(n), None) => Entry::Comment(*n),
-            (EntryKey::DevSnapshot(id), None) => Entry::DevSnapshot(*id),
-            _ => return Err(SealError::Invalid("entry name doesn't match its kind".into())),
-        })
-    }
-}
-
-/// A document-level entry in a [`SealedChange`]: its [`EntryKey`] (what the server keys it by),
-/// and for named entries the name itself, sealed (slot [`Slot::EntryName`]), so that a removal
-/// opens without the reader having to know the name already.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SealedEntry {
-    pub key: EntryKey,
-    pub name: Option<Sealed>,
-}
-
-/// A [`Change`] on a sealed file: what the server needs stays plain (ids, the node kind's tag,
-/// the tree: parent and position, property names, entry keys), every other value is [`Sealed`]
-/// with the JSON of the original value.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SealedChange {
-    /// A new node. `kind_tag` is the kind's type name (`"frame"`, `"text"`, `"page"`…:
-    /// [`node_kind_tag`]), all the server learns of the kind; the whole kind (a text's contents, a
-    /// vector's paths, a page's background and flows…) is `kind`, sealed for slot
-    /// `Node { id, prop: Prop::Kind }`. `props` never holds `Kind`, `Parent` or `Position`.
-    Create {
-        id: NodeId,
-        kind_tag: String,
-        kind: Sealed,
-        parent: Option<NodeId>,
-        position: String,
-        props: Vec<(Prop, Sealed)>,
-    },
-    /// Field property `prop` (any but `Kind`, `Parent` and `Position`) of node `id` is now `value`.
-    Set {
-        id: NodeId,
-        prop: Prop,
-        value: Sealed,
-    },
-    /// The node's kind is now `value` (sealed for `Prop::Kind`), whose tag is `kind_tag`, so the
-    /// server can still refuse a node becoming or ceasing to be a page.
-    SetKind {
-        id: NodeId,
-        kind_tag: String,
-        value: Sealed,
-    },
-    /// `Prop::Parent` or `Prop::Position` of node `id`: the tree is structure, so it stays plain.
-    SetTree {
-        id: NodeId,
-        prop: Prop,
-        value: Json,
-    },
-    Delete {
-        id: NodeId,
-    },
-    SetDoc {
-        prop: DocProp,
-        value: Sealed,
-    },
-    Put {
-        entry: SealedEntry,
-        value: Sealed,
-    },
-    Remove {
-        entry: SealedEntry,
-    },
-}
-
-impl SealedChange {
-    /// The node this change is about, if any.
-    pub fn node(&self) -> Option<NodeId> {
-        match self {
-            SealedChange::Create { id, .. }
-            | SealedChange::Set { id, .. }
-            | SealedChange::SetKind { id, .. }
-            | SealedChange::SetTree { id, .. }
-            | SealedChange::Delete { id } => Some(*id),
-            _ => None,
-        }
-    }
-}
-
-/// The type name of a node kind's JSON (`{"type": "frame", …}` → `"frame"`).
-pub fn kind_tag(kind: &Json) -> Option<String> {
-    kind.0.get("type").and_then(|t| t.as_str()).map(str::to_string)
-}
-
-/// The tag of `kind`: its serde type name, the same as [`kind_tag`] of its JSON.
-pub fn node_kind_tag(kind: &NodeKind) -> &'static str {
-    match kind {
-        NodeKind::Page { .. } => "page",
-        NodeKind::Frame => "frame",
-        NodeKind::Group => "group",
-        NodeKind::Section { .. } => "section",
-        NodeKind::Rectangle => "rectangle",
-        NodeKind::Ellipse { .. } => "ellipse",
-        NodeKind::Polygon { .. } => "polygon",
-        NodeKind::Star { .. } => "star",
-        NodeKind::Line => "line",
-        NodeKind::Vector { .. } => "vector",
-        NodeKind::Text(_) => "text",
-        NodeKind::BooleanOp { .. } => "booleanOp",
-        NodeKind::Component { .. } => "component",
-        NodeKind::ComponentSet { .. } => "componentSet",
-        NodeKind::Instance { .. } => "instance",
-        NodeKind::Slice => "slice",
-    }
-}
-
-/// Whether a kind tag is a page's ([`Node::is_page`](figcraft_doc::Node::is_page)).
-pub fn is_page_tag(tag: &str) -> bool {
-    tag == "page"
-}
-
-/// Whether nodes of a kind tag hold layers ([`NodeKind::is_container`]).
-pub fn is_container_tag(tag: &str) -> bool {
-    matches!(tag, "page" | "frame" | "group" | "section" | "booleanOp" | "component" | "componentSet" | "instance")
+/// The entry with key `key` and `name` (for the named kinds).
+fn entry_of(key: &EntryKey, name: Option<String>) -> Result<Entry, SealError> {
+    Ok(match (key, name) {
+        (EntryKey::Style(_), Some(n)) => Entry::Style(n),
+        (EntryKey::Collection(_), Some(n)) => Entry::Collection(n),
+        (EntryKey::Variable(_), Some(n)) => Entry::Variable(n),
+        (EntryKey::Image(_), Some(n)) => Entry::Image(n),
+        (EntryKey::Comment(n), None) => Entry::Comment(*n),
+        (EntryKey::DevSnapshot(id), None) => Entry::DevSnapshot(*id),
+        _ => return Err(SealError::Invalid("entry name doesn't match its kind".into())),
+    })
 }
 
 /// The tree properties, which stay plain.
@@ -238,7 +73,7 @@ fn open_entry(keyring: &Keyring, file: &str, entry: &SealedEntry) -> Result<Entr
         (None, false) => None,
         _ => return Err(SealError::Invalid("entry name doesn't match its kind".into())),
     };
-    entry.key.entry(name)
+    entry_of(&entry.key, name)
 }
 
 /// Seal `change` for `file` with `key` (the keyring's current key).

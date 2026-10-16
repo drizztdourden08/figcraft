@@ -4,7 +4,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use figcraft_auth::registry::Registry;
-use figcraft_auth::{AuthConfig, E2eConfig, E2eMode};
+use figcraft_auth::{AuthConfig, E2eConfig};
 use figcraft_collab_net::{Endpoint, NetLimits};
 use serde::Deserialize;
 
@@ -178,9 +178,7 @@ impl Config {
     /// are found here, not when the server starts.
     pub fn check_with(&self, registry: &Registry) -> Result<(), String> {
         self.auth.check()?;
-        if self.e2e.mode()? != E2eMode::Off {
-            return Err("`e2e.mode`: sealed files aren't available in this version yet; leave it \"off\"".into());
-        }
+        self.e2e.mode()?;
         if self.auth.mode()?.accounts() && self.open_publish {
             return Err("`open_publish` publishes without signing in: turn it off on a server with accounts".into());
         }

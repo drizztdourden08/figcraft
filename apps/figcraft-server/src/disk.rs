@@ -7,6 +7,10 @@
 //! - `log.bin`: `FCLG`, a format byte, the generation of the snapshot it continues, then records:
 //!   length (u32 LE), CRC-32 (u32 LE), one [`Journal`] entry in the wire encoding.
 //!
+//! The format byte is 1 for plain files and 2 for sealed files, whose snapshot holds a
+//! [`SealedSessionState`] and whose log [`SealedJournal`] entries (sealed values the server can't
+//! read; servers from before sealed files refuse them as a format they don't read).
+//!
 //! Compaction writes the next generation's snapshot, then an empty log of that generation. A log
 //! whose generation isn't the snapshot's is from before a compaction that was cut short: what it
 //! holds is in the snapshot already. A log ends at its first damaged record (a write cut short).
@@ -16,7 +20,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use figcraft_collab::message;
-use figcraft_collab::{Journal, SessionState};
+use figcraft_collab::{Journal, SealedJournal, SealedSessionState, SessionState};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 pub const SNAPSHOT: &str = "snapshot.bin";
 pub const LOG: &str = "log.bin";
@@ -28,6 +34,7 @@ pub const USAGE: &str = "usage.json";
 const SNAP_MAGIC: &[u8; 4] = b"FCSN";
 const LOG_MAGIC: &[u8; 4] = b"FCLG";
 const FORMAT: u8 = 1;
+const SEALED_FORMAT: u8 = 2;
 const SNAP_HEADER: usize = 4 + 1 + 8 + 4;
 pub const LOG_HEADER: usize = 4 + 1 + 8;
 const RECORD_HEADER: usize = 8;
@@ -125,56 +132,87 @@ fn u64_at(b: &[u8], at: usize) -> Option<u64> {
 
 /// A snapshot file's bytes.
 pub fn encode_snapshot(generation: u64, state: &SessionState) -> Result<Vec<u8>, String> {
+    encode_snapshot_as(generation, FORMAT, state)
+}
+
+/// A sealed file's snapshot file's bytes.
+pub fn encode_sealed_snapshot(generation: u64, state: &SealedSessionState) -> Result<Vec<u8>, String> {
+    encode_snapshot_as(generation, SEALED_FORMAT, state)
+}
+
+fn encode_snapshot_as<T: Serialize>(generation: u64, format: u8, state: &T) -> Result<Vec<u8>, String> {
     let body = message::encode(state).map_err(|e| e.to_string())?;
     let mut out = Vec::with_capacity(SNAP_HEADER + body.len());
     out.extend_from_slice(SNAP_MAGIC);
-    out.push(FORMAT);
+    out.push(format);
     out.extend_from_slice(&generation.to_le_bytes());
     out.extend_from_slice(&crc(&body).to_le_bytes());
     out.extend_from_slice(&body);
     Ok(out)
 }
 
-/// A snapshot's generation and body, when its header and checksum are right.
-fn snapshot_body(bytes: &[u8]) -> Result<(u64, &[u8]), String> {
+/// A snapshot's format, generation and body, when its header and checksum are right.
+fn snapshot_body(bytes: &[u8]) -> Result<(u8, u64, &[u8]), String> {
     if bytes.get(..4) != Some(SNAP_MAGIC.as_slice()) {
         return Err("the snapshot isn't one (wrong header)".into());
     }
-    if bytes.get(4) != Some(&FORMAT) {
-        return Err("the snapshot is in a format this version doesn't read".into());
-    }
+    let format = match bytes.get(4) {
+        Some(&f) if f == FORMAT || f == SEALED_FORMAT => f,
+        _ => return Err("the snapshot is in a format this version doesn't read".into()),
+    };
     let (Some(generation), Some(sum), Some(body)) = (u64_at(bytes, 5), u32_at(bytes, 13), bytes.get(SNAP_HEADER..)) else {
         return Err("the snapshot is cut short".into());
     };
     if crc(body) != sum {
         return Err("the snapshot is damaged (checksum mismatch)".into());
     }
-    Ok((generation, body))
+    Ok((format, generation, body))
 }
 
 /// A snapshot's generation, after checking its header and checksum (no decoding).
 pub fn check_snapshot(bytes: &[u8]) -> Result<u64, String> {
-    snapshot_body(bytes).map(|(g, _)| g)
+    snapshot_body(bytes).map(|(_, g, _)| g)
+}
+
+fn decode_snapshot_as<T: DeserializeOwned>(bytes: &[u8], format: u8) -> Result<(u64, T), String> {
+    let (found, generation, body) = snapshot_body(bytes)?;
+    if found != format {
+        return Err(if format == SEALED_FORMAT { "the snapshot isn't a sealed file's" } else { "the snapshot is a sealed file's" }.into());
+    }
+    let state = message::decode::<T>(body, body.len()).map_err(|e| format!("the snapshot can't be read: {e}"))?;
+    Ok((generation, state))
 }
 
 /// A snapshot's generation and session state.
 pub fn decode_snapshot(bytes: &[u8]) -> Result<(u64, SessionState), String> {
-    let (generation, body) = snapshot_body(bytes)?;
-    let state = message::decode::<SessionState>(body, body.len()).map_err(|e| format!("the snapshot can't be read: {e}"))?;
-    Ok((generation, state))
+    decode_snapshot_as(bytes, FORMAT)
+}
+
+/// A sealed file's snapshot's generation and session state.
+pub fn decode_sealed_snapshot(bytes: &[u8]) -> Result<(u64, SealedSessionState), String> {
+    decode_snapshot_as(bytes, SEALED_FORMAT)
 }
 
 /// An empty log continuing snapshot `generation`.
 pub fn log_header(generation: u64) -> Vec<u8> {
+    log_header_as(generation, FORMAT)
+}
+
+/// An empty log of a sealed file continuing snapshot `generation`.
+pub fn sealed_log_header(generation: u64) -> Vec<u8> {
+    log_header_as(generation, SEALED_FORMAT)
+}
+
+fn log_header_as(generation: u64, format: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(LOG_HEADER);
     out.extend_from_slice(LOG_MAGIC);
-    out.push(FORMAT);
+    out.push(format);
     out.extend_from_slice(&generation.to_le_bytes());
     out
 }
 
-/// One log record.
-pub fn record(entry: &Journal) -> Result<Vec<u8>, String> {
+/// One log record (a [`Journal`] or [`SealedJournal`] entry).
+pub fn record<T: Serialize>(entry: &T) -> Result<Vec<u8>, String> {
     let body = message::encode(entry).map_err(|e| e.to_string())?;
     let len = u32::try_from(body.len()).map_err(|_| "a journal entry over 4 GiB".to_string())?;
     let mut out = Vec::with_capacity(RECORD_HEADER + body.len());
@@ -186,9 +224,9 @@ pub fn record(entry: &Journal) -> Result<Vec<u8>, String> {
 
 /// What a log holds.
 #[derive(Debug)]
-pub struct LogRead {
+pub struct LogRead<J = Journal> {
     pub generation: u64,
-    pub entries: Vec<Journal>,
+    pub entries: Vec<J>,
     /// Why it ends before the end of the file (a damaged or cut-short record), if it does.
     pub damaged: Option<String>,
 }
@@ -196,10 +234,27 @@ pub struct LogRead {
 /// Read a log: its generation and the entries up to the first damaged record. Only a header that
 /// isn't a log's is an error.
 pub fn read_log(bytes: &[u8]) -> Result<LogRead, String> {
+    read_log_as(bytes, FORMAT)
+}
+
+/// [`read_log`] for a sealed file's log.
+pub fn read_sealed_log(bytes: &[u8]) -> Result<LogRead<SealedJournal>, String> {
+    read_log_as(bytes, SEALED_FORMAT)
+}
+
+/// The generation a log (plain or sealed) continues.
+pub fn log_generation(bytes: &[u8]) -> Result<u64, String> {
     if bytes.get(..4) != Some(LOG_MAGIC.as_slice()) {
         return Err("the log isn't one (wrong header)".into());
     }
-    if bytes.get(4) != Some(&FORMAT) {
+    u64_at(bytes, 5).ok_or_else(|| "the log is cut short".into())
+}
+
+fn read_log_as<J: DeserializeOwned>(bytes: &[u8], format: u8) -> Result<LogRead<J>, String> {
+    if bytes.get(..4) != Some(LOG_MAGIC.as_slice()) {
+        return Err("the log isn't one (wrong header)".into());
+    }
+    if bytes.get(4) != Some(&format) {
         return Err("the log is in a format this version doesn't read".into());
     }
     let generation = u64_at(bytes, 5).ok_or("the log is cut short")?;
@@ -220,7 +275,7 @@ pub fn read_log(bytes: &[u8]) -> Result<LogRead, String> {
             damaged = Some(format!("a damaged record at byte {at}"));
             break;
         }
-        match message::decode::<Journal>(body, body.len()) {
+        match message::decode::<J>(body, body.len()) {
             Ok(e) => entries.push(e),
             Err(e) => {
                 damaged = Some(format!("an unreadable record at byte {at} ({e})"));
