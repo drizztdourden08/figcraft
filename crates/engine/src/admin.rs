@@ -8,13 +8,13 @@
 //! The app shows them in the server's section of the home screen. Every `admin.*` command takes
 //! `server?` (default: the first server).
 
-use figcraft_collab::message::{Admin, AdminReply, FileInfo, OwnerlessFile, PersonInfo};
+use figcraft_collab::message::{Admin, AdminReply, FileInfo, OwnerlessFile, PersonInfo, Secret, UserInfo};
 use serde_json::{Value, json};
 
 use crate::accounts::{info_json, invited_json, member_json, role, session_ended};
 use crate::cmd::CommandSpec;
 use crate::live::{NetReply, NetRequest};
-use crate::params::{boolean, req_string};
+use crate::params::{boolean, req_string, string};
 use crate::{EngineError, Result, Session, bad, spec};
 
 impl Session {
@@ -146,8 +146,84 @@ fn status(s: &mut Session, p: &Value) -> Result<Value> {
     }
 }
 
+fn user_json(u: &UserInfo) -> Value {
+    json!({
+        "username": u.username, "account": u.account, "email": u.email, "name": u.name, "created": u.created, "changed": u.changed,
+        "temporary": u.temporary, "locked": u.locked,
+    })
+}
+
+/// The answer to adding someone or resetting their password: the password the server made, shown
+/// this once (null: the one given was kept).
+fn user_made(reply: AdminReply) -> Result<Value> {
+    match reply {
+        AdminReply::User { username, password } => Ok(json!({"username": username, "password": password.map(|p| p.0)})),
+        _ => Err(other()),
+    }
+}
+
+fn users(s: &mut Session, p: &Value) -> Result<Value> {
+    match s.admin_request("admin.users", p, Admin::Users)? {
+        (server, AdminReply::Users(list)) => Ok(json!({"server": server, "users": list.iter().map(user_json).collect::<Vec<_>>()})),
+        _ => Err(other()),
+    }
+}
+
+fn create_user(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "admin.createUser";
+    let username = req_string(CMD, p, "username")?;
+    let req = Admin::CreateUser {
+        username: username.trim().to_string(),
+        email: string(p, "email").filter(|e| !e.trim().is_empty()),
+        name: string(p, "name").unwrap_or_default(),
+        password: string(p, "password").filter(|p| !p.is_empty()).map(Secret),
+    };
+    user_made(s.admin_request(CMD, p, req)?.1)
+}
+
+fn reset_password(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "admin.resetPassword";
+    let username = req_string(CMD, p, "username")?;
+    user_made(s.admin_request(CMD, p, Admin::ResetPassword { username })?.1)
+}
+
+fn remove_user(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "admin.removeUser";
+    let username = req_string(CMD, p, "username")?;
+    s.admin_request(CMD, p, Admin::RemoveUser { username: username.clone() })?;
+    Ok(json!({"username": username, "removed": true}))
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        spec!(
+            "admin.users",
+            "Server usernames",
+            "{server?} → {server, users: [{username, account, email, name, created, changed, temporary, locked}]}: who signs in with a username and password there (admins)",
+            false,
+            users
+        ),
+        spec!(
+            "admin.createUser",
+            "Add server user",
+            "{username, email?, name?, password? (default: the server makes one), server?} → {username, password (the one the server made, shown this once; null: yours was kept)}: lets someone sign in with a username and password (admins)",
+            false,
+            create_user
+        ),
+        spec!(
+            "admin.resetPassword",
+            "Reset password",
+            "{username, server?} → {username, password (a new temporary one, shown this once)}: their sessions end (admins)",
+            false,
+            reset_password
+        ),
+        spec!(
+            "admin.removeUser",
+            "Remove server user",
+            "{username, server?} → {username, removed}: they can't sign in with it any more; their account and files stay (admins)",
+            false,
+            remove_user
+        ),
         spec!(
             "admin.people",
             "Server people",

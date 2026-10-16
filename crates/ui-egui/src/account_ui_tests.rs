@@ -6,8 +6,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use figcraft_engine::figcraft_auth::{AuthMode, ProviderInfo};
-use figcraft_engine::figcraft_collab::message::{AccountReply, AccountReq, Admin, AdminReply, ClientMsg, FileInfo, Member, MyFile, Role};
+use figcraft_engine::figcraft_auth::{AuthMode, ProviderInfo, ServerAbout};
+use figcraft_engine::figcraft_collab::message::{AccountReply, AccountReq, Admin, AdminReply, ClientMsg, FileEntry, FileInfo, Member, MyFile, Role};
 use figcraft_engine::live::{
     Event as LiveEvent, Flow, HostOptions, LiveLink, Me, NetReply, NetRequest, Presence, ServerInfo, SessionInfo, SignIn, SignInReply,
 };
@@ -52,7 +52,7 @@ impl LiveLink for Link {
         self.0.lock().unwrap().asked.push(req.clone());
         let file = FileInfo { id: "f1".into(), name: "Plan".into(), created: 1, updated: 1_791_800_000, seq: 1, bytes: 1, people: 0 };
         match req {
-            NetRequest::Info { .. } => NetReply::Info(Ok(info())),
+            NetRequest::Info { .. } => NetReply::Info(Ok(ServerAbout { name: String::new(), info: info(), version: "1".into() })),
             NetRequest::SignIn { req: SignIn::Token { token, .. }, .. } if token == "ann" => NetReply::SignIn(Ok(SignInReply::SignedIn(Me {
                 account: "a1".into(),
                 name: "Ann".into(),
@@ -72,6 +72,10 @@ impl LiveLink for Link {
             NetRequest::Account { req: AccountReq::Files, .. } => {
                 NetReply::Account(Ok(AccountReply::Files(vec![MyFile { info: file, role: Role::Owner }])))
             }
+            NetRequest::Account { req: AccountReq::Browse, .. } => NetReply::Account(Ok(AccountReply::Browse {
+                files: vec![FileEntry { info: file, role: Role::Owner, folder: String::new(), sealed: false, thumbnail: None, opened: Some(5) }],
+                folders: vec!["Work".into()],
+            })),
             NetRequest::Account { req: AccountReq::Members { .. }, .. } => NetReply::Account(Ok(AccountReply::Members {
                 members: vec![
                     Member { account: "a1".into(), name: "Ann".into(), email: None, role: Role::Owner },
@@ -126,7 +130,7 @@ fn a_servers_page_signs_in_lists_your_files_and_their_people() {
     let sign_in = crate::live_tests::texts(&shapes).into_iter().filter(|t| t.0 == "Sign in").map(|t| t.1).next().unwrap();
     h.click(sign_in);
     let shapes = h.frames(6);
-    for t in ["Signed in as Ann (ann@example.com)", "Sign out", "Files", "People", "Admin", "Recent", "All files", "Plan"] {
+    for t in ["Signed in as Ann (ann@example.com)", "Sign out", "Files", "People", "Admin", "Recent", "All files", "Plan", "Folders", "Work"] {
         assert!(has_text(&shapes, t), "signed in, the page shows {t:?}");
     }
     assert!(!format!("{:?}", crate::account_ui::inspect(&h.app)).contains(TOKEN));

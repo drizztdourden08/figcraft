@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use figcraft_collab::message::{Admin, AdminReply, ClientMsg, FileInfo, Member, OwnerlessFile, PersonInfo, Role};
+use figcraft_collab::message::{Admin, AdminReply, ClientMsg, FileInfo, Member, OwnerlessFile, PersonInfo, Role, Secret, UserInfo};
 use serde_json::{Value, json};
 
 use crate::accounts::{SIGNED_OUT, SignedIn};
@@ -96,7 +96,21 @@ impl LiveLink for Link {
                 Admin::RemovePerson { force, .. } => AdminReply::PersonRemoved {
                     orphaned: if force { vec![OwnerlessFile { id: "f1".into(), name: "Plan".into() }] } else { Vec::new() },
                 },
-                Admin::EndSessions { .. } | Admin::SetFileRole { .. } | Admin::AddFileMember { .. } => AdminReply::Done,
+                Admin::EndSessions { .. } | Admin::SetFileRole { .. } | Admin::AddFileMember { .. } | Admin::RemoveUser { .. } => AdminReply::Done,
+                Admin::CreateUser { username, password, .. } => {
+                    AdminReply::User { username, password: password.is_none().then(|| Secret("Made-By-Server-1".into())) }
+                }
+                Admin::ResetPassword { username } => AdminReply::User { username, password: Some(Secret("Temp-Pass-2".into())) },
+                Admin::Users => AdminReply::Users(vec![UserInfo {
+                    username: "bob".into(),
+                    account: Some("b2".into()),
+                    email: None,
+                    name: "Bob".into(),
+                    created: 1,
+                    changed: 1,
+                    temporary: true,
+                    locked: 0,
+                }]),
                 _ => AdminReply::Failed { reason: "no such file".into() },
             })),
             other => other.failure()("not in this test".into()),
@@ -245,6 +259,12 @@ fn admins_list_people_and_files_and_manage_them() {
     assert_eq!((v["removed"].clone(), v["lastOwner"][0]["file"].clone()), (json!(false), json!("f1")));
     let v = run(&mut s, "admin.removePerson", json!({"account": "b2", "force": true}));
     assert_eq!((v["removed"].clone(), v["orphaned"][0]["name"].clone()), (json!(true), json!("Plan")));
+    // Usernames and passwords: a password the server made shows once in the answer.
+    assert_eq!(run(&mut s, "admin.users", json!({}))["users"][0]["username"], "bob");
+    assert_eq!(run(&mut s, "admin.createUser", json!({"username": "cy"}))["password"], "Made-By-Server-1");
+    assert!(run(&mut s, "admin.createUser", json!({"username": "di", "password": "chosen"}))["password"].is_null());
+    assert_eq!(run(&mut s, "admin.resetPassword", json!({"username": "bob"}))["password"], "Temp-Pass-2");
+    assert_eq!(run(&mut s, "admin.removeUser", json!({"username": "bob"}))["removed"], true);
     // The server's own refusal is the error.
     assert!(err(&mut s, "admin.status", json!({})).contains("no such file"));
     // A session the server ended: forgotten, and the app asks to sign in again.
@@ -310,23 +330,4 @@ fn a_join_refused_for_an_ended_sign_in_forgets_it() {
     wire.lock().unwrap().events.push((id, Event::Ended { reason: "The host ended the session".into() }));
     s.live_poll();
     assert!(s.signed_in(OTHER).is_some());
-}
-
-#[test]
-fn folders_and_pictures_say_they_arent_there_yet() {
-    let (mut s, _) = session();
-    run(&mut s, "servers.add", json!({"url": SERVER}));
-    assert!(err(&mut s, "account.folders", json!({})).contains("signed in"));
-    signed_in(&mut s, SERVER, false);
-    for (cmd, p) in [
-        ("account.folders", json!({})),
-        ("account.createFolder", json!({"path": "Work"})),
-        ("account.renameFolder", json!({"path": "Work", "to": "Old"})),
-        ("account.removeFolder", json!({"path": "Work"})),
-        ("account.moveFile", json!({"file": "f1", "folder": "Work"})),
-        ("account.thumbnail", json!({"file": "f1"})),
-    ] {
-        assert!(err(&mut s, cmd, p).contains(crate::folders::NO_FOLDERS), "{cmd}");
-    }
-    assert!(err(&mut s, "account.moveFile", json!({"file": "f1"})).contains("folder"));
 }

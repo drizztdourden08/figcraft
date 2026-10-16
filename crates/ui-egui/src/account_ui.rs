@@ -30,10 +30,11 @@ const INFO: &str = "account.info";
 const POLL: &str = "account.signInPoll";
 const SIGN_OUT: &str = "account.signOut";
 const CHECK: &str = "account.check";
-const FILES: &str = "account.files";
+const FILES: &str = "account.browse";
+const THUMBNAIL: &str = "account.thumbnail";
+const FOLDER_CHANGES: [&str; 4] = ["account.createFolder", "account.renameFolder", "account.removeFolder", "account.moveFile"];
 const MEMBERS: &str = "collab.members";
 const DEVICES: &str = "account.devices";
-const FOLDERS: &str = "account.folders";
 const DEVICE_CHANGES: [&str; 3] = ["account.revokeDevice", "account.recoveryKey", "account.recover"];
 const PEOPLE_CHANGE: [&str; 3] = ["collab.invite", "collab.setRole", "collab.removeMember"];
 
@@ -73,10 +74,9 @@ pub struct ServerState {
     /// The page's tab, and the folder the Files tab is in (`""`: the top).
     pub tab: ServerTab,
     pub folder: String,
-    /// The folders there (`account.folders`; none while the server keeps no folders), asked once a
-    /// run.
-    pub folders: Option<Value>,
-    folders_asked: bool,
+    /// The pictures of your files there: by file, the time of the picture asked for and its
+    /// texture (`None`: none to show).
+    pub pictures: BTreeMap<String, (u64, Option<egui::TextureHandle>)>,
 }
 
 /// UI-only state of servers and accounts.
@@ -98,6 +98,14 @@ pub struct AccountUi {
     pub role_edit: Option<String>,
     pub invite_email: String,
     pub invite_role: usize,
+    /// A folder being made, and one being renamed (its path and the name typed).
+    pub new_folder: Option<String>,
+    pub rename_folder: Option<(String, String)>,
+    /// A password being changed (current, new), a safety number shown (account, number), and an
+    /// account being made (email, name) with the username and password above.
+    pub change: (String, String),
+    pub safety: Option<(String, String)>,
+    pub sign_up: Option<(String, String)>,
     /// A token being typed to sign in, a username and password, and a recovery key.
     pub token: String,
     pub username: String,
@@ -338,6 +346,42 @@ pub fn sign_in_block(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
             start = Some(json!({"server": server, "provider": id, "flow": "password", "username": user, "password": pass}));
         }
     }
+    // Making an account, where the server lets people do it themselves.
+    if let Some(p) = providers.iter().find(|p| has(p, "signUp")) {
+        let id = p["id"].as_str().unwrap_or_default().to_string();
+        match app.ui.account.sign_up.take() {
+            None => {
+                if ui.link(tr("No account yet? Make one")).clicked() {
+                    app.ui.account.sign_up = Some(Default::default());
+                }
+            }
+            Some((mut email, mut name)) => {
+                let mut keep = true;
+                widgets::label(ui, tr("Make an account with the username and password above."), t.text_secondary);
+                let r = widgets::text_input(ui, egui::Id::new(("signup_email", &id)), &mut email, 240.0, tr("Email (optional)"));
+                a11y::text(&r, tr("Email"), &email);
+                let r = widgets::text_input(ui, egui::Id::new(("signup_name", &id)), &mut name, 240.0, tr("Your name (optional)"));
+                a11y::text(&r, tr("Name"), &name);
+                let filled = !app.ui.account.username.trim().is_empty() && app.ui.account.password.chars().count() >= 10;
+                ui.horizontal(|ui| {
+                    if widgets::button(ui, tr("Make account"), true, filled && !busy).clicked() {
+                        let params = json!({
+                            "server": server, "provider": id, "username": app.ui.account.username.trim(),
+                            "password": std::mem::take(&mut app.ui.account.password), "email": email.trim(), "name": name.trim(),
+                        });
+                        app.run_background(&ctx, "account.signUp", params, Box::new(|_, _, _| {}));
+                        keep = false;
+                    }
+                    if widgets::button(ui, tr("Cancel"), false, true).clicked() {
+                        keep = false;
+                    }
+                });
+                if keep {
+                    app.ui.account.sign_up = Some((email, name));
+                }
+            }
+        }
+    }
     // A token the person has.
     for p in providers.iter().filter(|p| sso_flow(p).is_none() && !has(p, "password") && has(p, "token")) {
         let (id, label) = (p["id"].as_str().unwrap_or_default(), p["label"].as_str().unwrap_or_default());
@@ -508,7 +552,7 @@ impl ServerTab {
         match self {
             ServerTab::Files => tr("Files"),
             ServerTab::People => tr("People"),
-            ServerTab::Devices => tr("Devices"),
+            ServerTab::Devices => tr("Account"),
             ServerTab::Admin => tr("Admin"),
         }
     }
@@ -576,11 +620,13 @@ fn account_part(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str, links: 
         return;
     }
     sign_in_block(app, ui, t, server);
-    let sealing = app.ui.account.of(server).info.as_ref().is_some_and(|i| i["e2e"].as_str().is_some_and(|m| m != "off"));
+    let info = app.ui.account.of(server).info.clone().unwrap_or_default();
+    let sealing = info["e2e"].as_str().is_some_and(|m| m != "off");
+    let basic = info["access"].as_str().is_some_and(|a| a.contains("basic"));
     let admin = app.session.signed_in(server).is_some_and(|m| m.admin);
     let tabs: Vec<ServerTab> = [ServerTab::Files, ServerTab::People]
         .into_iter()
-        .chain(sealing.then_some(ServerTab::Devices))
+        .chain((sealing || basic).then_some(ServerTab::Devices))
         .chain(admin.then_some(ServerTab::Admin))
         .collect();
     let mut tab = app.ui.account.of(server).tab;
@@ -607,7 +653,12 @@ fn account_part(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str, links: 
             }
         }
         ServerTab::People => people_tab(app, ui, t, server),
-        ServerTab::Devices => devices(app, ui, t, server),
+        ServerTab::Devices => {
+            if basic {
+                change_password(app, ui, t, server);
+            }
+            devices(app, ui, t, server);
+        }
         ServerTab::Admin => {
             ui.scope(|ui| {
                 ui.set_max_width(900.0);
@@ -617,98 +668,159 @@ fn account_part(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str, links: 
     }
 }
 
-/// Your files on `server` as cards, like the home screen's own: the recent ones first, then the
-/// folder you are in (with its path to go back up) and its folders and files. Folders and pictures
-/// show once the server keeps them (`account.folders`, `account.thumbnail`).
+/// Your files on `server` as cards, like the home screen's own (`account.browse`): the recent
+/// ones first, then the folder you are in (with the way back up), its folders and its files, with
+/// their pictures (`account.thumbnail`) or a plain placeholder. A new folder, renaming and removing
+/// one, and moving a file into one, from the folders' and cards' menus.
 fn files_tab(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     let ctx = ui.ctx().clone();
     let st = app.ui.account.of(server);
-    let (files, folders, folders_asked, here) = (st.files.clone(), st.folders.clone(), st.folders_asked, st.folder.clone());
-    // Whether the server keeps folders: asked once (it says so when it doesn't).
-    if !folders_asked && !app.session.waiting_for(FOLDERS) {
-        app.ui.account.of(server).folders_asked = true;
-        let at = server.to_string();
-        app.run_background(
-            &ctx,
-            FOLDERS,
-            json!({"server": server}),
-            Box::new(move |app, _, v| {
-                app.ui.account.of(&at).folders = Some(v);
-            }),
-        );
-    }
+    let (browse, here) = (st.files.clone(), st.folder.clone());
+    let busy = FOLDER_CHANGES.iter().any(|c| app.session.waiting_for(c));
     ui.horizontal(|ui| {
         if widgets::button(ui, tr("Refresh"), false, !app.session.waiting_for(FILES)).clicked() {
             load_files(app, &ctx, server);
+        }
+        if widgets::button(ui, tr("New folder…"), false, !busy).clicked() {
+            app.ui.account.new_folder = Some(String::new());
         }
         if app.session.waiting_for(FILES) || app.session.waiting_for(CHECK) {
             widgets::label(ui, tr("Loading your files…"), t.text_secondary);
         }
     });
-    let list = files.as_ref().and_then(|f| f["files"].as_array().cloned()).unwrap_or_default();
-    if files.is_some() && list.is_empty() {
-        widgets::label(ui, tr("No files here yet. Put an open file here, or open one someone invited you to."), t.text_secondary);
-        return;
+    if let Some(mut name) = app.ui.account.new_folder.take() {
+        let mut keep = true;
+        ui.horizontal(|ui| {
+            let resp = widgets::text_input(ui, egui::Id::new(("new_folder", server)), &mut name, 220.0, tr("Folder name"));
+            a11y::text(&resp, tr("Folder name"), &name);
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let filled = !name.trim().is_empty() && !name.contains('/');
+            if (widgets::button(ui, tr("Make folder"), true, filled).clicked() || enter) && filled {
+                let path = if here.is_empty() { name.trim().to_string() } else { format!("{here}/{}", name.trim()) };
+                folder_change(app, &ctx, server, "account.createFolder", json!({"server": server, "path": path}));
+                keep = false;
+            }
+            if widgets::button(ui, tr("Cancel"), false, true).clicked() {
+                keep = false;
+            }
+        });
+        if keep {
+            app.ui.account.new_folder = Some(name);
+        }
     }
-    let folder_of = |f: &Value| f["folder"].as_str().unwrap_or_default().trim_matches('/').to_string();
-    let mut open = None;
-    // The folder you are in, and the way back up.
-    let all: Vec<String> = folders
+    let list = browse.as_ref().and_then(|f| f["files"].as_array().cloned()).unwrap_or_default();
+    let all: Vec<String> = browse
         .as_ref()
         .and_then(|v| v["folders"].as_array().cloned())
         .unwrap_or_default()
         .iter()
         .filter_map(|f| f.as_str().map(str::to_string))
         .collect();
-    if folders.is_some() {
-        ui.horizontal(|ui| {
-            if ui.link(tr("All files")).clicked() {
-                app.ui.account.of(server).folder.clear();
-            }
-            let mut path = String::new();
-            for part in here.split('/').filter(|p| !p.is_empty()) {
-                path = if path.is_empty() { part.to_string() } else { format!("{path}/{part}") };
-                widgets::label(ui, "›", t.text_tertiary);
-                if ui.link(part).clicked() {
-                    app.ui.account.of(server).folder = path.clone();
-                }
-            }
-        });
+    if browse.is_some() && list.is_empty() && all.is_empty() {
+        widgets::label(ui, tr("No files here yet. Put an open file here, or open one someone invited you to."), t.text_secondary);
+        return;
     }
-    if here.is_empty() && !list.is_empty() {
-        subheading(ui, t, tr("Recent"));
-        let mut recent = list.clone();
-        recent.sort_by_key(|f| std::cmp::Reverse(f["updated"].as_u64().unwrap_or(0)));
+    let folder_of = |f: &Value| f["folder"].as_str().unwrap_or_default().trim_matches('/').to_string();
+    let mut open = None;
+    // The folder you are in, and the way back up.
+    ui.horizontal(|ui| {
+        if ui.link(tr("All files")).clicked() {
+            app.ui.account.of(server).folder.clear();
+        }
+        let mut path = String::new();
+        for part in here.split('/').filter(|p| !p.is_empty()) {
+            path = if path.is_empty() { part.to_string() } else { format!("{path}/{part}") };
+            widgets::label(ui, "›", t.text_tertiary);
+            if ui.link(part).clicked() {
+                app.ui.account.of(server).folder = path.clone();
+            }
+        }
+    });
+    if here.is_empty() {
+        // The server's order: what you opened or changed last first.
+        let ids: Vec<String> = browse
+            .as_ref()
+            .and_then(|v| v["recent"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|f| f.as_str().map(str::to_string))
+            .collect();
         let (columns, _) = crate::home_recents::grid_columns(ui.available_width() - 16.0);
-        recent.truncate(columns.max(1));
-        if let Some(id) = cards(app, ui, t, server, &recent, "recent") {
-            open = Some(id);
+        let recent: Vec<Value> = ids.iter().filter_map(|id| list.iter().find(|f| f["file"] == id.as_str()).cloned()).take(columns.max(1)).collect();
+        if !recent.is_empty() {
+            subheading(ui, t, tr("Recent"));
+            if let Some(id) = cards(app, ui, t, server, &recent, "recent", &all) {
+                open = Some(id);
+            }
         }
     }
     // Folders in this one.
-    let inside: Vec<String> = all
-        .iter()
-        .filter(|f| {
-            let parent = f.rsplit_once('/').map_or("", |(p, _)| p);
-            parent == here.as_str() && !f.is_empty()
-        })
-        .cloned()
-        .collect();
+    let inside: Vec<String> = all.iter().filter(|f| f.rsplit_once('/').map_or("", |(p, _)| p) == here.as_str() && !f.is_empty()).cloned().collect();
     if !inside.is_empty() {
         subheading(ui, t, tr("Folders"));
         ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(12.0, 12.0);
             for f in &inside {
                 let name = f.rsplit('/').next().unwrap_or(f);
-                let resp = widgets::button(ui, name, false, true);
+                // A folder tile: a mark and its name, lit on hover.
+                let (rect, _) = ui.allocate_exact_size(vec2(220.0, 48.0), Sense::hover());
+                let resp = ui.interact(rect, ui.id().with(("server_folder", f)), Sense::click());
+                a11y::button(&resp, name);
+                let p = ui.painter();
+                p.rect_filled(rect, CornerRadius::same(8), if resp.hovered() { t.hover } else { t.panel });
+                p.rect_stroke(
+                    rect,
+                    CornerRadius::same(8),
+                    egui::Stroke::new(1.0, if resp.hovered() { t.border_strong } else { t.border }),
+                    egui::StrokeKind::Inside,
+                );
+                crate::icons::paint(p, Rect::from_center_size(pos2(rect.min.x + 22.0, rect.center().y), vec2(18.0, 18.0)), Icon::Group, t.icon);
+                let shown = widgets::elide_font(ui, name, rect.width() - 56.0, semibold(12.0));
+                ui.painter().text(pos2(rect.min.x + 42.0, rect.center().y), egui::Align2::LEFT_CENTER, shown, semibold(12.0), t.text);
                 if resp.clicked() {
                     app.ui.account.of(server).folder = f.clone();
                 }
+                crate::right::context_popup(&resp).show(|ui| {
+                    if crate::right::menu_item(ui, tr("Rename…"), "") {
+                        app.ui.account.rename_folder = Some((f.clone(), name.to_string()));
+                        ui.close();
+                    }
+                    if crate::right::menu_item(ui, tr("Remove folder"), "") {
+                        folder_change(app, &ctx, server, "account.removeFolder", json!({"server": server, "path": f}));
+                        ui.close();
+                    }
+                });
             }
         });
+        if let Some((from, mut name)) = app.ui.account.rename_folder.take() {
+            let mut keep = true;
+            ui.horizontal(|ui| {
+                let resp = widgets::text_input(ui, egui::Id::new(("rename_folder", server)), &mut name, 220.0, tr("Folder name"));
+                a11y::text(&resp, tr("Folder name"), &name);
+                let filled = !name.trim().is_empty() && !name.contains('/');
+                if widgets::button(ui, tr("Rename"), true, filled).clicked() && filled {
+                    let to = match from.rsplit_once('/') {
+                        Some((parent, _)) => format!("{parent}/{}", name.trim()),
+                        None => name.trim().to_string(),
+                    };
+                    folder_change(app, &ctx, server, "account.renameFolder", json!({"server": server, "from": from, "to": to}));
+                    keep = false;
+                }
+                if widgets::button(ui, tr("Cancel"), false, true).clicked() {
+                    keep = false;
+                }
+            });
+            if keep {
+                app.ui.account.rename_folder = Some((from, name));
+            }
+        }
     }
     let shown: Vec<Value> = list.iter().filter(|f| folder_of(f) == here).cloned().collect();
     subheading(ui, t, if here.is_empty() { tr("All files") } else { tr("In this folder") });
-    if let Some(id) = cards(app, ui, t, server, &shown, "all") {
+    if shown.is_empty() {
+        widgets::label(ui, tr("No files in this folder."), t.text_secondary);
+    }
+    if let Some(id) = cards(app, ui, t, server, &shown, "all", &all) {
         open = Some(id);
     }
     if let Some(file) = open {
@@ -716,8 +828,53 @@ fn files_tab(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     }
 }
 
-/// `files` as cards in as many columns as fit (the home screen's cards); the file chosen, if any.
-fn cards(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str, files: &[Value], salt: &str) -> Option<String> {
+/// Make, rename or remove a folder, or move a file: then the files again.
+fn folder_change(app: &mut FigApp, ctx: &Context, server: &str, cmd: &str, params: Value) {
+    let at = server.to_string();
+    app.run_background(ctx, cmd, params, Box::new(move |app, ctx, _| load_files(app, ctx, &at)));
+}
+
+/// The picture of `file` on `server`, once it has been asked for (one at a time, in the
+/// background); `None` while there is none to show.
+fn picture(app: &mut FigApp, ctx: &Context, server: &str, file: &Value) -> Option<egui::TextureHandle> {
+    let id = file["file"].as_str().unwrap_or_default().to_string();
+    let set = file["thumbnail"].as_u64()?;
+    let st = app.ui.account.of(server);
+    if let Some((at, texture)) = st.pictures.get(&id) {
+        // Kept until the server has a newer one.
+        if *at >= set {
+            return texture.clone();
+        }
+    }
+    if app.session.waiting_for(THUMBNAIL) {
+        return st.pictures.get(&id).and_then(|(_, t)| t.clone());
+    }
+    let (at, key) = (server.to_string(), id.clone());
+    app.run_background(
+        ctx,
+        THUMBNAIL,
+        json!({"server": server, "file": id}),
+        Box::new(move |app, ctx, v| {
+            let texture = v["data"].as_str().and_then(|b| {
+                use base64::Engine as _;
+                let bytes = base64::engine::general_purpose::STANDARD.decode(b).ok()?;
+                let image = image::load_from_memory(&bytes).ok()?.thumbnail(720, 405).to_rgba8();
+                let size = [image.width() as usize, image.height() as usize];
+                let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+                Some(ctx.load_texture(format!("server-thumb-{at}-{key}"), color, egui::TextureOptions::LINEAR))
+            });
+            app.ui.account.of(&at).pictures.insert(key, (set, texture));
+        }),
+    );
+    // Asked: not again for this version, whatever comes back.
+    app.ui.account.of(server).pictures.entry(file["file"].as_str().unwrap_or_default().to_string()).or_insert((set, None));
+    None
+}
+
+/// `files` as cards in as many columns as fit (the home screen's cards), with their menus (open,
+/// people, move to one of `folders`); the file chosen, if any.
+fn cards(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str, files: &[Value], salt: &str, folders: &[String]) -> Option<String> {
+    let ctx = ui.ctx().clone();
     // Clear of the scroll bar.
     let (columns, card_w) = crate::home_recents::grid_columns(ui.available_width() - 16.0);
     let (picture_h, card_h) = crate::home_recents::card_heights(card_w);
@@ -736,15 +893,19 @@ fn cards(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str, files: &[Value
                     role_label(f["role"].as_str().unwrap_or_default()),
                     crate::home_recents::edited(now, f["updated"].as_u64().unwrap_or(0))
                 );
-                if f["sealed"] == true {
+                let sealed = f["sealed"] == true;
+                if sealed {
                     detail = format!("{} · {detail}", tr("Encrypted"));
                 }
-                let sealed = f["sealed"] == true;
                 let lead = |ui: &Ui, at: egui::Pos2| {
                     let icon = if sealed { Icon::Lock } else { Icon::Online };
                     crate::icons::paint(ui.painter(), Rect::from_center_size(at, vec2(16.0, 16.0)), icon, ACCENT);
                 };
-                let picture = crate::home_recents::CardPicture::Glyph(Icon::Page);
+                let shown = if ui.is_rect_visible(rect) { picture(app, &ctx, server, f) } else { None };
+                let picture = match shown {
+                    Some(texture) => crate::home_recents::CardPicture::Image { page: None, texture: Some(texture), alpha: 1.0 },
+                    None => crate::home_recents::CardPicture::Glyph(Icon::Page),
+                };
                 crate::home_recents::file_card(ui, t, rect, picture_h, &resp, false, picture, &lead, name, &detail);
                 if resp.clicked() {
                     chosen = Some(id.to_string());
@@ -760,6 +921,20 @@ fn cards(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str, files: &[Value
                         st.people = Some((id.to_string(), Value::Null));
                         ui.close();
                     }
+                    let current = f["folder"].as_str().unwrap_or_default().trim_matches('/').to_string();
+                    let mut moved = None;
+                    if !current.is_empty() && crate::right::menu_item(ui, tr("Move to All files"), "") {
+                        moved = Some(String::new());
+                    }
+                    for folder in folders.iter().filter(|x| **x != current) {
+                        if crate::right::menu_item(ui, &trf("Move to {folder}", &[("folder", folder)]), "") {
+                            moved = Some(folder.clone());
+                        }
+                    }
+                    if let Some(folder) = moved {
+                        folder_change(app, &ctx, server, "account.moveFile", json!({"server": server, "file": id, "folder": folder}));
+                        ui.close();
+                    }
                 });
             }
         });
@@ -768,8 +943,91 @@ fn cards(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str, files: &[Value
     chosen
 }
 
+/// Changing your password, on a server where you sign in with one.
+fn change_password(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
+    let ctx = ui.ctx().clone();
+    subheading(ui, t, tr("Password"));
+    let (old, new) = &mut app.ui.account.change;
+    let a = ui.add(
+        egui::TextEdit::singleline(old).password(true).hint_text(tr("Current password")).desired_width(220.0).id(egui::Id::new(("pw_old", server))),
+    );
+    a11y::text(&a, tr("Current password"), "");
+    let b = ui
+        .add(egui::TextEdit::singleline(new).password(true).hint_text(tr("New password")).desired_width(220.0).id(egui::Id::new(("pw_new", server))));
+    a11y::text(&b, tr("New password"), "");
+    let ready = !old.is_empty() && new.chars().count() >= 10;
+    widgets::label(ui, tr("At least 10 characters, not your username."), t.text_secondary);
+    if widgets::button(ui, tr("Change password"), true, ready && !app.session.waiting_for("account.changePassword")).clicked() {
+        let (old, new) = std::mem::take(&mut app.ui.account.change);
+        app.run_background(
+            &ctx,
+            "account.changePassword",
+            json!({"server": server, "old": old, "new": new}),
+            Box::new(|app, _, _| app.toast(tr("Password changed"))),
+        );
+    }
+    subheading(ui, t, tr("Devices"));
+}
+
+/// People whose devices changed on `server` since this app last saw them (`account.status` ›
+/// `keyChanges`): a gentle note each, with their safety number to compare.
+fn key_changes(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
+    let Ok(status) = app.session.execute("account.status", &json!({})) else { return };
+    let key = figcraft_engine::accounts::server_key(server);
+    let changes: Vec<Value> =
+        status["keyChanges"].as_array().cloned().unwrap_or_default().into_iter().filter(|c| c["server"] == key.as_str()).collect();
+    if changes.is_empty() {
+        return;
+    }
+    let ctx = ui.ctx().clone();
+    // Their names, from the people you have seen in your files.
+    let names: BTreeMap<String, String> = app
+        .ui
+        .account
+        .servers
+        .get(server)
+        .and_then(|st| st.people.as_ref())
+        .and_then(|(_, v)| v["members"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| Some((m["account"].as_str()?.to_string(), m["name"].as_str()?.to_string())))
+        .collect();
+    for c in changes {
+        let account = c["account"].as_str().unwrap_or_default().to_string();
+        let name = names.get(&account).cloned().unwrap_or_else(|| tr("Someone").to_string());
+        egui::Frame::NONE.fill(t.field).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+            ui.set_max_width(720.0);
+            widgets::label(
+                ui,
+                &trf("{name}'s devices changed. If you didn't expect it, compare their safety number with them.", &[("name", &name)]),
+                t.text,
+            );
+            let shown = app.ui.account.safety.as_ref().filter(|(a, _)| *a == account).map(|(_, n)| n.clone());
+            match shown {
+                Some(number) => {
+                    ui.label(RichText::new(&number).font(egui::FontId::monospace(16.0)).color(t.text));
+                }
+                None => {
+                    if widgets::button(ui, tr("Show safety number"), false, true).clicked() {
+                        let who = account.clone();
+                        app.run_background(
+                            &ctx,
+                            "account.safetyNumber",
+                            json!({"server": server, "account": account}),
+                            Box::new(move |app, _, v| {
+                                app.ui.account.safety = Some((who, v["safetyNumber"].as_str().unwrap_or_default().to_string()));
+                            }),
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// Who is in each of your files on `server`: a row per file; its people open under it.
 fn people_tab(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
+    key_changes(app, ui, t, server);
     let files = app.ui.account.of(server).files.clone();
     let list = files.as_ref().and_then(|f| f["files"].as_array().cloned()).unwrap_or_default();
     if list.is_empty() {

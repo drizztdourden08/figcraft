@@ -565,9 +565,11 @@ The app shows a server by the name given to it there, never by its address.
   no link needed). **Put an open file here** publishes an open file to the server as yours.
 - **People**: each of your files; one opens to show who is in it, and owners change roles, remove
   people, take invites back and **Invite** by email.
-- **Devices** (servers that keep sealed files): your devices, the recovery key, **Revoke**, **Make
-  a recovery key** (shown once) and **Use a recovery key**.
-- **Admin** (admins only): **People** (end someone's sessions, **Remove…** them from the server;
+- **Account**: **Change password** (basic sign-in), and on servers that keep sealed files your
+  devices, the recovery key, **Revoke**, **Make a recovery key** (shown once) and **Use a recovery
+  key**. Someone whose devices changed gets a gentle note in People, with **Show safety number**.
+- **Admin** (admins only): **Usernames** (basic sign-in: **Add user**, **Reset password**, Remove;
+  a password the server makes shows once, with Copy), **People** (end someone's sessions, **Remove…** them from the server;
   when they are the last owner of files, **Make someone else owner** or **Remove anyway**, and
   files left without an owner say so with **Give it an owner**), **Ownership** (give a file an
   owner) and **Status**. Files themselves are managed from Files, not here.

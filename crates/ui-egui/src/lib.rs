@@ -654,7 +654,7 @@ pub struct FigApp {
 
 /// Commands the window runs by itself (not because you asked): their errors are logged, not
 /// shown (a server that can't be reached says so where it is shown).
-const QUIET: [&str; 4] = ["account.info", "account.check", "account.folders", "account.thumbnail"];
+const QUIET: [&str; 3] = ["account.info", "account.check", "account.thumbnail"];
 
 /// What to do with the result of a command run in the background.
 pub type Done = Box<dyn FnOnce(&mut FigApp, &egui::Context, Value)>;

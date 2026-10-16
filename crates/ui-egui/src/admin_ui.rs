@@ -22,23 +22,32 @@ const PEOPLE: &str = "admin.people";
 const FILES: &str = "admin.files";
 const MEMBERS: &str = "admin.fileMembers";
 const STATUS: &str = "admin.status";
-const CHANGES: [&str; 4] = ["admin.endSessions", "admin.removePerson", "admin.setFileRole", "admin.addFileMember"];
+const CHANGES: [&str; 7] = [
+    "admin.endSessions",
+    "admin.removePerson",
+    "admin.setFileRole",
+    "admin.addFileMember",
+    "admin.createUser",
+    "admin.resetPassword",
+    "admin.removeUser",
+];
+const USERS: &str = "admin.users";
 
 /// The window's tabs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AdminTab {
     #[default]
     People,
+    Users,
     Files,
     Status,
 }
 
 impl AdminTab {
-    const ALL: [AdminTab; 3] = [AdminTab::People, AdminTab::Files, AdminTab::Status];
-
     fn label(self) -> &'static str {
         match self {
             AdminTab::People => tr("People"),
+            AdminTab::Users => tr("Usernames"),
             AdminTab::Files => tr("Ownership"),
             AdminTab::Status => tr("Status"),
         }
@@ -71,6 +80,11 @@ pub struct AdminWindow {
     /// Add someone to the file: their email and role.
     pub add_email: String,
     pub add_role: usize,
+    /// Usernames (`admin.users`), a user being added (username, email, name), and a password the
+    /// server just made (username, password: shown this once).
+    pub users: Option<Value>,
+    pub new_user: (String, String, String),
+    pub made: Option<(String, String)>,
 }
 
 impl AdminWindow {
@@ -129,14 +143,112 @@ pub fn tools(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     if app.ui.admin.as_ref().is_none_or(|w| w.server != server) {
         app.ui.admin = Some(AdminWindow::new(server.to_string()));
     }
+    // Usernames only where people sign in with a username and password.
+    let basic =
+        app.ui.account.servers.get(server).and_then(|st| st.info.as_ref()).is_some_and(|i| i["access"].as_str().is_some_and(|a| a.contains("basic")));
+    let tabs: Vec<AdminTab> =
+        [AdminTab::People].into_iter().chain(basic.then_some(AdminTab::Users)).chain([AdminTab::Files, AdminTab::Status]).collect();
     let mut tab = app.ui.admin.as_ref().map(|w| w.tab).unwrap_or_default();
-    tab_strip(ui, t, &AdminTab::ALL, AdminTab::label, &mut tab);
+    if !tabs.contains(&tab) {
+        tab = AdminTab::People;
+    }
+    tab_strip(ui, t, &tabs, AdminTab::label, &mut tab);
     with(app, |w| w.tab = tab);
     ui.add_space(4.0);
     match tab {
         AdminTab::People => people(app, ui, t),
+        AdminTab::Users => users(app, ui, t),
         AdminTab::Files => files(app, ui, t),
         AdminTab::Status => status(app, ui, t),
+    }
+}
+
+/// People who sign in with a username and password: add one (the server makes the password, shown
+/// once with Copy), give one a new temporary password, take one's password away.
+fn users(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
+    let ctx = ui.ctx().clone();
+    let Some(w) = app.ui.admin.as_ref() else { return };
+    let (users, made) = (w.users.clone(), w.made.clone());
+    if users.is_none() && !app.session.waiting_for(USERS) {
+        ask(app, &ctx, USERS, json!({}), Box::new(|app, _, v| with(app, |w| w.users = Some(v))));
+    }
+    if let Some((username, password)) = made {
+        egui::Frame::NONE.fill(t.field).corner_radius(egui::CornerRadius::same(6)).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+            widgets::label(
+                ui,
+                &trf(
+                    "The password for {username}, shown only this once: give it to them. They choose their own when they first sign in.",
+                    &[("username", &username)],
+                ),
+                t.text,
+            );
+            ui.label(RichText::new(&password).font(egui::FontId::monospace(14.0)).color(t.text));
+            ui.horizontal(|ui| {
+                if widgets::button(ui, tr("Copy"), false, true).clicked() {
+                    app.services.clipboard_set_text(&password);
+                    app.toast(tr("Password copied"));
+                }
+                if widgets::button(ui, tr("Done"), true, true).clicked() {
+                    with(app, |w| w.made = None);
+                }
+            });
+        });
+    }
+    let busy = busy(app);
+    let shown = |app: &mut FigApp, v: Value| {
+        let username = v["username"].as_str().unwrap_or_default().to_string();
+        let password = v["password"].as_str().map(str::to_string);
+        with(app, |w| {
+            w.users = None;
+            w.made = password.map(|p| (username, p));
+        });
+    };
+    for u in users.as_ref().and_then(|v| v["users"].as_array().cloned()).unwrap_or_default() {
+        let username = u["username"].as_str().unwrap_or_default().to_string();
+        ui.horizontal(|ui| {
+            ui.scope(|ui| {
+                ui.set_width(300.0);
+                let mut line = username.clone();
+                if let Some(e) = u["email"].as_str() {
+                    line = format!("{line} · {e}");
+                }
+                widgets::label(ui, &line, t.text);
+                if u["temporary"] == true {
+                    widgets::label(ui, tr("temporary password"), t.text_secondary);
+                }
+            });
+            if widgets::button(ui, tr("Reset password"), false, !busy)
+                .on_hover_text(tr("A new temporary password, shown once; their sessions end"))
+                .clicked()
+            {
+                ask(app, &ctx, "admin.resetPassword", json!({"username": username}), Box::new(move |app, _, v| shown(app, v)));
+            }
+            if widgets::button(ui, tr("Remove"), false, !busy)
+                .on_hover_text(tr("They can't sign in with it any more; their account and files stay"))
+                .clicked()
+            {
+                ask(app, &ctx, "admin.removeUser", json!({"username": username}), Box::new(|app, _, _| with(app, |w| w.users = None)));
+            }
+        });
+    }
+    ui.add_space(6.0);
+    let Some(w) = app.ui.admin.as_mut() else { return };
+    let mut add = None;
+    ui.horizontal(|ui| {
+        let (user, email, name) = &mut w.new_user;
+        let r = widgets::text_input(ui, egui::Id::new("admin_new_username"), user, 140.0, tr("Username"));
+        a11y::text(&r, tr("Username"), user);
+        let r = widgets::text_input(ui, egui::Id::new("admin_new_email"), email, 180.0, tr("Email (optional)"));
+        a11y::text(&r, tr("Email"), email);
+        let r = widgets::text_input(ui, egui::Id::new("admin_new_name"), name, 140.0, tr("Name (optional)"));
+        a11y::text(&r, tr("Name"), name);
+        if widgets::button(ui, tr("Add user"), true, !user.trim().is_empty() && !busy).clicked() {
+            add = Some(json!({"username": user.trim(), "email": email.trim(), "name": name.trim()}));
+        }
+    });
+    if let Some(params) = add {
+        w.new_user = Default::default();
+        ask(app, &ctx, "admin.createUser", params, Box::new(move |app, _, v| shown(app, v)));
     }
 }
 
