@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::change::{Change, Entry, Prop, Target};
 use crate::message::{
     AcceptedOf, Access, CatchUpOf, ClientMsg, Hello, PROTOCOL, Peer, Presence, Processed, ServerMsg, Signal, reads_sealed, reads_signals,
+    sealed_rules,
 };
 use crate::opaque::OpaqueReplica;
 use crate::replica::{Mode, Replica, create_change};
@@ -353,6 +354,10 @@ pub const PLAIN_FILE: &str = "this file isn't sealed: send its changes and prese
 /// Why a client that doesn't read sealed messages can't join a sealed file.
 pub const NEEDS_SEALED: &str = "this file is sealed (end-to-end encrypted): open it with a FigCraft that knows sealed files";
 
+/// Why a client checking a sealed file's values with other rules (an older or newer FigCraft) can't
+/// join it: its copy could come out different from everyone else's.
+pub const OTHER_RULES: &str = "this file is sealed (end-to-end encrypted) and every app checks its changes the same way: this FigCraft checks them differently (update FigCraft, or ask the server's operator to)";
+
 /// What changed a server's lasting state, in order: what a store appends to its log between
 /// snapshots ([`SessionServer::journaling`]) and replays over the last snapshot after a restart
 /// ([`SessionServer::replay`]). Presence and who is connected aren't in it.
@@ -617,7 +622,8 @@ impl<S: Synced> SessionServer<S> {
     /// coming back ([`Hello::resume`]) keeps its id (taking over from its old connection if that
     /// is still open: the transport closes the old one) and gets the batches it missed, or a
     /// snapshot when they are no longer in the log; an id this session never gave out joins as
-    /// new. A sealed file takes only clients that announce [`SEALED`](crate::message::SEALED).
+    /// new. A sealed file takes only clients that announce [`SEALED`](crate::message::SEALED) and
+    /// this build's sealed value rules ([`RULES`](crate::message::RULES), [`OTHER_RULES`]).
     pub fn join(&mut self, hello: Hello) -> Result<(u32, Vec<Outgoing>), ServerMsg> {
         self.join_as(hello, Access::Edit)
     }
@@ -633,6 +639,9 @@ impl<S: Synced> SessionServer<S> {
         }
         if S::SEALED && !reads_sealed(&hello.client_version) {
             return Err(refuse(NEEDS_SEALED));
+        }
+        if S::SEALED && sealed_rules(&hello.client_version) != Some(crate::rules::SEALED_RULES) {
+            return Err(refuse(OTHER_RULES));
         }
         let resume = hello.resume.filter(|r| r.session == self.session && self.issued.contains_key(&r.client_id));
         if self.peers.len() >= self.limits.max_peers && resume.is_none_or(|r| !self.peers.contains_key(&r.client_id)) {

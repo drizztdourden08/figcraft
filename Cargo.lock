@@ -1895,6 +1895,7 @@ dependencies = [
  "figcraft-doc",
  "figcraft-engine",
  "figcraft-format",
+ "figcraft-mcp",
  "figcraft-plugin",
  "log",
  "ring",

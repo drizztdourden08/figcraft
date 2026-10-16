@@ -12,7 +12,7 @@ use imbl::{OrdMap, OrdSet};
 use crate::Error;
 use crate::change::{DocProp, Prop};
 use crate::frac;
-use crate::sealed::{EntryKey, KIND_TAGS, Sealed, SealedChange, SealedEntry, is_container_tag, is_page_tag};
+use crate::sealed::{EntryKey, KIND_TAGS, Sealed, SealedChange, SealedEntry, is_container_tag, is_page_tag, split_signature};
 
 /// A node: its kind's tag and sealed kind, its place in the tree and its sealed properties.
 #[derive(Clone, Debug, PartialEq)]
@@ -23,6 +23,11 @@ struct Node {
     position: String,
     props: OrdMap<Prop, Sealed>,
     children: OrdSet<NodeId>,
+    /// The kind it was created with (tag and sealed kind), once its kind changed to another tag.
+    /// A new node's properties start from its kind's defaults and only written ones are kept here,
+    /// so a snapshot creates it with that kind, then sets the current one: an app that joins later
+    /// starts from the same defaults as the apps that saw it created.
+    born: Option<(String, Sealed)>,
 }
 
 /// A document-level entry: its key and sealed name, its value (`None`: removed after the last
@@ -150,16 +155,23 @@ impl OpaqueReplica {
         out
     }
 
-    fn create_of(&self, id: NodeId) -> Option<SealedChange> {
-        let n = self.nodes.get(&id)?;
-        Some(SealedChange::Create {
+    /// The changes that make node `id` as it is: its creation with the kind it was created with,
+    /// then its current kind when that changed (see [`Node::born`]).
+    fn create_of(&self, id: NodeId) -> Vec<SealedChange> {
+        let Some(n) = self.nodes.get(&id) else { return Vec::new() };
+        let (tag, kind) = n.born.as_ref().map_or((&n.kind_tag, &n.kind), |(t, k)| (t, k));
+        let mut out = vec![SealedChange::Create {
             id,
-            kind_tag: n.kind_tag.clone(),
-            kind: n.kind.clone(),
+            kind_tag: tag.clone(),
+            kind: kind.clone(),
             parent: n.parent,
             position: n.position.clone(),
             props: n.props.iter().map(|(p, v)| (*p, v.clone())).collect(),
-        })
+        }];
+        if n.born.is_some() {
+            out.push(SealedChange::SetKind { id, kind_tag: n.kind_tag.clone(), value: n.kind.clone() });
+        }
+        out
     }
 
     /// The whole state as changes that build it from nothing: every node (pages, then each tree
@@ -171,7 +183,7 @@ impl OpaqueReplica {
         let mut out = Vec::with_capacity(self.nodes.len() + self.doc.len() + self.entries.len());
         let roots = self.sorted(self.nodes.iter().filter(|(_, n)| n.parent.is_none()).map(|(id, _)| *id));
         for r in roots {
-            out.extend(self.subtree(r).into_iter().filter_map(|id| self.create_of(id)));
+            out.extend(self.subtree(r).into_iter().flat_map(|id| self.create_of(id)));
         }
         for (prop, value) in &self.doc {
             if list_of(*prop).is_none() {
@@ -199,12 +211,14 @@ impl OpaqueReplica {
     /// Apply a batch with the server's structural checks: nodes exist (or don't, to be created),
     /// pages and only pages have no parent, no node becomes or stops being a page, only containers
     /// hold layers, positions are valid fractional keys, no layer goes inside itself, a deletion
-    /// takes the subtree, the file keeps a page; property names and entry names fit their changes.
-    /// Stops at the first problem (the state is then left partly changed: apply to a clone). The
-    /// nodes deleted.
+    /// takes the subtree, the file keeps a page; property names and entry names fit their changes;
+    /// a batch's signature ([`SealedChange::Signature`]) is its last change and its only one (the
+    /// apps check what it signs). Stops at the first problem (the state is then left partly
+    /// changed: apply to a clone). The nodes deleted.
     pub fn apply(&mut self, changes: &[SealedChange]) -> Result<Vec<NodeId>, Error> {
         let mut deleted = Vec::new();
         let mut touched: BTreeSet<NodeId> = BTreeSet::new();
+        let (changes, _signature) = split_signature(changes)?;
         for c in changes {
             self.apply_one(c, &mut deleted, &mut touched)?;
         }
@@ -256,6 +270,7 @@ impl OpaqueReplica {
                     position: position.clone(),
                     props: map,
                     children: OrdSet::new(),
+                    born: None,
                 };
                 self.nodes.insert(*id, node);
             }
@@ -270,6 +285,9 @@ impl OpaqueReplica {
                 let node = self.node_mut(*id)?;
                 if is_page_tag(&node.kind_tag) != is_page_tag(kind_tag) {
                     return Err(Error::Invalid("a node can't become or stop being a page".into()));
+                }
+                if node.born.is_none() && node.kind_tag != *kind_tag {
+                    node.born = Some((node.kind_tag.clone(), node.kind.clone()));
                 }
                 node.kind_tag = kind_tag.clone();
                 node.kind = value.clone();
@@ -361,11 +379,21 @@ impl OpaqueReplica {
                     }
                 }
             }
+            // Changes nothing (taken off the batch in `apply`).
+            SealedChange::Signature(_) => {}
             SealedChange::Remove { entry } => {
                 check_entry(entry)?;
                 let in_whole = entry.key.list().is_some_and(|w| self.doc.contains_key(&w));
                 if in_whole {
-                    let added = self.entries.get(&entry.key).map_or(self.counter, |s| s.added);
+                    // A removal of an entry it never saw takes the next counter too, so the
+                    // removals keep their order when a snapshot is rebuilt.
+                    let added = match self.entries.get(&entry.key) {
+                        Some(s) => s.added,
+                        None => {
+                            self.counter += 1;
+                            self.counter - 1
+                        }
+                    };
                     self.entries.insert(entry.key.clone(), Slot { entry: entry.clone(), value: None, added, late: true });
                 } else {
                     self.entries.remove(&entry.key);
@@ -386,7 +414,7 @@ impl OpaqueReplica {
                 out.push(c);
             }
         };
-        for c in changes {
+        for c in changes.iter().filter(|c| !matches!(c, SealedChange::Signature(_))) {
             if let Some(id) = c.node()
                 && !self.nodes.contains_key(&id)
             {
@@ -417,7 +445,7 @@ impl OpaqueReplica {
                 }
                 SealedChange::Delete { id } => {
                     for d in self.subtree(*id) {
-                        if let Some(c) = self.create_of(d) {
+                        for c in self.create_of(d) {
                             push(c, &mut out);
                         }
                     }
@@ -432,6 +460,7 @@ impl OpaqueReplica {
                     Some(Slot { entry: e, value: None, .. }) => push(SealedChange::Remove { entry: e.clone() }, &mut out),
                     None => push(SealedChange::Remove { entry: entry.clone() }, &mut out),
                 },
+                SealedChange::Signature(_) => {}
             }
         }
         out

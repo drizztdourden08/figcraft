@@ -15,6 +15,9 @@
 //! - [`DeviceKeys`]: an install's X25519 key (file keys are wrapped to it with RFC 9180 HPKE,
 //!   [`wrap`] / [`unwrap`]) and Ed25519 key ([`DeviceKeys::sign`], [`verify`]).
 //! - [`link_fragment`] / [`parse_link_fragment`]: a file key in a share link's `#k=` fragment.
+//! - [`sign_batch`] / [`check_batch`]: editors' signatures on sealed batches, checked against the
+//!   [`EditorKeys`] an app trusts; [`safety_number`]: a short number to compare someone's device
+//!   keys by (step 10).
 //! - [`RecoveryKey`]: 32 random bytes written as grouped base32 with a checksum, sealing a copy of
 //!   someone's keyring.
 //!
@@ -26,7 +29,10 @@ mod keys;
 mod random;
 mod recovery;
 mod seal;
+mod sign;
 
+#[cfg(test)]
+mod hardening_tests;
 #[cfg(test)]
 mod sim_tests;
 #[cfg(test)]
@@ -36,11 +42,12 @@ pub use change::{open_change, open_presence, open_signal, seal_change, seal_pres
 // The data of sealed files lives in `figcraft-collab` (the session messages carry it).
 pub use device::{DeviceKeys, DevicePublic, Wrapped, unwrap, verify, wrap};
 pub use figcraft_collab::sealed::{
-    EntryKey, MAX_PLAINTEXT, Sealed, SealedChange, SealedEntry, is_container_tag, is_page_tag, kind_tag, node_kind_tag, padded_len,
+    BatchSignature, EntryKey, MAX_PLAINTEXT, Sealed, SealedChange, SealedEntry, is_container_tag, is_page_tag, kind_tag, node_kind_tag, padded_len,
 };
 pub use keys::{FileKey, Keyring, MAX_LINK_EPOCHS, entry_id, link_fragment, parse_link_fragment, parse_ring_fragment, ring_fragment};
 pub use recovery::RecoveryKey;
 pub use seal::{Slot, open, seal};
+pub use sign::{AnyEditor, BatchRefused, EditorKeys, KnownEditors, Signed, batch_message, check_batch, safety_number, sign_batch, verify_batch};
 
 /// Why something couldn't be sealed, opened, decoded or unwrapped.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

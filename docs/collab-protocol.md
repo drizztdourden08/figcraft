@@ -188,8 +188,11 @@ changes.
 
 **Sealed files** came later within version 2 the same way: a client that seals and opens the
 sealed session messages says so with the word `sealed` in its hello's `client_version`
-(`"0.6.0 signals hosting sealed"`); a sealed file refuses clients that don't, and plain files never
-send them sealed messages. The app's transport seals what its sync client sends and opens what
+(`"0.6.0 signals hosting sealed rules1"`); a sealed file refuses clients that don't, and plain
+files never send them sealed messages. `rules<N>` is the version of the value rules the client
+checks a sealed file's batches with (the server can't): a sealed file takes only clients with the
+server's version, so no two copies of it are checked differently (see
+[`accounts-and-e2e.md`](accounts-and-e2e.md#same-checks-everywhere-built-step-10)). The app's transport seals what its sync client sends and opens what
 arrives, so the client and the engine only see the plain messages (see
 [`accounts-and-e2e.md`](accounts-and-e2e.md#sealing-in-the-app-built-step-8)).
 

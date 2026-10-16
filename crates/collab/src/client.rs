@@ -61,6 +61,9 @@ pub struct Client {
     notices: Vec<Notice>,
     /// What the server lets this client do (a viewer's edits are refused).
     access: Access,
+    /// How the server's batches are applied: [`Mode::Strict`] on a plain file (the server checked
+    /// them), [`Mode::Sealed`] on a sealed one (every app checks them the same way).
+    rules: Mode,
 }
 
 /// The step with id `id` in either stack.
@@ -84,10 +87,22 @@ impl Client {
 
     /// Start from the server's `Welcome` (which must carry a snapshot).
     pub fn join(welcome: ServerMsg) -> Result<Client, Error> {
+        Client::join_with(welcome, Mode::Strict)
+    }
+
+    /// Start from a sealed file's `Welcome` (opened into a plain one): the server couldn't check
+    /// its values, so this client applies every batch under the sealed value rules
+    /// ([`Mode::Sealed`], [`crate::rules`]): a value that breaks them takes its default and a change
+    /// that can't apply is skipped, the same in every app, instead of failing the session.
+    pub fn join_sealed(welcome: ServerMsg) -> Result<Client, Error> {
+        Client::join_with(welcome, Mode::Sealed)
+    }
+
+    fn join_with(welcome: ServerMsg, rules: Mode) -> Result<Client, Error> {
         let ServerMsg::Welcome { session, client_id, seq, catch_up: CatchUp::Snapshot(snapshot), processed, peers, access } = welcome else {
             return Err(Error::Protocol("expected a welcome with the document".into()));
         };
-        let mut confirmed = Replica::from_snapshot(&snapshot)?;
+        let mut confirmed = Replica::from_snapshot_in(&snapshot, rules)?;
         confirmed.document_mut().set_client_id(client_id);
         let next_id = confirmed.document().next_id();
         Ok(Client {
@@ -110,7 +125,14 @@ impl Client {
             history_limit: HISTORY_LIMIT,
             notices: Vec::new(),
             access,
+            rules,
         })
+    }
+
+    /// Whether this client applies the server's batches under the sealed value rules
+    /// ([`join_sealed`](Self::join_sealed)).
+    pub fn is_sealed(&self) -> bool {
+        self.rules == Mode::Sealed
     }
 
     /// This client's id (its node ids are `id << 32 | counter`).
@@ -504,7 +526,8 @@ impl Client {
             return Err(Error::Protocol(format!("sequence {} after {}", acc.seq, self.seq)));
         }
         if acc.author != self.id {
-            self.confirmed.apply(&acc.changes, Mode::Strict)?;
+            let applied = self.confirmed.apply(&acc.changes, self.rules)?;
+            self.checked(&acc, &applied);
             self.seq = acc.seq;
             // Ordered after the steps the server confirmed already: those leave its targets alone.
             let touches = Touches::of(&acc.changes);
@@ -519,7 +542,8 @@ impl Client {
         }
         let mine = self.pop_sent(acc.batch_id, "confirmation")?;
         let before = self.confirmed.clone();
-        let applied = self.confirmed.apply(&acc.changes, Mode::Strict)?;
+        let applied = self.confirmed.apply(&acc.changes, self.rules)?;
+        self.checked(&acc, &applied);
         self.seq = acc.seq;
         if mine.kind != BatchKind::FollowUp
             && let Some(s) = mine.step.and_then(|id| find_step(&mut self.undo, &mut self.redo, id))
@@ -532,6 +556,14 @@ impl Client {
             self.repair(&before, &applied.touched, recompute)?;
         }
         Ok(())
+    }
+
+    /// A sealed file's batch had values the rules reset or changes they skipped: say so (how
+    /// many, never what).
+    fn checked(&mut self, acc: &Accepted, applied: &crate::Applied) {
+        if applied.skipped > 0 || applied.defaulted > 0 {
+            self.notices.push(Notice::Checked { seq: acc.seq, author: acc.author, skipped: applied.skipped, defaulted: applied.defaulted });
+        }
     }
 
     /// Batch `p` was refused: its step leaves the undo history, with the batches of that step
@@ -586,7 +618,7 @@ impl Client {
                 }
             }
             CatchUp::Snapshot(snapshot) => {
-                let mut confirmed = Replica::from_snapshot(&snapshot)?;
+                let mut confirmed = Replica::from_snapshot_in(&snapshot, self.rules)?;
                 confirmed.document_mut().set_client_id(self.id);
                 self.confirmed = confirmed;
                 self.seq = seq;
@@ -633,7 +665,7 @@ impl Client {
         let lost = self.pending.iter().filter(|p| p.kind != BatchKind::FollowUp).count();
         let notices = std::mem::take(&mut self.notices);
         let limit = self.history_limit;
-        *self = Client::join(welcome)?;
+        *self = Client::join_with(welcome, self.rules)?;
         self.notices = notices;
         self.history_limit = limit;
         if lost > 0 {

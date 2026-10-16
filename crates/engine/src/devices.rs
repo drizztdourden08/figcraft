@@ -656,6 +656,23 @@ fn devices(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// The safety number of your devices on a server (`figcraft_collab_seal::safety_number`, step 10):
+/// what you read out to someone checking that the devices the server lists for you are yours.
+fn safety_number(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "account.safetyNumber";
+    let server = s.account_server(CMD, p)?;
+    if string(p, "account").is_some() {
+        return Err(bad(CMD, "only your own devices' number for now: the server doesn't list another person's devices yet"));
+    }
+    s.device_id(CMD, &server)?;
+    let list = match s.account_request(CMD, &server, AccountReq::Devices)? {
+        AccountReply::Devices(l) => l,
+        _ => return Err(other("the server answered something else")),
+    };
+    let keys: Vec<_> = list.iter().map(|d| d.public.clone()).collect();
+    Ok(json!({"server": server, "safetyNumber": figcraft_collab_seal::safety_number(&keys), "devices": list.len()}))
+}
+
 fn revoke_device(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "account.revokeDevice";
     let server = s.account_server(CMD, p)?;
@@ -821,6 +838,13 @@ pub fn specs() -> Vec<CommandSpec> {
             "{server?, name? (this device's name in the list)} → {server, device (this one's id), keyStore: keychain | preferences (where this device's key is kept: preferences is weaker), devices: [{id, name, created, seen, recovery, thisDevice}]}: registers this device for end-to-end encrypted files on a server with accounts, and lists yours",
             false,
             devices
+        ),
+        spec!(
+            "account.safetyNumber",
+            "Safety number",
+            "{server?} → {server, safetyNumber (12 digits, \"1234 5678 9012\"), devices (how many it covers)}: a short number for the devices registered for you on a server with accounts (recovery device included). Read it out to someone who checks it the same way: a device the server added without you changes it",
+            false,
+            safety_number
         ),
         spec!(
             "account.revokeDevice",

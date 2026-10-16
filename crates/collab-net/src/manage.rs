@@ -257,17 +257,23 @@ pub fn library(link: &str, req: LibraryReq, limits: &NetLimits, timeout: Duratio
         _ => None,
     };
     let invite = Invite::parse(link)?;
-    let open = OpenLibrary { protocol: PROTOCOL, file: invite.file, token: invite.token, client_version: env!("CARGO_PKG_VERSION").to_string() };
+    let open = OpenLibrary {
+        protocol: PROTOCOL,
+        file: invite.file.clone(),
+        token: invite.token.clone(),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
     let mut ws = connect(&invite.server, limits, timeout)?;
     send(&mut ws, &ClientMsg::OpenLibrary(open))?;
     match reply(&mut ws, limits, lib)? {
         LibraryReply::Ready { .. } => {}
         other => return Err(format!("the server answered {other:?} instead of opening the library")),
     }
-    send(&mut ws, &ClientMsg::Library(req))?;
+    // A sealed file's archive is sealed and opened with the link's key (`#k=`).
+    send(&mut ws, &ClientMsg::Library(crate::sealing::library_out(&invite, req)?))?;
     let r = reply(&mut ws, limits, lib)?;
     close(ws);
-    Ok(r)
+    crate::sealing::library_in(&invite, r)
 }
 
 /// Send one request to the plugin directory of the server at `server`, with its `key` (empty: only

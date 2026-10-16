@@ -88,6 +88,7 @@ fn the_commands_need_a_sign_in() {
         ("account.recoveryKey", json!({"server": "wss://a.example/"})),
         ("account.recover", json!({"server": "wss://a.example/", "recoveryKey": "AAAAA"})),
         ("account.syncKeys", json!({"server": "wss://a.example/"})),
+        ("account.safetyNumber", json!({"server": "wss://a.example/"})),
     ] {
         assert!(s.execute(cmd, &p).is_err(), "{cmd}");
     }

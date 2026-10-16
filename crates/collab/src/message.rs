@@ -35,11 +35,22 @@ pub fn reads_sealed(client_version: &str) -> bool {
     client_version.split_whitespace().any(|w| w == SEALED)
 }
 
+/// The prefix of the word announcing which version of the sealed value rules a client applies
+/// (`rules1`: [`crate::rules::SEALED_RULES`]). A sealed file takes only clients with the server's
+/// version, so every copy of it is checked with the same rules.
+pub const RULES: &str = "rules";
+
+/// The sealed value rules version a [`Hello::client_version`] announces (`None`: none, as apps
+/// from before the rules were versioned).
+pub fn sealed_rules(client_version: &str) -> Option<u32> {
+    client_version.split_whitespace().find_map(|w| w.strip_prefix(RULES)?.parse().ok())
+}
+
 /// The `client_version` this build announces: its version, then what it reads beyond the protocol
 /// (sealed files: the app's transport seals and opens around the sync client, see
-/// `figcraft-collab-net`).
+/// `figcraft-collab-net`; and the version of the value rules it checks them with).
 pub fn client_version() -> String {
-    format!("{} {SIGNALS} {HOSTING} {SEALED}", env!("CARGO_PKG_VERSION"))
+    format!("{} {SIGNALS} {HOSTING} {SEALED} {RULES}{}", env!("CARGO_PKG_VERSION"), crate::rules::SEALED_RULES)
 }
 
 /// A [`Hello::client_version`] that announces [`SIGNALS`].

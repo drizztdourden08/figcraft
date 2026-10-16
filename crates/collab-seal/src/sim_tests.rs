@@ -14,14 +14,14 @@ use figcraft_doc::{Document, NodeId, NodeKind, Style, StyleKind};
 
 use crate::{FileKey, Keyring, open_change, open_presence, seal_change, seal_presence};
 
-const FILE: &str = "0123456789abcdef";
+pub(crate) const FILE: &str = "0123456789abcdef";
 
-fn seal_all(key: &FileKey, changes: &[Change]) -> Vec<SealedChange> {
+pub(crate) fn seal_all(key: &FileKey, changes: &[Change]) -> Vec<SealedChange> {
     changes.iter().map(|c| seal_change(key, FILE, c).unwrap()).collect()
 }
 
 /// Open what can be opened (a change that doesn't open is skipped, the same way everywhere).
-fn open_all(ring: &Keyring, changes: &[SealedChange]) -> Vec<Change> {
+pub(crate) fn open_all(ring: &Keyring, changes: &[SealedChange]) -> Vec<Change> {
     changes.iter().filter_map(|c| open_change(ring, FILE, c).ok()).collect()
 }
 
@@ -55,7 +55,7 @@ fn open_msg(ring: &Keyring, msg: ServerMsg) -> ServerMsg {
     }
 }
 
-fn base() -> Document {
+pub(crate) fn base() -> Document {
     let mut d = Document::new("Shared");
     let page = d.first_page().unwrap();
     for i in 0..3 {
@@ -69,7 +69,7 @@ fn base() -> Document {
 }
 
 /// One random edit, as a command would make it.
-fn random_edit(doc: &mut Document, rng: &mut Rng) {
+pub(crate) fn random_edit(doc: &mut Document, rng: &mut Rng) {
     let ids: Vec<NodeId> = doc.ids().collect();
     let containers: Vec<NodeId> = ids.iter().copied().filter(|i| doc.node(*i).is_some_and(|n| n.kind.is_container())).collect();
     let layers: Vec<NodeId> = ids.iter().copied().filter(|i| doc.node(*i).is_some_and(|n| !n.is_page())).collect();
@@ -185,7 +185,9 @@ impl Sim {
             let mut rest = Vec::new();
             for o in out {
                 match o {
-                    Outgoing::To(to, w @ ServerMsg::SealedWelcome { .. }) if to == id => client = Some(Client::join(open_msg(&sim.ring, w)).unwrap()),
+                    Outgoing::To(to, w @ ServerMsg::SealedWelcome { .. }) if to == id => {
+                        client = Some(Client::join_sealed(open_msg(&sim.ring, w)).unwrap())
+                    }
                     other => rest.push(other),
                 }
             }

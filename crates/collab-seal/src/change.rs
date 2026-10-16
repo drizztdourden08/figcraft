@@ -159,6 +159,8 @@ pub fn open_change(keyring: &Keyring, file: &str, sealed: &SealedChange) -> Resu
             Change::Put { entry: open_entry(keyring, file, entry)?, value }
         }
         SealedChange::Remove { entry } => Change::Remove { entry: open_entry(keyring, file, entry)? },
+        // Taken off the batch and checked before its changes open (`check_batch`).
+        SealedChange::Signature(_) => return Err(SealError::Invalid("a batch's signature isn't a change".into())),
     })
 }
 
