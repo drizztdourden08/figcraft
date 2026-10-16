@@ -311,3 +311,22 @@ fn a_join_refused_for_an_ended_sign_in_forgets_it() {
     s.live_poll();
     assert!(s.signed_in(OTHER).is_some());
 }
+
+#[test]
+fn folders_and_pictures_say_they_arent_there_yet() {
+    let (mut s, _) = session();
+    run(&mut s, "servers.add", json!({"url": SERVER}));
+    assert!(err(&mut s, "account.folders", json!({})).contains("signed in"));
+    signed_in(&mut s, SERVER, false);
+    for (cmd, p) in [
+        ("account.folders", json!({})),
+        ("account.createFolder", json!({"path": "Work"})),
+        ("account.renameFolder", json!({"path": "Work", "to": "Old"})),
+        ("account.removeFolder", json!({"path": "Work"})),
+        ("account.moveFile", json!({"file": "f1", "folder": "Work"})),
+        ("account.thumbnail", json!({"file": "f1"})),
+    ] {
+        assert!(err(&mut s, cmd, p).contains(crate::folders::NO_FOLDERS), "{cmd}");
+    }
+    assert!(err(&mut s, "account.moveFile", json!({"file": "f1"})).contains("folder"));
+}

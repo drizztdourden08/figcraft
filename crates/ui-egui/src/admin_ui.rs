@@ -39,7 +39,7 @@ impl AdminTab {
     fn label(self) -> &'static str {
         match self {
             AdminTab::People => tr("People"),
-            AdminTab::Files => tr("Files"),
+            AdminTab::Files => tr("Ownership"),
             AdminTab::Status => tr("Status"),
         }
     }

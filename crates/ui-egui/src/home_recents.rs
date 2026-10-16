@@ -806,13 +806,50 @@ fn card(
     alpha: f32,
     now: u64,
 ) {
+    let shown = match picture {
+        Some((page, texture, _)) if stat.exists && (page.is_some() || texture.is_some()) => CardPicture::Image { page, texture, alpha },
+        // Being read: the empty area, the picture fades in.
+        None if stat.exists => CardPicture::Empty,
+        // Nothing to show (a missing file, an svg, a damaged picture): a file glyph.
+        _ => CardPicture::Glyph(Icon::Page),
+    };
+    let detail = file.detail(now);
+    let lead = |ui: &Ui, at: egui::Pos2| file_icon(ui, t, at, &file.path);
+    file_card(ui, t, rect, picture_h, resp, selected, shown, &lead, &file.name, &detail);
+}
+
+/// What a card's picture area shows.
+pub(crate) enum CardPicture {
+    /// The file's picture on its page colour, faded in by `alpha`.
+    Image { page: Option<Color32>, texture: Option<egui::TextureHandle>, alpha: f32 },
+    /// Nothing yet.
+    Empty,
+    /// A glyph in the middle (no picture to show).
+    Glyph(Icon),
+}
+
+/// A file card as the home screen draws them (Recents, a server's files): the picture area, the
+/// mark `lead` paints, the name and a line under it, selected or hovered.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn file_card(
+    ui: &Ui,
+    t: &Tokens,
+    rect: Rect,
+    picture_h: f32,
+    resp: &Response,
+    selected: bool,
+    picture: CardPicture,
+    lead: &dyn Fn(&Ui, egui::Pos2),
+    name: &str,
+    detail: &str,
+) {
     let p = ui.painter();
     p.rect_filled(rect, CornerRadius::same(8), if resp.hovered() { t.hover } else { t.panel });
     let area = Rect::from_min_size(rect.min, vec2(rect.width(), picture_h)).shrink(1.0);
     let top = CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 };
     p.rect_filled(area, top, t.canvas);
     match picture {
-        Some((page, texture, _)) if stat.exists && (page.is_some() || texture.is_some()) => {
+        CardPicture::Image { page, texture, alpha } => {
             if let Some(page) = page {
                 p.rect_filled(area, top, page.gamma_multiply(alpha));
             }
@@ -824,18 +861,16 @@ fn card(
                 p.image(texture.id(), image, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE.gamma_multiply(alpha));
             }
         }
-        // Being read: the empty area, the picture fades in.
-        None if stat.exists => {}
-        // Nothing to show (a missing file, an svg, a damaged picture): a file glyph.
-        _ => icons::paint(p, Rect::from_center_size(area.center(), vec2(28.0, 28.0)), Icon::Page, t.icon_secondary),
+        CardPicture::Empty => {}
+        CardPicture::Glyph(icon) => icons::paint(p, Rect::from_center_size(area.center(), vec2(28.0, 28.0)), icon, t.icon_secondary),
     }
     p.line_segment([pos2(rect.min.x, area.max.y + 0.5), pos2(rect.max.x, area.max.y + 0.5)], Stroke::new(1.0, t.border));
     let y = area.max.y + 1.0 + FOOTER_H / 2.0;
-    file_icon(ui, t, pos2(rect.min.x + 24.0, y), &file.path);
+    lead(ui, pos2(rect.min.x + 24.0, y));
     let (x, w) = (rect.min.x + 44.0, rect.width() - 56.0);
-    let name = widgets::elide_font(ui, &file.name, w, semibold(12.5));
+    let name = widgets::elide_font(ui, name, w, semibold(12.5));
     p.text(pos2(x, y - 8.0), Align2::LEFT_CENTER, name, semibold(12.5), t.text);
-    let detail = widgets::elide_font(ui, &file.detail(now), w, regular(11.5));
+    let detail = widgets::elide_font(ui, detail, w, regular(11.5));
     p.text(pos2(x, y + 9.0), Align2::LEFT_CENTER, detail, regular(11.5), t.text_secondary);
     if selected {
         p.rect_stroke(rect, CornerRadius::same(8), Stroke::new(2.0, ACCENT), StrokeKind::Inside);

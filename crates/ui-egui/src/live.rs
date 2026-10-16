@@ -640,11 +640,6 @@ fn people_count(others: usize) -> String {
     }
 }
 
-/// The host a server address names (`wss://share.example/` is `share.example`).
-fn server_host(server: &str) -> &str {
-    server.split_once("://").map_or(server, |(_, rest)| rest).trim_end_matches('/')
-}
-
 /// What a server says about its hosting (`collab.serverInfo`): who runs it, its terms, how long
 /// files nobody opens are kept, and that it can read them.
 fn hosting_lines(ui: &mut Ui, t: &Tokens, info: &Value) {
@@ -660,7 +655,10 @@ fn hosting_lines(ui: &mut Ui, t: &Tokens, info: &Value) {
 fn online_note(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     widgets::label(
         ui,
-        &trf("People join from anywhere with a code. The file is kept on {server} while you share it.", &[("server", &server_host(server))]),
+        &trf(
+            "People join from anywhere with a code. The file is kept on {server} while you share it.",
+            &[("server", &crate::account_ui::server_name(app, server))],
+        ),
         t.text_secondary,
     );
     match app.ui.live.server_info.as_ref().filter(|(at, _)| at == server) {
@@ -840,7 +838,7 @@ fn join_and_advanced(app: &mut FigApp, ui: &mut Ui, t: &Tokens, has_advanced: bo
 /// others new links and codes for this same file; taking it off the server is a separate,
 /// confirmed step under Advanced.
 fn private_ui(app: &mut FigApp, ui: &mut Ui, t: &Tokens, share: &Share) {
-    let host = server_host(share.server.split('?').next().unwrap_or_default()).to_string();
+    let host = crate::account_ui::server_name(app, share.server.split('?').next().unwrap_or_default());
     widgets::label(
         ui,
         &trf("This file is on {server}, open only to you. Share it to let others in with a new code.", &[("server", &host)]),
@@ -991,7 +989,11 @@ fn guest_ui(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
     let live = app.session.live();
     let view = live.info.as_ref().is_some_and(|i| i.access == Access::View);
     if let Some(i) = live.info.as_ref() {
-        widgets::label(ui, &format!("{} · {}", i.address, if view { tr("View only") } else { tr("Can edit") }), t.text_secondary);
+        // A server by its name; a session on the local network by its address.
+        let key = figcraft_engine::accounts::server_of(&i.link).map(|s| figcraft_engine::accounts::server_key(&s));
+        let known = key.filter(|k| crate::account_ui::home_servers(app).iter().any(|s| s.url == *k));
+        let place = known.map_or_else(|| i.address.clone(), |k| crate::account_ui::server_name(app, &k));
+        widgets::label(ui, &format!("{place} · {}", if view { tr("View only") } else { tr("Can edit") }), t.text_secondary);
         if !i.pages.is_empty() {
             let pages: Vec<&str> = i.pages.iter().map(|p| p.name.as_str()).take(8).collect();
             widgets::label(ui, &trf("Pages: {pages}", &[("pages", &pages.join(", "))]), t.text_secondary);

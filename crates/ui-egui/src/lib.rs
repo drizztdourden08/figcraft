@@ -654,7 +654,7 @@ pub struct FigApp {
 
 /// Commands the window runs by itself (not because you asked): their errors are logged, not
 /// shown (a server that can't be reached says so where it is shown).
-const QUIET: [&str; 2] = ["account.info", "account.check"];
+const QUIET: [&str; 4] = ["account.info", "account.check", "account.folders", "account.thumbnail"];
 
 /// What to do with the result of a command run in the background.
 pub type Done = Box<dyn FnOnce(&mut FigApp, &egui::Context, Value)>;
@@ -786,7 +786,17 @@ impl FigApp {
     }
 
     pub fn toast(&mut self, msg: impl Into<String>) {
-        self.ui.toast = Some((msg.into(), ToastClock::Raised));
+        // Servers by their names, never their addresses (errors from the network name them).
+        let mut msg: String = msg.into();
+        for s in account_ui::home_servers(self) {
+            let host = figcraft_engine::servers::host(&s.url).to_string();
+            for at in [s.url.clone(), s.url.trim_end_matches('/').to_string(), host] {
+                if !at.is_empty() && at != s.name {
+                    msg = msg.replace(&at, &s.name);
+                }
+            }
+        }
+        self.ui.toast = Some((msg, ToastClock::Raised));
     }
 
     /// Say that `n` documents left unsaved by a crash were opened again from recovery copies.

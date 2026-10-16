@@ -28,8 +28,8 @@ fn info() -> ServerInfo {
     ServerInfo {
         auth: AuthMode::Accounts,
         providers: vec![
-            ProviderInfo { id: "tokens".into(), label: "Company token".into(), flows: vec![Flow::Token { label: "Company token".into() }] },
-            ProviderInfo { id: "sso".into(), label: "Company SSO".into(), flows: vec![Flow::Device] },
+            ProviderInfo { id: "tokens".into(), label: "Access token".into(), flows: vec![Flow::Token { label: "Access token".into() }] },
+            ProviderInfo { id: "sso".into(), label: "Example SSO".into(), flows: vec![Flow::Device] },
         ],
         ..ServerInfo::default()
     }
@@ -114,32 +114,34 @@ fn a_servers_page_signs_in_lists_your_files_and_their_people() {
     assert!(has_text(&shapes, "Team") && has_text(&shapes, "127.0.0.1:47910"));
     h.app.ui.preferences = false;
     let shapes = click(&mut h, "Team");
-    // Not signed in: the server's ways in.
-    for t in ["Sign in to 127.0.0.1:47910", "Company token", "Sign in with Company SSO"] {
+    // Not signed in: the server's ways in, under its name (never its address).
+    for t in ["Sign in to Team", "Access token", "Sign in with Example SSO"] {
         assert!(has_text(&shapes, t), "the page shows {t:?}");
     }
+    assert!(!has_text(&shapes, "127.0.0.1:47910"));
     assert!(wire.lock().unwrap().asked.iter().any(|r| matches!(r, NetRequest::Info { .. })));
-    // A token signs in; the files there show.
+    // A token signs in; the files there show as cards, and the tabs (Admin for an admin).
     h.app.ui.account.token = "ann".into();
     let shapes = h.frames(1);
     let sign_in = crate::live_tests::texts(&shapes).into_iter().filter(|t| t.0 == "Sign in").map(|t| t.1).next().unwrap();
     h.click(sign_in);
     let shapes = h.frames(6);
-    for t in ["Signed in as Ann (ann@example.com)", "Sign out", "Your files here", "Plan", "Server admin"] {
+    for t in ["Signed in as Ann (ann@example.com)", "Sign out", "Files", "People", "Admin", "Recent", "All files", "Plan"] {
         assert!(has_text(&shapes, t), "signed in, the page shows {t:?}");
     }
     assert!(!format!("{:?}", crate::account_ui::inspect(&h.app)).contains(TOKEN));
-    // A file's people, and an owner's invite field.
-    let shapes = h.frames(1);
-    let plan = text_center(&shapes, "Plan");
-    h.click(egui::pos2(280.0 + 720.0 - 18.0, plan.y));
-    let shapes = h.frames(6);
+    // The People tab: a file's people, and an owner's invite field.
+    click(&mut h, "People");
+    let shapes = click(&mut h, "Plan");
     for t in ["Ann (you)", "Bob", "Invite"] {
         assert!(has_text(&shapes, t), "the people show {t:?}");
     }
     assert!(wire.lock().unwrap().asked.iter().any(|r| matches!(r, NetRequest::Account { req: AccountReq::Members { file }, .. } if file == "f1")));
+    // The Admin tab: the server's people, no file management.
+    let shapes = click(&mut h, "Admin");
+    assert!(has_text(&shapes, "Ownership") && has_text(&shapes, "Status"));
     // Sign out: back to the ways in.
     let shapes = click(&mut h, "Sign out");
     assert!(h.app.session.signed_in(SERVER).is_none());
-    assert!(has_text(&shapes, "Company token"));
+    assert!(has_text(&shapes, "Access token"));
 }

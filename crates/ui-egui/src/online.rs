@@ -9,7 +9,7 @@
 
 use egui::{CornerRadius, Rect, Sense, Ui, pos2, vec2};
 use figcraft_engine::live::utc_date;
-use figcraft_engine::online::{FileState, OnlineFile, ServerProblem, server_host};
+use figcraft_engine::online::{FileState, OnlineFile, ServerProblem};
 use serde_json::{Value, json};
 
 use crate::FigApp;
@@ -39,8 +39,8 @@ pub struct OnlineUi {
 }
 
 /// What a row says after the file's name.
-fn detail(f: &OnlineFile) -> String {
-    let host = server_host(&f.server);
+fn detail(app: &FigApp, f: &OnlineFile) -> String {
+    let host = crate::account_ui::server_name(app, &f.server);
     if f.state == FileState::Gone {
         return trf("{server} · No longer on the server", &[("server", &host)]);
     }
@@ -132,7 +132,7 @@ fn status(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
         return widgets::label(ui, tr("Asking the server…"), t.text_secondary);
     }
     let problems: Vec<(String, bool)> =
-        app.session.live.servers.iter().map(|(s, p)| (server_host(s).to_string(), matches!(p, ServerProblem::Offline(_)))).collect();
+        app.session.live.servers.iter().map(|(s, p)| (crate::account_ui::server_name(app, s), matches!(p, ServerProblem::Offline(_)))).collect();
     let mut again = false;
     for (host, offline) in &problems {
         if *offline {
@@ -158,7 +158,7 @@ fn row(app: &mut FigApp, ui: &mut Ui, t: &Tokens, f: &OnlineFile, busy: bool) {
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
     let gone = f.state == FileState::Gone;
     let more = Rect::from_center_size(pos2(r.max.x - 18.0, r.center().y), vec2(24.0, 24.0));
-    let details = detail(f);
+    let details = detail(app, f);
     a11y::button(&resp, &format!("{}, {details}", f.name));
     let ink = if gone { t.text_tertiary } else { t.text };
     let glyph = if gone { Icon::Close } else { mark(f.shared.is_some()) };
@@ -241,7 +241,10 @@ fn forget(app: &mut FigApp, f: &OnlineFile) {
     if f.state == FileState::Gone {
         app.toast(trf("{name} cleared from the list", &[("name", &f.name)]));
     } else {
-        app.toast(trf("{name} is forgotten on this computer; the file stays on {server}", &[("name", &f.name), ("server", &server_host(&f.server))]));
+        app.toast(trf(
+            "{name} is forgotten on this computer; the file stays on {server}",
+            &[("name", &f.name), ("server", &crate::account_ui::server_name(app, &f.server))],
+        ));
     }
 }
 
@@ -263,7 +266,7 @@ pub fn dialogs(app: &mut FigApp, ctx: &egui::Context) {
         crate::dialogs::window(tr("Remove from server"), ctx).id(egui::Id::new("Remove online file")).open(&mut open).show(ctx, |ui| {
             ui.set_width(380.0);
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            widgets::label(ui, &trf("Remove {name} from {server}?", &[("name", &name), ("server", &server_host(&server))]), t.text);
+            widgets::label(ui, &trf("Remove {name} from {server}?", &[("name", &name), ("server", &crate::account_ui::server_name(app, &server))]), t.text);
             widgets::label(
                 ui,
                 tr("The file is deleted from the server: nobody can open or join it from there again, and this can't be undone. Copies that are open stay with whoever has them."),
@@ -316,7 +319,7 @@ pub fn inspect(app: &FigApp) -> Value {
         .prefs
         .online_files
         .iter()
-        .map(|f| json!({"file": f.file, "name": f.name, "detail": detail(f), "shared": f.shared.is_some(), "state": f.state, "hasOwnerToken": true}))
+        .map(|f| json!({"file": f.file, "name": f.name, "detail": detail(app, f), "shared": f.shared.is_some(), "state": f.state, "hasOwnerToken": true}))
         .collect();
     json!({
         "open": matches!(app.ui.home_view.section, crate::home::Section::Server(_)),

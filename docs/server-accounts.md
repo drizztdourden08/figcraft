@@ -549,22 +549,28 @@ People add the server in the app under **Preferences ▸ Servers** (a name and i
 `wss://figcraft.example.com/`); the browser build that a server hosts uses that server only. The
 home screen then has a page for the server, under **Servers** in its sidebar:
 
-- **Signing in**: the page lists the server's providers. One with a page shows **Sign in** (or
-  **Sign in with *Label*** when there are several): the provider's page opens in the system
-  browser, the page says *Finish signing in in your browser* (with **Cancel**) and comes back
-  signed in. One with the device flow shows the code to type (*Enter this code at …*, **Copy
-  code**, **Open the page**); in the browser build every sign-in uses the code. An `external`
-  provider shows a field for the token. A sign-in kept from before is checked when the page
-  opens, without asking anything; one the server no longer takes asks you to sign in again.
-  **Sign out** is on the same page.
-- **Your files here**: the files you are in, with your role; a click opens one (as a member, no
-  link needed). The people button at a row's end shows who is in it and lets owners change roles,
-  remove people, take invites back and **Invite** by email. **Put an open file here** publishes an
-  open file to the server as yours.
-- **Server admin** (admins only): **People** (end someone's sessions, **Remove…** them from the
-  server; when they are the last owner of files, **Make someone else owner** or **Remove
-  anyway**, and files left without an owner say so with **Give it an owner**), **Files** (each
-  file's members; change roles, add someone by email with a role) and **Status**.
+The app shows a server by the name given to it there, never by its address.
+
+- **Signing in**: the page offers the server's ways in, from what it says it accepts: none for a
+  server open to everyone (links and codes only); a username and password for basic sign-in; a
+  token field for an `external` provider; and for each single sign-on provider a light **Sign in
+  with *Label*** button (a plain key, never the provider's logo). The browser flow says *Finish
+  signing in in your browser* (with **Cancel**); the device flow shows the code to type (**Copy
+  code**, **Open the page**); in the browser build every sign-on uses the code. A sign-in kept
+  from before is checked when the page opens, without asking; one the server no longer takes asks
+  you to sign in again. **Sign out** is next to your name.
+- **Files** (the first tab): your files there as cards, like the home screen's own: **Recent**
+  first, then **All files** (and folders, with the path to go back up, once the server keeps
+  folders), each with your role and *Encrypted* for sealed files. A click opens one (as a member,
+  no link needed). **Put an open file here** publishes an open file to the server as yours.
+- **People**: each of your files; one opens to show who is in it, and owners change roles, remove
+  people, take invites back and **Invite** by email.
+- **Devices** (servers that keep sealed files): your devices, the recovery key, **Revoke**, **Make
+  a recovery key** (shown once) and **Use a recovery key**.
+- **Admin** (admins only): **People** (end someone's sessions, **Remove…** them from the server;
+  when they are the last owner of files, **Make someone else owner** or **Remove anyway**, and
+  files left without an owner say so with **Give it an owner**), **Ownership** (give a file an
+  owner) and **Status**. Files themselves are managed from Files, not here.
 - The **Share** popover of a file on the server shows its **People** in the same way. To put a
   file on the server from there, choose the server under **Online** and **Put on *server***.
 
