@@ -5,6 +5,7 @@
 
 use std::io;
 use std::net::{SocketAddr, TcpListener};
+use std::sync::Arc;
 
 use figcraft_collab::message::{Access, ClientMsg, Hello, PROTOCOL, Peer, Presence, ServerMsg};
 use figcraft_collab::{Outgoing, Server, same_secret};
@@ -101,7 +102,7 @@ impl Host {
         let me = server.peers().find(|p| p.client_id == me).cloned().ok_or_else(|| io::Error::other("the host didn't join its own session"))?;
         let backend = OneFile { file: cfg.file.clone(), token: cfg.token };
         let local = Local { file: cfg.file, server, id: me.client_id, inbox };
-        let hosting = Hosting::start(listener, backend, cfg.limits, Some(local))?;
+        let hosting = Hosting::start(listener, backend, cfg.limits, Some(local), Arc::new(figcraft_auth::Links))?;
         Ok(Host { hosting, me })
     }
 

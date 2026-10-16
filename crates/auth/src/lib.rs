@@ -1,0 +1,65 @@
+//! Accounts for `figcraft-server` (design: `docs/accounts-and-e2e.md`).
+//!
+//! A server can let people in by who they are instead of only by share links. *Who they are* comes
+//! from an [`IdentityProvider`]: built-in kinds speak standards (OpenID Connect, the OAuth device
+//! flow) or ask a verifier the operator runs, and anyone can add their own. The server talks to the
+//! providers; apps only open the provider's sign-in page and hand the server what comes back
+//! ([`SignIn`]), then use the server's own session token ([`Me::session`]).
+//!
+//! - [`wire`]: what apps and servers say about signing in (also part of `figcraft-collab`'s
+//!   messages): [`ServerInfo`], [`SignIn`], [`SignInReply`].
+//! - [`provider`]: [`Identity`], the [`IdentityProvider`] trait, and [`Fetch`] (the HTTPS a
+//!   provider needs, supplied by the server so this crate opens no sockets).
+//! - [`policy`]: who may sign in once a provider vouched for them, and who is an admin.
+//! - [`config`]: the `[auth]` and `[e2e]` settings of `server.toml`.
+//! - [`Gate`]: what a host asks before a connection's first message: what it accepts and who this
+//!   is. [`Links`] is today's behaviour (no accounts).
+
+pub mod config;
+pub mod policy;
+pub mod provider;
+pub mod wire;
+
+pub use config::{AuthConfig, E2eConfig, ProviderConfig};
+pub use policy::Policy;
+pub use provider::{AuthError, DeviceStart, Fetch, FetchError, Identity, IdentityProvider};
+pub use wire::{AuthMode, DeviceCode, E2eMode, Flow, Me, ProviderInfo, ServerInfo, SignIn, SignInReply};
+
+/// Someone a connection was signed in as: what a host's backend admits by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Person {
+    /// The server's id for them (stable across sign-ins).
+    pub account: String,
+    pub name: String,
+    pub email: Option<String>,
+    /// May manage the server (like the server key).
+    pub admin: bool,
+}
+
+/// What a host asks before a connection's first message (`Hello`, `Manage`…): what it accepts,
+/// and who a sign-in is. Called from the connection's own thread (providers are slow), never the
+/// hub's.
+pub trait Gate: Send + Sync {
+    /// What this host accepts (the answer to `Info`).
+    fn info(&self) -> ServerInfo;
+
+    /// A sign-in step: the reply, and the person when it signed the connection in.
+    fn sign_in(&self, req: SignIn) -> (SignInReply, Option<Person>);
+}
+
+/// Today's behaviour: share links only, nobody signs in, nothing sealed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Links;
+
+impl Gate for Links {
+    fn info(&self) -> ServerInfo {
+        ServerInfo::default()
+    }
+
+    fn sign_in(&self, _req: SignIn) -> (SignInReply, Option<Person>) {
+        (SignInReply::Refused { reason: "this server has no accounts: join with a share link or a code".into() }, None)
+    }
+}
+
+#[cfg(test)]
+mod tests;

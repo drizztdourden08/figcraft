@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use figcraft_auth::ServerInfo;
 use figcraft_collab::message::{
     self, Access, Admin, AdminReply, ClientMsg, HostInfo, LibraryReply, LibraryReq, Manage, NewLink, OpenHosting, OpenLibrary, OpenPlugins, PROTOCOL,
     PluginReply, PluginReq, Resolve, ServerMsg,
@@ -79,6 +80,24 @@ pub fn hosting(
     }
     close(ws);
     Ok((info, replies))
+}
+
+/// Ask the server at `server` what it accepts: who may get in, how to sign in, whether files are
+/// sealed. A server older than accounts can't read the question: it takes share links only
+/// ([`ServerInfo::default`]).
+pub fn info(server: &Endpoint, limits: &NetLimits, timeout: Duration) -> Result<ServerInfo, String> {
+    let mut ws = connect(server, limits, timeout)?;
+    send(&mut ws, &ClientMsg::Info)?;
+    let answer = match reply(&mut ws, limits, |m| match m {
+        ServerMsg::Info(i) => Some(*i),
+        _ => None,
+    }) {
+        Ok(i) => i,
+        Err(e) if e.contains("couldn't be read") => ServerInfo::default(),
+        Err(e) => return Err(e),
+    };
+    close(ws);
+    Ok(answer)
 }
 
 /// Ask the server at `server` which file join code `code` opens: the file's id and its link's

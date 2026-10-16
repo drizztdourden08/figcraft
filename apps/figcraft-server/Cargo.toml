@@ -19,6 +19,8 @@ workspace = true
 [dependencies]
 figcraft-collab = { workspace = true }
 figcraft-collab-net = { workspace = true }
+# Who may get in: accounts and identity providers.
+figcraft-auth = { workspace = true }
 # Checking a team library before keeping it (read as files using it read it).
 figcraft-format = { workspace = true }
 # Checking plugin bundles before the plugin directory keeps them (never run here).

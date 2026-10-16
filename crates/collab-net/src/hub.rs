@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use figcraft_auth::{Gate, Links};
 use figcraft_collab::message::{
     self, Access, Admin, AdminReply, ClientMsg, Hello, HostInfo, LibraryReply, LibraryReq, Manage, OpenHosting, OpenLibrary, OpenPlugins, PROTOCOL,
     PluginReply, PluginReq, Presence, Resolve, ServerMsg, reads_hosting,
@@ -455,12 +456,24 @@ pub struct Hosting {
 }
 
 impl Hosting {
-    /// Serve `backend`'s files on `listener`.
+    /// Serve `backend`'s files on `listener` (share links only: [`Links`]).
     pub fn serve<B: Backend>(listener: TcpListener, backend: B, limits: NetLimits) -> io::Result<Hosting> {
-        Self::start(listener, backend, limits, None)
+        Self::start(listener, backend, limits, None, Arc::new(Links))
     }
 
-    pub(crate) fn start<B: Backend>(listener: TcpListener, backend: B, limits: NetLimits, local: Option<Local>) -> io::Result<Hosting> {
+    /// Serve `backend`'s files on `listener`, with `gate` saying what the server accepts and who
+    /// signs in (before each connection's first message, in that connection's thread).
+    pub fn serve_gated<B: Backend>(listener: TcpListener, backend: B, limits: NetLimits, gate: Arc<dyn Gate>) -> io::Result<Hosting> {
+        Self::start(listener, backend, limits, None, gate)
+    }
+
+    pub(crate) fn start<B: Backend>(
+        listener: TcpListener,
+        backend: B,
+        limits: NetLimits,
+        local: Option<Local>,
+        gate: Arc<dyn Gate>,
+    ) -> io::Result<Hosting> {
         let addr = listener.local_addr()?;
         let in_flight = InFlight(Arc::default());
         let mut hub = Hub {
@@ -489,6 +502,7 @@ impl Hosting {
             blocks: Blocks::default(),
             reading: Arc::default(),
             readers: Readers::default(),
+            gate,
         };
         let queued = shared.queued.clone();
         let blocks = shared.blocks.clone();
@@ -759,6 +773,8 @@ struct Shared {
     /// Bytes being read into messages, all connections together, and who is reading them.
     reading: Arc<AtomicUsize>,
     readers: Readers,
+    /// What the host accepts and who signs in.
+    gate: Arc<dyn Gate>,
 }
 
 fn accept(listener: &TcpListener, hub: &Sender<HubIn>, stop: &AtomicBool, open: &Arc<AtomicUsize>, limits: NetLimits, shared: Shared) {
@@ -837,6 +853,27 @@ fn next_message(ws: &mut WebSocket<Duplex>, max: usize) -> Result<Option<(Client
             Err(tungstenite::Error::Io(e)) if e.kind() == io::ErrorKind::Other => Err(e.to_string()),
             Err(_) => Ok(None),
         };
+    }
+}
+
+/// Most steps (asking what the server accepts, signing in) before a connection's first message.
+const MAX_STEPS: usize = 16;
+
+/// Answer what comes before a connection's first message (`Info`), then return that message.
+fn before_first(ws: &mut WebSocket<Duplex>, out: &Line, max: usize, gate: &dyn Gate) -> Result<Option<(ClientMsg, usize)>, String> {
+    for _ in 0..MAX_STEPS {
+        match next_message(ws, max)? {
+            Some((ClientMsg::Info, _)) => say(out, &ServerMsg::Info(Box::new(gate.info()))),
+            other => return Ok(other),
+        }
+    }
+    Err("too many steps before saying hello".into())
+}
+
+/// Queue `msg` for a connection the hub hasn't taken in yet (small: not counted against its caps).
+fn say(out: &Line, msg: &ServerMsg) {
+    if let Some(b) = encode(msg) {
+        let _ = out.tx.try_send(Out::Bytes(b, None));
     }
 }
 
@@ -923,7 +960,7 @@ fn serve(mut stream: TcpStream, conn: u64, hub: &Sender<HubIn>, limits: NetLimit
         log::info!("event=refused ip={ip} reason=connections_per_address");
         end(Some("too many connections from your address: close some and try again"));
     } else {
-        match next_message(&mut ws, limits.max_hello) {
+        match before_first(&mut ws, &out, limits.max_hello, shared.gate.as_ref()) {
             Ok(Some((
                 first @ (ClientMsg::Hello(_)
                 | ClientMsg::Manage(_)
