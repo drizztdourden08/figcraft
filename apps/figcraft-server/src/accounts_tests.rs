@@ -310,3 +310,82 @@ fn allow_lists_keep_strangers_out() {
     assert!(signed(addr, token("u9", "eve@evil.test", "Eve")).1.unwrap_err().contains("isn't allowed"));
     server.stop();
 }
+
+/// The app's side: sign in with the engine's commands (token flow), publish as owner, invite,
+/// and the invited person joins with the member's link (no secret in it) as themselves.
+#[test]
+fn the_app_signs_in_publishes_and_members_join() {
+    use crate::test_util::{live, pump, session};
+    use serde_json::json;
+    let dir = TempDir::new("acc-app");
+    let mut server = start(&accounts_config(dir.path(), "accounts"));
+    let url = format!("ws://{}/", server.addr());
+    let mut ann = session("Ann");
+    let mut bo = session("Bo");
+    // What the server accepts.
+    let info = ann.execute("account.info", &json!({"server": url})).unwrap();
+    assert_eq!(info["auth"], "accounts");
+    assert_eq!(info["providers"][0]["flows"], json!(["token"]));
+    assert!(info["signedIn"].is_null());
+    // Signing in: the token flow (what the fake provider offers).
+    let r = ann.execute("account.signIn", &json!({"server": url, "token": "u1|ann@example.com|Ann"})).unwrap();
+    assert_eq!(r["status"], "signedIn");
+    assert_eq!(r["account"]["name"], "Ann");
+    assert!(!r.to_string().contains("session"), "no session token in results: {r}");
+    assert_eq!(ann.prefs.accounts.len(), 1);
+    assert!(ann.prefs.accounts[0].session.len() >= 40);
+    let bad = ann.execute("account.signIn", &json!({"server": url, "token": "nonsense"}));
+    assert!(bad.is_err());
+    // Publishing while signed in: the file is Ann's; she joins it as herself.
+    ann.execute("shape.rectangle", &json!({"x": 0, "y": 0, "width": 50, "height": 50})).unwrap();
+    ann.execute("collab.publish", &json!({"server": url, "name": "Plan"})).unwrap();
+    pump(&mut [&mut ann], "Ann's publish", |s| live(s[0]) && s[0].live().published.is_some());
+    let published = ann.live().published.clone().unwrap();
+    assert!(!published.edit.contains("token="), "a member's link carries no secret: {}", published.edit);
+    let files = ann.execute("account.files", &json!({"server": url})).unwrap();
+    assert_eq!(files["files"][0]["role"], "owner");
+    // Bo isn't in yet: joining with the link is refused even once signed in.
+    bo.execute("account.signIn", &json!({"server": url, "token": "u2|bo@example.com|Bo"})).unwrap();
+    // Ann invites Bo; Bo joins with the same member link and edits.
+    ann.execute("collab.invite", &json!({"email": "bo@example.com", "role": "editor"})).unwrap();
+    let members = ann.execute("collab.members", &json!({})).unwrap();
+    assert_eq!(members["members"].as_array().unwrap().len(), 2);
+    bo.execute("collab.join", &json!({"link": published.edit})).unwrap();
+    pump(&mut [&mut ann, &mut bo], "Bo in", |s| live(s[1]) && s[0].live().peers.len() == 1);
+    assert_eq!(bo.live_summary()["access"], "edit");
+    // Signing out forgets the token here.
+    let out = bo.execute("account.signOut", &json!({"server": url})).unwrap();
+    assert_eq!(out["signedOut"], true);
+    assert!(bo.prefs.accounts.is_empty());
+    let status = ann.execute("account.status", &json!({})).unwrap();
+    assert_eq!(status["accounts"].as_array().unwrap().len(), 1);
+    assert!(!status.to_string().contains(&ann.prefs.accounts[0].session));
+    server.stop();
+}
+
+/// Someone who isn't a member is refused with a clear reason when joining by the link.
+#[test]
+fn strangers_with_a_member_link_are_refused() {
+    use crate::test_util::{live, pump, session};
+    use serde_json::json;
+    let dir = TempDir::new("acc-app-no");
+    let mut server = start(&accounts_config(dir.path(), "accounts"));
+    let url = format!("ws://{}/", server.addr());
+    let mut ann = session("Ann");
+    ann.execute("account.signIn", &json!({"server": url, "token": "u1|ann@example.com|Ann"})).unwrap();
+    ann.execute("collab.publish", &json!({"server": url})).unwrap();
+    pump(&mut [&mut ann], "publish", |s| live(s[0]) && s[0].live().published.is_some());
+    let link = ann.live().published.clone().unwrap().edit;
+    let mut eve = session("Eve");
+    eve.execute("account.signIn", &json!({"server": url, "token": "u9|eve@example.com|Eve"})).unwrap();
+    eve.execute("collab.join", &json!({"link": link})).unwrap();
+    pump(&mut [&mut eve], "Eve refused", |s| matches!(s[0].live().status, figcraft_engine::live::Status::Failed { .. }));
+    let why = eve.live_summary().to_string();
+    assert!(why.contains("aren't in this file"), "{why}");
+    // Not signed in at all: told to sign in.
+    let mut nobody = session("X");
+    nobody.execute("collab.join", &json!({"link": link})).unwrap();
+    pump(&mut [&mut nobody], "refused", |s| matches!(s[0].live().status, figcraft_engine::live::Status::Failed { .. }));
+    assert!(nobody.live_summary().to_string().contains("sign in"));
+    server.stop();
+}

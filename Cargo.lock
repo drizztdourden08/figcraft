@@ -1595,6 +1595,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "serde_json",
+ "sha2",
  "tungstenite",
  "wasm-bindgen",
  "web-sys",
@@ -1651,6 +1652,7 @@ name = "figcraft-engine"
 version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
+ "figcraft-auth",
  "figcraft-collab",
  "figcraft-color",
  "figcraft-doc",
@@ -1793,6 +1795,7 @@ dependencies = [
  "figcraft-format",
  "figcraft-plugin",
  "log",
+ "ring",
  "rustix 1.1.5",
  "serde",
  "serde_json",

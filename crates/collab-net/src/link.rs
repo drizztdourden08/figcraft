@@ -8,8 +8,8 @@ use std::time::Duration;
 use figcraft_collab::code;
 use figcraft_collab::message::{Access, Admin, AdminReply, ClientMsg, LibraryReply, LibraryReq, PluginReply, PluginReq};
 use figcraft_engine::live::{
-    Bind, Event, HostInfo, HostOptions, LiveLink, NO_SESSION, NetReply, NetRequest, PageInfo, Presence, PublishOptions, Published, Resume, Role,
-    SessionId, SessionInfo, Shared,
+    Bind, Event, Flow, HostInfo, HostOptions, LiveLink, NO_SESSION, NetReply, NetRequest, PageInfo, Presence, PublishOptions, Published, Resume,
+    Role, SessionId, SessionInfo, Shared, SignIn,
 };
 
 use crate::guest::{Guest, GuestConfig, Publish, upload_file};
@@ -19,6 +19,7 @@ use crate::invite::{Endpoint, Invite};
 use crate::manage;
 use crate::net::NetLimits;
 use crate::sessions::Sessions;
+use crate::signin;
 use crate::token;
 
 /// The port a hosted session tries first.
@@ -52,13 +53,15 @@ pub struct NetLink {
     libraries: Inbox,
     /// Background library requests are out.
     fetching: Arc<AtomicBool>,
+    /// Where you are signed in: each server's address (as [`Endpoint::url`]) and your session token.
+    sign_ins: Vec<(String, String)>,
 }
 
 impl NetLink {
     /// `wake` is called (from network threads) whenever something arrives for the UI.
     pub fn new(wake: Waker) -> Self {
         let libraries = Inbox::new(wake.clone());
-        Self { limits: NetLimits::default(), sessions: Sessions::new(wake), guest: |c| c, libraries, fetching: Arc::default() }
+        Self { limits: NetLimits::default(), sessions: Sessions::new(wake), guest: |c| c, libraries, fetching: Arc::default(), sign_ins: Vec::new() }
     }
 
     /// With other transport limits.
@@ -75,9 +78,16 @@ impl NetLink {
 
     /// How this link joins `invite` (after asking its server about `code`, if there is one).
     fn guest_config(&self, invite: Invite, code: Option<String>, name: &str) -> GuestConfig {
-        let mut cfg = (self.guest)(GuestConfig { code, ..GuestConfig::new(invite, name.to_string()) });
+        let session = self.session_for(&invite.server);
+        let mut cfg = (self.guest)(GuestConfig { code, session, ..GuestConfig::new(invite, name.to_string()) });
         cfg.limits = self.limits;
         cfg
+    }
+
+    /// Your session token on `server`, if you are signed in there.
+    fn session_for(&self, server: &Endpoint) -> Option<String> {
+        let url = server.url();
+        self.sign_ins.iter().find(|(s, _)| *s == url).map(|(_, t)| t.clone())
     }
 
     /// The running host of session `session`, if it is hosted here.
@@ -180,7 +190,7 @@ impl LiveLink for NetLink {
         // Until the upload is done the invite names only the server.
         let cfg = self.guest_config(Invite { server: server.clone(), file: String::new(), token: String::new() }, None, &o.me);
         let inbox = self.sessions.inbox();
-        let job = Publish { server, key, name: o.name, doc: o.doc, share: o.share };
+        let job = Publish { server, key, name: o.name, doc: o.doc, share: o.share, session: o.session };
         let guest = Guest::publish(job, cfg, inbox.clone()).map_err(|e| format!("can't start the connection: {e}"))?;
         self.started(session, Active::Guest(guest), inbox);
         Ok(())
@@ -188,6 +198,36 @@ impl LiveLink for NetLink {
 
     fn upload(&mut self, o: PublishOptions) -> Result<Published, String> {
         upload(o, &self.limits)
+    }
+
+    fn accounts(&mut self, req: NetRequest) -> NetReply {
+        accounts(req, &self.limits)
+    }
+
+    fn sign_ins(&mut self, list: Vec<(String, String)>) {
+        self.sign_ins = list.into_iter().filter_map(|(s, t)| Endpoint::parse(&s).ok().map(|(e, _)| (e.url(), t))).collect();
+    }
+
+    fn browser_sign_in(&mut self, server: &str, provider: &str, flow: &Flow) -> Result<String, String> {
+        let Flow::Browser { authorize_url, client_id, scopes, params } = flow else { return Err("that isn't a browser sign-in".into()) };
+        let (endpoint, _) = Endpoint::parse(server)?;
+        let listener =
+            std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).map_err(|e| format!("can't wait for the sign-in page: {e}"))?;
+        let redirect = format!("http://127.0.0.1:{}/", listener.local_addr().map_err(|e| e.to_string())?.port());
+        let pkce = signin::Pkce::new()?;
+        let url = pkce.authorize_url(authorize_url, client_id, scopes, params, &redirect);
+        let (inbox, limits, server, provider) = (self.libraries.clone(), self.limits, server.to_string(), provider.to_string());
+        std::thread::Builder::new()
+            .name("sign-in".into())
+            .spawn(move || {
+                let reply = signin::wait_for_code(&listener, &pkce.state, std::time::Instant::now() + signin::WAIT).and_then(|code| {
+                    let req = SignIn::Code { provider, code, verifier: pkce.verifier.clone(), redirect_uri: redirect };
+                    manage::sign_in(&endpoint, req, &limits, CONNECT)
+                });
+                inbox.push(Event::SignIn { server, reply });
+            })
+            .map_err(|e| format!("can't start a thread for the sign-in: {e}"))?;
+        Ok(url)
     }
 
     fn library(&mut self, link: &str, req: LibraryReq) -> Result<LibraryReply, String> {
@@ -216,6 +256,7 @@ impl LiveLink for NetLink {
                 NetRequest::Upload(o) => NetReply::Upload(upload(o, &limits)),
                 NetRequest::Hosting { server, file, owner, req } => NetReply::Hosting(hosting(&server, &file, &owner, req, &limits)),
                 NetRequest::Share { server, file, owner, revoke, create } => NetReply::Share(share(&server, &file, &owner, &revoke, create, &limits)),
+                req @ (NetRequest::Info { .. } | NetRequest::SignIn { .. } | NetRequest::Account { .. }) => accounts(req, &limits),
             };
             inbox.push(Event::Net { job, reply: Box::new(reply) });
         });
@@ -281,6 +322,20 @@ impl LiveLink for NetLink {
         let mut out: Vec<(SessionId, Event)> = self.libraries.drain().into_iter().map(|e| (NO_SESSION, e)).collect();
         out.extend(self.sessions.poll());
         out
+    }
+}
+
+/// What the server says it accepts, a sign-in step, or a request on your account there.
+fn accounts(req: NetRequest, limits: &NetLimits) -> NetReply {
+    match req {
+        NetRequest::Info { server } => NetReply::Info(Endpoint::parse(&server).and_then(|(e, _)| manage::info(&e, limits, CONNECT))),
+        NetRequest::SignIn { server, req } => NetReply::SignIn(Endpoint::parse(&server).and_then(|(e, _)| manage::sign_in(&e, req, limits, CONNECT))),
+        NetRequest::Account { server, session, req } => NetReply::Account(
+            Endpoint::parse(&server)
+                .and_then(|(e, _)| manage::account(&e, &session, vec![req], limits, CONNECT))
+                .and_then(|r| r.into_iter().next().ok_or_else(|| "the server didn't answer".to_string())),
+        ),
+        other => other.failure()("not an account request".into()),
     }
 }
 

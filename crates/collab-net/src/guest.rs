@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use figcraft_collab::Replica;
-use figcraft_collab::message::{self, Admin, AdminReply, ClientMsg, HostInfo, Presence, ServerMsg};
+use figcraft_collab::message::{self, AccountReply, AccountReq, Admin, AdminReply, ClientMsg, HostInfo, Presence, ServerMsg};
 use figcraft_doc::Document;
 use figcraft_engine::live::{Event, Published, Status};
 use tungstenite::protocol::frame::coding::CloseCode;
@@ -26,7 +26,7 @@ use tungstenite::{Bytes, Message};
 use crate::inbox::Inbox;
 use crate::invite::{Endpoint, Invite};
 pub use crate::join::GuestConfig;
-use crate::join::{Next, Outcome, Resuming, Seen, Taken, after, closed, hello, resolved, take, unresolved};
+use crate::join::{Next, Outcome, Resuming, Seen, Taken, after, closed, hello, resolved, sign_in, take, unresolved};
 use crate::manage;
 use crate::net::{Duplex, NetLimits, config, open, shutdown};
 use crate::throttle::{PRESENCE_INTERVAL, Throttle, earliest};
@@ -41,6 +41,8 @@ pub struct Publish {
     pub doc: Arc<Document>,
     /// Share the file once it is there: links and join codes for others ([`Event::Shared`]).
     pub share: bool,
+    /// Your session token there: published as yours on a server with accounts (no key).
+    pub session: Option<String>,
 }
 
 /// A joined (or joining) session. Dropping it leaves.
@@ -102,6 +104,9 @@ impl Guest {
             // file's first links stay its owner's (this app joins with one): others get their own,
             // which stopping takes away again.
             let shared = job.share.then(|| {
+                if job.session.is_some() {
+                    return Err("on a server with accounts, invite people to the file (collab.invite) instead".to_string());
+                }
                 let owner = published.owner.as_deref().unwrap_or_default();
                 let made = manage::share(&job.server, job.key.as_deref(), &published.file, owner, &[], true, &cfg.limits, cfg.connect_timeout);
                 made.and_then(|s| s.ok_or_else(|| "the server didn't make the links".to_string()))
@@ -171,6 +176,29 @@ struct Conn {
     sock: TcpStream,
 }
 
+/// Keep `doc` on `server` as a new file you own, signed in with `session` (a server with
+/// accounts): the member's link (no secret: who you are lets you in) and where it is.
+pub(crate) fn upload_owned(
+    server: &Endpoint,
+    session: &str,
+    name: &str,
+    doc: &Document,
+    limits: &NetLimits,
+    timeout: Duration,
+) -> Result<(Invite, Published), String> {
+    let snapshot = Replica::new(doc.clone()).snapshot().map_err(|e| e.to_string())?;
+    let file =
+        match manage::account(server, session, vec![AccountReq::Publish { name: name.to_string(), snapshot }], limits, timeout)?.into_iter().next() {
+            Some(AccountReply::Published { file }) => file,
+            Some(AccountReply::Failed { reason }) => return Err(reason),
+            _ => return Err("the server didn't say where the file is".into()),
+        };
+    let member = Invite { server: server.clone(), file: file.id.clone(), token: String::new() };
+    let published =
+        Published { server: server.display(), file: file.id, name: file.name, edit: member.link(), view: member.link(), owner: None, expires: None };
+    Ok((member, published))
+}
+
 /// Keep `doc` on `server` as a new file named `name`, with the server's `key` (or, without one, as
 /// anyone may on a server open to the public): its edit link, where it is with its links (and its
 /// owner token without a key), and what the server says about its hosting (without a key).
@@ -206,6 +234,13 @@ pub(crate) fn upload_file(
 
 /// Upload the document; the join settings for the new file, its links and the server's hosting.
 fn upload(job: &Publish, mut cfg: GuestConfig) -> Result<(GuestConfig, Published, Option<HostInfo>), String> {
+    // Signed in, without the key: as yours (a server with accounts).
+    if let (Some(session), None) = (&job.session, &job.key) {
+        let (member, published) = upload_owned(&job.server, session, &job.name, &job.doc, &cfg.limits, cfg.connect_timeout)?;
+        cfg.invite = member;
+        cfg.session = Some(session.clone());
+        return Ok((cfg, published, None));
+    }
     let (edit, published, hosting) = upload_file(&job.server, job.key.as_deref(), &job.name, &job.doc, &cfg.limits, cfg.connect_timeout)?;
     cfg.invite = edit;
     Ok((cfg, published, hosting))
@@ -284,7 +319,8 @@ fn session(
     let hello = hello(cfg, resume);
     let mut welcomed = false;
     let mut throttle = Throttle::new(PRESENCE_INTERVAL);
-    let outcome = if send(&mut writer, &hello, &mut last_sent) {
+    let signed = sign_in(cfg).is_none_or(|m| send(&mut writer, &m, &mut last_sent));
+    let outcome = if signed && send(&mut writer, &hello, &mut last_sent) {
         loop {
             let ping_at = last_sent + cfg.limits.keepalive;
             let wake = earliest([throttle.due(), Some(ping_at)]).unwrap_or(ping_at);

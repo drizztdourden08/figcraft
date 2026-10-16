@@ -112,18 +112,25 @@ impl Invite {
         Self { server: Endpoint::plain(host), file: file.into(), token: token.into() }
     }
 
-    /// The `figcraft://join?…` link.
+    /// The `figcraft://join?…` link (without `&token=…` for a member's link: [`member`](Self::member)).
     pub fn link(&self) -> String {
+        let token = if self.member() { String::new() } else { format!("&token={}", self.token) };
         if self.server.is_plain() {
-            format!("figcraft://join?host={}&file={}&token={}", self.server.host, self.file, self.token)
+            format!("figcraft://join?host={}&file={}{token}", self.server.host, self.file)
         } else {
-            format!("figcraft://join?server={}&file={}&token={}", self.server.url(), self.file, self.token)
+            format!("figcraft://join?server={}&file={}{token}", self.server.url(), self.file)
         }
     }
 
     /// The same session as a WebSocket URL.
     pub fn url(&self) -> String {
-        format!("{}?file={}&token={}", self.server.url(), self.file, self.token)
+        let token = if self.member() { String::new() } else { format!("&token={}", self.token) };
+        format!("{}?file={}{token}", self.server.url(), self.file)
+    }
+
+    /// A link without a secret: on a server with accounts, members join by who they are.
+    pub fn member(&self) -> bool {
+        self.token.is_empty()
     }
 
     /// What the client connects to (no secrets in it).
@@ -177,7 +184,12 @@ impl Invite {
             return Ok((Invite { server, file: String::new(), token: String::new() }, Some(code)));
         }
         let file = get("file").filter(|f| valid_id(f, 1, 64)).ok_or("the invite link has no valid file id")?;
-        let token = get("token").filter(|t| valid_id(t, 16, 128)).ok_or("the invite link has no valid token")?;
+        // No token: a member's link on a server with accounts (who you are lets you in).
+        let token = match get("token") {
+            None => String::new(),
+            Some(t) if valid_id(&t, 16, 128) => t,
+            Some(_) => return Err("the invite link has no valid token".into()),
+        };
         Ok((Invite { server, file, token }, None))
     }
 }
@@ -185,6 +197,11 @@ impl Invite {
 /// Without surrounding spaces, quotes or angle brackets.
 fn clean(s: &str) -> &str {
     s.trim().trim_matches(|c| matches!(c, '<' | '>' | '"' | '\''))
+}
+
+/// A %-escaped query value, decoded (`+` is a space).
+pub(crate) fn decode(v: &str) -> Option<String> {
+    percent_decode(&v.replace('+', " "))
 }
 
 /// A query's `key=value` pairs, decoded.

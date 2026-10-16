@@ -124,6 +124,8 @@ mod hardening_tests;
 #[cfg(test)]
 mod library_tests;
 #[cfg(test)]
+mod oidc_tests;
+#[cfg(test)]
 mod owned_tests;
 #[cfg(test)]
 mod public_tests;

@@ -892,6 +892,12 @@ impl FigApp {
                 "dialog.unsaved" => self.toast(i18n::tr("This file has unsaved changes")),
                 "dialog.plugins" => self.ui.plugins_window = true,
                 "dialog.cursorChat" => live::open_chat(self),
+                // A sign-in page (`account.signIn`): in the system browser.
+                "open.url" => {
+                    if let Some(url) = r.data["url"].as_str().filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
+                        self.services.open_url(url);
+                    }
+                }
                 "window.new" | "window.focus" | "window.fullscreen" => self.window_requests.push(r),
                 _ => {}
             }

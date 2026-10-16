@@ -16,7 +16,7 @@ use figcraft_engine::live::{Event, Status};
 use web_time::Instant;
 
 use crate::inbox::Inbox;
-use crate::join::{GuestConfig, Next, Outcome, Resuming, Seen, Taken, after, closed, hello, resolved, take, unresolved};
+use crate::join::{GuestConfig, Next, Outcome, Resuming, Seen, Taken, after, closed, hello, resolved, sign_in, take, unresolved};
 use crate::throttle::{PRESENCE_INTERVAL, Throttle, earliest};
 
 /// A WebSocket the driver opens, writes and closes; what it receives comes back through the
@@ -106,7 +106,8 @@ impl<S: Socket> Driver<S> {
             Some(code) => ClientMsg::Resolve(Resolve { protocol: PROTOCOL, client_version: message::client_version(), code: code.clone() }),
             None => hello(&self.cfg, &self.resume),
         };
-        if !self.write(&hello, now) {
+        let signed = self.cfg.code.is_some() || sign_in(&self.cfg).is_none_or(|m| self.write(&m, now));
+        if !signed || !self.write(&hello, now) {
             self.end(Outcome::Retry("the connection dropped".into()), now);
         }
     }

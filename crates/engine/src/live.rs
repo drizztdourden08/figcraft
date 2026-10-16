@@ -41,10 +41,13 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+pub use figcraft_auth::{Flow, Me, ServerInfo, SignIn, SignInReply};
 use figcraft_collab::Client;
 use figcraft_collab::code::{self, Code};
 pub use figcraft_collab::message::Signal;
-use figcraft_collab::message::{Admin, AdminReply, ClientMsg, EditingText, LibraryReply, LibraryReq, PluginReply, PluginReq, ServerMsg};
+use figcraft_collab::message::{
+    AccountReply, AccountReq, Admin, AdminReply, ClientMsg, EditingText, LibraryReply, LibraryReq, PluginReply, PluginReq, ServerMsg,
+};
 
 pub use figcraft_collab::message::{Access, HostInfo, Resume, utc_date};
 use figcraft_doc::{Document, NodeId};
@@ -319,6 +322,12 @@ pub enum Event {
         job: u64,
         reply: Box<NetReply>,
     },
+    /// A browser sign-in to the server at `server` ended ([`LiveLink::browser_sign_in`]): the
+    /// server's answer, or why it didn't happen.
+    SignIn {
+        server: String,
+        reply: std::result::Result<SignInReply, String>,
+    },
 }
 
 /// A request to a server outside a live session: its plugin directory, a team library, or keeping
@@ -339,6 +348,14 @@ pub enum NetRequest {
     /// Ask the server at `server` about its hosting and, with a file's owner token, manage that
     /// file ([`LiveLink::hosting`]).
     Hosting { server: String, file: String, owner: String, req: Option<Admin> },
+    /// What the server at `server` accepts: who may get in, how to sign in, whether files are
+    /// sealed ([`LiveLink::accounts`]).
+    Info { server: String },
+    /// One sign-in step with the server at `server` ([`LiveLink::accounts`]).
+    SignIn { server: String, req: SignIn },
+    /// A request on your account at the server at `server`, signed in with `session`
+    /// ([`LiveLink::accounts`]).
+    Account { server: String, session: String, req: AccountReq },
 }
 
 impl NetRequest {
@@ -348,6 +365,7 @@ impl NetRequest {
             NetRequest::Plugins { .. } => crate::plugin_directory::NO_DIRECTORY,
             NetRequest::Library { .. } | NetRequest::Upload(_) => NO_TEAM_LIBRARIES,
             NetRequest::Hosting { .. } | NetRequest::Share { .. } => NO_HOSTING,
+            NetRequest::Info { .. } | NetRequest::SignIn { .. } | NetRequest::Account { .. } => NO_ACCOUNTS,
         }
     }
 
@@ -359,6 +377,9 @@ impl NetRequest {
             NetRequest::Upload(_) => |why| NetReply::Upload(Err(why)),
             NetRequest::Hosting { .. } => |why| NetReply::Hosting(Err(why)),
             NetRequest::Share { .. } => |why| NetReply::Share(Err(why)),
+            NetRequest::Info { .. } => |why| NetReply::Info(Err(why)),
+            NetRequest::SignIn { .. } => |why| NetReply::SignIn(Err(why)),
+            NetRequest::Account { .. } => |why| NetReply::Account(Err(why)),
         }
     }
 
@@ -376,6 +397,11 @@ impl NetRequest {
             (NetRequest::Share { server: a, file: f, create: x, .. }, NetRequest::Share { server: b, file: g, create: y, .. }) => {
                 a == b && f == g && x == y
             }
+            (NetRequest::Info { server: a }, NetRequest::Info { server: b }) => a == b,
+            (NetRequest::SignIn { server: a, req: x }, NetRequest::SignIn { server: b, req: y }) => a == b && discriminant(x) == discriminant(y),
+            (NetRequest::Account { server: a, req: x, .. }, NetRequest::Account { server: b, req: y, .. }) => {
+                a == b && discriminant(x) == discriminant(y)
+            }
             _ => false,
         }
     }
@@ -391,7 +417,13 @@ pub enum NetReply {
     Upload(std::result::Result<Published, String>),
     /// What the server says about its hosting, and its answer to the request, if one was sent.
     Hosting(std::result::Result<(HostInfo, Option<AdminReply>), String>),
+    Info(std::result::Result<ServerInfo, String>),
+    SignIn(std::result::Result<SignInReply, String>),
+    Account(std::result::Result<AccountReply, String>),
 }
+
+/// What a session without the network says about signing in to servers.
+pub const NO_ACCOUNTS: &str = "signing in to a server needs the desktop app or the MCP server";
 
 /// What a session without the network says about servers' hosting.
 pub const NO_HOSTING: &str = "publishing to a server needs the desktop app or the MCP server";
@@ -438,6 +470,9 @@ pub struct PublishOptions {
     /// Share the file once it is there: links and join codes for others ([`Event::Shared`];
     /// `collab.share`).
     pub share: bool,
+    /// Your session token on that server, when you are signed in there: the file is published as
+    /// yours (you are its owner) on a server with accounts.
+    pub session: Option<String>,
 }
 
 /// The networking behind live sessions, installed by the app ([`Lives::install`]). It carries
@@ -502,9 +537,24 @@ pub trait LiveLink: Send {
     fn share(&mut self, _server: &str, _file: &str, _owner: &str, _revoke: &[String], _create: bool) -> std::result::Result<Option<Shared>, String> {
         Err(NO_HOSTING.into())
     }
+    /// See [`NetRequest::Info`], [`NetRequest::SignIn`] and [`NetRequest::Account`]; waits for the
+    /// server. Errors never echo a token.
+    fn accounts(&mut self, req: NetRequest) -> NetReply {
+        req.failure()(NO_ACCOUNTS.into())
+    }
+    /// Start signing in to the server at `server` through `provider`'s page in the browser, with
+    /// `flow` (a [`Flow::Browser`] from the server's `Info`): the page to open. The result arrives
+    /// later as [`Event::SignIn`].
+    fn browser_sign_in(&mut self, _server: &str, _provider: &str, _flow: &Flow) -> std::result::Result<String, String> {
+        Err(NO_ACCOUNTS.into())
+    }
+    /// The servers you are signed in to and your session tokens there: joining a file on one of
+    /// them signs in first (the engine tells the link before it joins or publishes).
+    fn sign_ins(&mut self, _list: Vec<(String, String)>) {}
     /// Send `req` and wait for the answer (through the methods above).
     fn request(&mut self, req: NetRequest) -> NetReply {
         match req {
+            req @ (NetRequest::Info { .. } | NetRequest::SignIn { .. } | NetRequest::Account { .. }) => self.accounts(req),
             NetRequest::Share { server, file, owner, revoke, create } => NetReply::Share(self.share(&server, &file, &owner, &revoke, create)),
             NetRequest::Plugins { server, req } => NetReply::Plugins(self.plugins(&server, req)),
             NetRequest::Library { link, req } => NetReply::Library(self.library(&link, req)),
@@ -951,6 +1001,7 @@ impl Session {
         let e = match e {
             Event::Library { link, reply } => return self.library_answer(&link, reply),
             Event::Net { job, reply } => return self.background_answer(job, *reply),
+            Event::SignIn { server, reply } => return self.account_signed_in(&server, reply),
             e => e,
         };
         // A session left meanwhile: what was still on its way is dropped.
@@ -1056,7 +1107,7 @@ impl Session {
                     Some(error.map_or_else(|| "Your report was sent to the server's operator".into(), |e| format!("The report wasn't sent: {e}")));
             }
             // Answered above.
-            Event::Library { .. } | Event::Net { .. } => {}
+            Event::Library { .. } | Event::Net { .. } | Event::SignIn { .. } => {}
         }
     }
 
@@ -1638,7 +1689,10 @@ fn start_publish(s: &mut Session, cmd: &str, server: &str, p: &Value, share: boo
     let (doc, uid) = s.ds().map(|ds| (ds.doc.clone(), ds.uid))?;
     let name = string(p, "name").map(|n| n.trim().chars().filter(|c| !c.is_control()).take(256).collect::<String>()).filter(|n| !n.is_empty());
     let me = display_name(&s.prefs);
-    let opts = PublishOptions { server: server.trim().to_string(), key, name: name.unwrap_or_else(|| doc.name.clone()), me, doc, share };
+    // Signed in there: published as yours (on a server with accounts), and joined as you.
+    let session = s.signed_in(server).map(|a| a.session.clone());
+    s.share_sign_ins();
+    let opts = PublishOptions { server: server.trim().to_string(), key, name: name.unwrap_or_else(|| doc.name.clone()), me, doc, share, session };
     let (id, ()) = s.live.start(cmd, |l, id| l.publish(id, opts).map_err(|e| bad(cmd, e)))?;
     // This tab becomes the server file's synced document once it is there.
     s.live.open(Live { id, status: Status::Connecting, doc_uid: Some(uid), tab: Some(uid), server: server.trim().to_string(), ..Live::default() });
@@ -1853,6 +1907,8 @@ pub(crate) fn start_join(
     resume: Option<Resume>,
 ) -> Result<SessionId> {
     let (name, tab) = (display_name(&s.prefs), s.tab());
+    // Where you are signed in, joining signs in first.
+    s.share_sign_ins();
     let (id, ()) = s.live.start(cmd, |l, id| l.join_resuming(id, link, &name, resume).map_err(|e| bad(cmd, e)))?;
     let server = share.as_ref().map(|s| s.server.clone()).unwrap_or_default();
     // The session's file opens in a tab of its own; until then the join shows on this one.

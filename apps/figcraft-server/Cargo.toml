@@ -50,6 +50,8 @@ base64 = { workspace = true }
 # Crafting hostile archives (zip bombs) in tests.
 zip = { workspace = true }
 wat = { workspace = true }
+# A fake OpenID issuer signing ID tokens (oidc_tests).
+ring = "0.17"
 figcraft-engine = { workspace = true }
 figcraft-doc = { workspace = true }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }

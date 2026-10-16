@@ -5,7 +5,7 @@ are built**: `crates/auth` (the sign-in types, the `IdentityProvider` and `Gate`
 `[auth]` and `[e2e]` settings, and with its `providers` feature the `oidc` and `external` providers
 and their registry), `Info` and `SignIn`, and accounts on `figcraft-server`: people and sessions,
 members and invites per file, roles in sessions, account connections, admins (see
-[`server.md`](server.md#accounts-sign-in)). **Step 6 is built**: `crates/collab-seal` (file keys
+[`server.md`](server.md#accounts-sign-in)). **Step 4 is built** in the engine and the transport: `account.info`, `account.signIn` (browser with PKCE and a loopback redirect, device code with `account.signInPoll`, token), `account.signOut`, `account.status`, `account.files`, and `collab.members`, `collab.invite`, `collab.setRole`, `collab.removeMember` for the file in front; session tokens are kept with the preferences (like owner tokens) and sent before each hello on that server; publishing while signed in makes the file yours, and members join with a link that carries no secret. The app's screens for it come next. **Step 6 is built**: `crates/collab-seal` (file keys
 and keyrings, sealing and opening values and changes, entry ids, device keys and HPKE wrapping,
 link keys, recovery keys; not yet used by the server or the app). `[e2e]` accepts only `off` until sealing lands. Sections say what is built as the implementation lands. Builds on [`collab-protocol.md`](collab-protocol.md)
 (live sessions) and [`server.md`](server.md) (running `figcraft-server`).
