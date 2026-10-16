@@ -394,3 +394,65 @@ fn strangers_with_a_member_link_are_refused() {
     assert!(nobody.live_summary().to_string().contains("sign in"));
     server.stop();
 }
+
+/// Exchanges any code; lists one page on the web (as `web_redirect_uris` would).
+struct Pages;
+
+const PAGE: &str = "https://app.example/";
+
+impl IdentityProvider for Pages {
+    fn info(&self) -> ProviderInfo {
+        let redirect = Flow::Redirect {
+            authorize_url: "https://issuer.example/authorize".into(),
+            client_id: "web".into(),
+            scopes: vec!["openid".into()],
+            params: vec![],
+            redirect_uris: vec![PAGE.into()],
+        };
+        ProviderInfo { id: "pages".into(), label: "Pages".into(), flows: vec![Flow::Device, redirect] }
+    }
+
+    fn web_redirect(&self, redirect_uri: &str) -> bool {
+        redirect_uri == PAGE
+    }
+
+    fn exchange_code(&self, code: &str, _verifier: &str, _redirect_uri: &str) -> Result<Identity, AuthError> {
+        Ok(Identity { provider: "pages".into(), subject: code.into(), email: Some(format!("{code}@example.com")), email_verified: true, name: None })
+    }
+}
+
+#[test]
+fn codes_come_back_only_to_loopback_or_listed_pages() {
+    let dir = TempDir::new("acc-pages");
+    let mut cfg = accounts_config(dir.path(), "accounts");
+    cfg.auth.provider.push(ProviderConfig { id: "pages".into(), kind: "pages".into(), ..ProviderConfig::default() });
+    let mut reg = registry();
+    reg.register("pages", |_, _| Ok(Box::new(Pages)));
+    let mut server = crate::start_with(&cfg, &reg).unwrap();
+    let addr = server.addr();
+    let code = |redirect: &str| {
+        signed(addr, SignIn::Code { provider: "pages".into(), code: "u7".into(), verifier: "v".into(), redirect_uri: redirect.into() }).1
+    };
+    assert_eq!(code(PAGE).unwrap().email.as_deref(), Some("u7@example.com"), "a listed page");
+    assert!(code("http://127.0.0.1:5000/").is_ok(), "the desktop app's loopback page");
+    for not_listed in ["https://evil.example/", "https://app.example", "https://app.example/other", "https://app.example/?x=1", "http://app.example/"]
+    {
+        assert_eq!(code(not_listed).unwrap_err(), "that sign-in isn't valid", "{not_listed}");
+    }
+    // `About` leaves the redirect flow out (apps from before it can't read it); `AboutAll` has it.
+    let mut raw = Raw::connect(addr);
+    raw.send(&ClientMsg::About);
+    let ServerMsg::About(about) = raw.next() else { panic!() };
+    let pages = about.info.providers.iter().find(|p| p.id == "pages").unwrap();
+    assert_eq!(pages.flows, vec![Flow::Device]);
+    let mut raw = Raw::connect(addr);
+    raw.send(&ClientMsg::AboutAll);
+    let ServerMsg::About(all) = raw.next() else { panic!() };
+    let pages = all.info.providers.iter().find(|p| p.id == "pages").unwrap();
+    assert!(matches!(&pages.flows[1], Flow::Redirect { redirect_uris, .. } if redirect_uris == &[PAGE.to_string()]));
+    let mut raw = Raw::connect(addr);
+    raw.send(&ClientMsg::Info);
+    let ServerMsg::Info(info) = raw.next() else { panic!() };
+    assert_eq!(info.providers.iter().find(|p| p.id == "pages").unwrap().flows, vec![Flow::Device]);
+    server.stop();
+}

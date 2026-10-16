@@ -227,6 +227,30 @@ flows = ["browser"]               # the default; see below
 params = [["prompt", "select_account"]]   # optional: let people pick among their Google accounts
 ```
 
+**Google in the browser app a server hosts** ([server.md ▸ Hosting the browser app](server.md#hosting-the-browser-app)).
+The page signs in by going to Google's page and coming back to its own address
+(`https://figcraft.example.com/`), which a Desktop app client refuses. Add a second client for it:
+
+1. **Credentials ▸ Create credentials ▸ OAuth client ID**, application type **Web application**.
+   **Authorized JavaScript origins**: `https://figcraft.example.com`. **Authorized redirect
+   URIs**: `https://figcraft.example.com/` (exactly the page's address, with the `/`).
+2. Put its secret in a file of its own, readable by the server only:
+   `sudo install -m 600 -o figcraft /dev/stdin /etc/figcraft-server/google-web.secret`, then paste
+   it and press Ctrl-D.
+3. Add the keys to the same provider (one provider: people get the same account from the desktop
+   app and the browser), then restart the server:
+
+```toml
+web_redirect_uris = ["https://figcraft.example.com/"]   # each matched exactly
+web_client_id = "1234-web.apps.googleusercontent.com"
+web_client_secret_file = "/etc/figcraft-server/google-web.secret"
+```
+
+The server exchanges codes that come back to a listed page with the web client, and codes from the
+desktop app's loopback page with the desktop client; a code sent back anywhere else is refused.
+Other issuers (Keycloak, Entra ID…) usually take both redirects on one client: list the page in
+`web_redirect_uris` and leave `web_client_id` out.
+
 **The device flow with Google.** Google offers the device flow only to clients of type **TVs and
 Limited Input devices**, and one `[[auth.provider]]` has one client. So with a Desktop app client
 keep `flows = ["browser"]` (the default). To offer the device flow too, create a second client of
@@ -462,6 +486,9 @@ scopes = ["openid", "email", "profile"]   # the default; must include "openid"
 params = [["prompt", "select_account"]]   # default none: extra parameters for the sign-in page
 flows = ["browser"]                 # default ["browser"]; "device" adds the device flow
 trust_email = false                 # default false: count emails as verified when the issuer doesn't say (see below)
+web_redirect_uris = []              # default none: pages of the browser app a server hosts that sign-ins may come back to (https://, exact)
+web_client_id = ""                  # default: client_id; a client of its own for those pages (Google: a "Web application" client)
+web_client_secret_file = ""         # with web_client_id: its secret (or web_client_secret = "…", not both)
 
 [[auth.provider]]
 id = "tokens"

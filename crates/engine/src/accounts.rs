@@ -294,6 +294,7 @@ fn flow_id(f: &Flow) -> &'static str {
         Flow::Token { .. } => "token",
         Flow::Password { .. } => "password",
         Flow::SignUp => "signUp",
+        Flow::Redirect { .. } => "redirect",
     }
 }
 
@@ -347,16 +348,32 @@ fn sign_in(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let has = |want: &str| provider.flows.iter().any(|f| flow_id(f) == want);
     let token = string(p, "token");
+    // The browser build sends its page to the provider; the desktop app opens the provider's page
+    // in the system browser and waits on this machine.
+    let web = cfg!(target_arch = "wasm32");
     let flow = match (string(p, "flow"), &token) {
         (Some(f), _) => f,
         (None, Some(_)) => "token".into(),
         (None, None) if p.get("password").is_some() => "password".into(),
-        (None, None) if has("browser") => "browser".into(),
+        (None, None) if p.get("code").is_some() => "code".into(),
+        (None, None) if web && has("redirect") => "redirect".into(),
+        (None, None) if !web && has("browser") => "browser".into(),
         (None, None) if has("device") => "device".into(),
         (None, None) if has("password") => "password".into(),
         (None, None) => "token".into(),
     };
-    if !has(&flow) {
+    // A code a sign-in page sent back (the redirect or the loopback page) is exchanged by the server.
+    let offered = if flow == "code" { has("redirect") || has("browser") } else { has(&flow) };
+    if !offered {
+        if web && flow == "browser" {
+            return Err(bad(
+                CMD,
+                format!(
+                    "{} can't be used from the browser on this server yet: its operator lists this page in `web_redirect_uris` to allow it",
+                    provider.label
+                ),
+            ));
+        }
         return Err(bad(CMD, format!("{} doesn't offer `{flow}` sign-in here", provider.label)));
     }
     let provider_id = provider.id.clone();
@@ -410,7 +427,29 @@ fn sign_in(s: &mut Session, p: &Value) -> Result<Value> {
             s.request_ui("open.url", json!({"url": url}));
             Ok(json!({"status": "waitingForBrowser", "url": url}))
         }
-        other => Err(bad(CMD, format!("`flow` is browser, device, token or password, not {other:?}"))),
+        "redirect" => {
+            let Some(page) = provider.flows.iter().find(|f| matches!(f, Flow::Redirect { .. })).cloned() else {
+                return Err(bad(CMD, "no sign-in page"));
+            };
+            let link = s.live.link().ok_or_else(|| EngineError::Other(crate::live::NO_ACCOUNTS.into()))?;
+            // The link sends the page there; it comes back with a code (`flow: "code"`).
+            let url = link.redirect_sign_in(&server, &provider_id, &page).map_err(EngineError::Other)?;
+            Ok(json!({"status": "redirecting", "url": url}))
+        }
+        "code" => {
+            let code = req_string(CMD, p, "code")?;
+            let verifier = req_string(CMD, p, "verifier")?;
+            let redirect_uri = req_string(CMD, p, "redirectUri")?;
+            match s.sign_in_step(&server, SignIn::Code { provider: provider_id, code, verifier, redirect_uri })? {
+                SignInReply::SignedIn(me) => Ok(json!({"status": "signedIn", "account": s.keep_sign_in(&server, me)})),
+                SignInReply::Refused { reason } => {
+                    s.accounts.last = Some(Err(reason.clone()));
+                    Err(EngineError::Other(reason))
+                }
+                _ => Err(EngineError::Other("the server didn't sign you in".into())),
+            }
+        }
+        other => Err(bad(CMD, format!("`flow` is browser, redirect, code, device, token or password, not {other:?}"))),
     }
 }
 
@@ -561,14 +600,14 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "account.info",
             "Server accounts",
-            "{server? (default: the server in Preferences)} → {server, name (what its operator calls it; empty: nothing — show your own name for the server first, then this, then its address), version, auth: links | accounts | accounts+links, access: open (no sign-in: links and codes) | basic (username and password) | sso (an identity provider) | basic+sso, open, accounts, links, providers: [{id, label, flows: [browser | device | token | password | signUp]}], e2e: off | optional | required, signedIn: {server, account, name, email, admin, expires} | null}: what the server accepts",
+            "{server? (default: the server in Preferences)} → {server, name (what its operator calls it; empty: nothing — show your own name for the server first, then this, then its address), version, auth: links | accounts | accounts+links, access: open (no sign-in: links and codes) | basic (username and password) | sso (an identity provider) | basic+sso, open, accounts, links, providers: [{id, label, flows: [browser | redirect | device | token | password | signUp]}], e2e: off | optional | required, signedIn: {server, account, name, email, admin, expires} | null}: what the server accepts",
             false,
             info
         ),
         spec!(
             "account.signIn",
             "Sign in to server",
-            "{server?, provider? (an id from `account.info`; default the first), flow? (browser | device | token | password; default browser when offered, password when `password` is given), token? (the token flow), username?, password? (the password flow: sent only over wss:// or to this machine, never returned)} → {status: signedIn, account} (token, password), {status: enterCode, userCode, verificationUri, interval, expiresIn} (device: type the code there, then `account.signInPoll`), or {status: waitingForBrowser, url} (the provider's page opens in the browser; `account.status` tells when it came back). The session token is kept on this computer only and never returned",
+            "{server?, provider? (an id from `account.info`; default the first), flow? (browser | redirect | code | device | token | password; default browser when offered (redirect in the browser build), password when `password` is given, code when `code` is given), token? (the token flow), username?, password? (the password flow: sent only over wss:// or to this machine, never returned), code?, verifier?, redirectUri? (the code flow: what a sign-in page sent back, its PKCE verifier and the exact redirect used)} → {status: signedIn, account} (token, password), {status: enterCode, userCode, verificationUri, interval, expiresIn} (device: type the code there, then `account.signInPoll`), {status: waitingForBrowser, url} (the provider's page opens in the browser; `account.status` tells when it came back), or {status: redirecting, url} (redirect: the browser build's page goes to the provider and comes back with a code). The session token is kept on this computer only and never returned",
             false,
             sign_in
         ),

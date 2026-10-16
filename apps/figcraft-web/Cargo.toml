@@ -19,6 +19,7 @@ figcraft-ui-egui = { workspace = true }
 figcraft-collab-net = { workspace = true }
 egui = { workspace = true }
 log = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # `wgpu` pulls egui-wgpu's defaults: WebGPU plus the WebGL2 fallback.

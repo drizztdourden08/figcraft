@@ -102,6 +102,15 @@ pub enum Flow {
     Password { label: String },
     /// People may make their own account here ([`SignIn::SignUp`]).
     SignUp,
+    // Appended for the browser build a server hosts (apps from before it can't read this: a
+    // server lists it only in the answer to `AboutAll` (figcraft-collab's message), never in `Info` or
+    // `About`).
+    /// [`Flow::Browser`] for a page: send the person (in the same tab) to `authorize_url` with a
+    /// PKCE challenge (S256), a `state` and a `redirect_uri` that is exactly one of
+    /// `redirect_uris` (the page's own address), then send the `code` the page is loaded with
+    /// back ([`SignIn::Code`] with that `redirect_uri`). `client_id` may differ from the
+    /// browser flow's (providers want a separate client for web redirects).
+    Redirect { authorize_url: String, client_id: String, scopes: Vec<String>, params: Vec<(String, String)>, redirect_uris: Vec<String> },
 }
 
 /// A provider a server accepts.
@@ -131,6 +140,15 @@ impl ServerInfo {
     pub fn for_older_apps(mut self) -> ServerInfo {
         for p in &mut self.providers {
             p.flows.retain(|f| matches!(f, Flow::Browser { .. } | Flow::Device | Flow::Token { .. }));
+        }
+        self
+    }
+
+    /// Everything but [`Flow::Redirect`]: what a server answers `About` with (apps that read
+    /// [`Flow::Password`] and [`Flow::SignUp`] but not that one).
+    pub fn without_redirects(mut self) -> ServerInfo {
+        for p in &mut self.providers {
+            p.flows.retain(|f| !matches!(f, Flow::Redirect { .. }));
         }
         self
     }
@@ -171,8 +189,8 @@ pub struct ServerAbout {
 pub enum SignIn {
     /// A session token the server gave earlier ([`Me::session`]).
     Session { token: String },
-    /// What the provider's page sent back to the loopback redirect, with the PKCE verifier and the
-    /// exact `redirect_uri` used.
+    /// What the provider's page sent back to the redirect (the loopback one, or a page's listed in
+    /// [`Flow::Redirect`]), with the PKCE verifier and the exact `redirect_uri` used.
     Code { provider: String, code: String, verifier: String, redirect_uri: String },
     /// Start a device sign-in: the server answers [`SignInReply::Device`].
     DeviceStart { provider: String },

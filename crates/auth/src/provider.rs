@@ -43,12 +43,25 @@ pub struct DeviceStart {
     pub expires_in: u32,
 }
 
+/// `uri` is a page on this machine (`http://127.0.0.1:<port>/`, `http://localhost:<port>/` or
+/// `http://[::1]:<port>/`): where the desktop app waits for a browser sign-in.
+pub fn loopback_redirect(uri: &str) -> bool {
+    ["http://127.0.0.1:", "http://localhost:", "http://[::1]:"].iter().any(|p| uri.starts_with(p))
+}
+
 /// Says who a sign-in is. The server builds one per `[[auth.provider]]`; implement it to add a kind
 /// of your own. Methods a provider doesn't support keep their default ([`AuthError::Unsupported`]).
 /// Called from connection threads: they may block on the network.
 pub trait IdentityProvider: Send + Sync {
     /// Its id, label and the flows apps may use.
     fn info(&self) -> ProviderInfo;
+
+    /// `redirect_uri` is a page on the web this provider lets sign-ins come back to (exactly as
+    /// listed: `web_redirect_uris`). The desktop app's loopback page ([`loopback_redirect`]) is
+    /// always let through by the server.
+    fn web_redirect(&self, _redirect_uri: &str) -> bool {
+        false
+    }
 
     /// The `code` its sign-in page sent to `redirect_uri`, with the PKCE `verifier`.
     fn exchange_code(&self, _code: &str, _verifier: &str, _redirect_uri: &str) -> Result<Identity, AuthError> {

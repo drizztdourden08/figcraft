@@ -176,3 +176,31 @@ fn basic_accounts_flows_are_kept_from_older_apps() {
     );
     assert!(!s.contains("secret") && s.contains("ann"), "{s}");
 }
+
+#[test]
+fn redirect_flows_are_kept_from_older_apps() {
+    let redirect = Flow::Redirect {
+        authorize_url: "https://issuer.test/authorize".into(),
+        client_id: "web".into(),
+        scopes: vec!["openid".into()],
+        params: vec![],
+        redirect_uris: vec!["https://app.example/".into()],
+    };
+    let browser = Flow::Browser { authorize_url: "https://issuer.test/authorize".into(), client_id: "desk".into(), scopes: vec![], params: vec![] };
+    let info = ServerInfo {
+        auth: AuthMode::Accounts,
+        providers: vec![
+            ProviderInfo { id: "g".into(), label: "G".into(), flows: vec![browser.clone(), redirect.clone()] },
+            ProviderInfo { id: "b".into(), label: "B".into(), flows: vec![Flow::Password { label: "A".into() }, Flow::SignUp] },
+        ],
+        e2e: E2eMode::Off,
+    };
+    assert_eq!(info.access(), "basic+sso");
+    // `Info` (apps before basic accounts) and `About` (apps before redirects) leave it out.
+    assert_eq!(info.clone().for_older_apps().providers[0].flows, vec![browser.clone()]);
+    let about = info.clone().without_redirects();
+    assert_eq!(about.providers[0].flows, vec![browser]);
+    assert_eq!(about.providers[1].flows.len(), 2, "basic accounts stay in About");
+    let text = serde_json::to_string(&redirect).unwrap();
+    assert_eq!(serde_json::from_str::<Flow>(&text).unwrap(), redirect);
+}

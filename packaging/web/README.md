@@ -26,6 +26,20 @@ browsers block from a page served over `https://` except to the same computer. T
 other machines, serve the site over `http://` on a trusted network (or use the desktop app);
 `wss://` comes with the standalone server.
 
+## Hosted by your server (locked to it)
+
+`packaging/web/package.sh --server wss://figcraft.example.com/` builds the version a
+`figcraft-server` hosts on its own address: the server's address is baked in
+(`FIGCRAFT_DEFAULT_SERVER`), the app shows the files on this computer and that server only, and
+Preferences ▸ Servers can't add others. The zip is `figcraft-web-<version>-<host>.zip`; add
+`--site DIR` to also get the plain folder to upload. Serve it from the same address as the server
+(WebSocket upgrades to the server, everything else these files): docs/server.md, *Hosting the
+browser app*, and `packaging/server/Caddyfile.web`. People sign in there with a username and
+password, or with an identity provider whose settings list the page in `web_redirect_uris`.
+
+A build without `--server` uses the project's default server (or `FIGCRAFT_DEFAULT_SERVER` from
+the environment; `FIGCRAFT_DEFAULT_SERVER=` for none).
+
 ## Sizes
 
 Measured on the 0.1.0 build (`trunk build --release`; gzip `-9`, Brotli quality 11):

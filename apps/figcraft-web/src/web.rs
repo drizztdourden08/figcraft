@@ -1,7 +1,10 @@
 //! The browser shell: web `Services` and the eframe web runner.
 
+use figcraft_collab_net::pkce::Back;
 use figcraft_engine::Session;
+use figcraft_ui_egui::home::Section;
 use figcraft_ui_egui::{FigApp, Services};
+use serde_json::json;
 use wasm_bindgen::JsCast as _;
 
 const CANVAS_ID: &str = "figcraft_canvas";
@@ -41,7 +44,8 @@ pub fn start() {
                     let ctx = cc.egui_ctx.clone();
                     session.live.install(Box::new(figcraft_collab_net::NetLink::new(std::sync::Arc::new(move || ctx.request_repaint()))));
                     let fig = FigApp::new(session, Box::new(WebServices { reduce_motion, ctx: cc.egui_ctx.clone() }));
-                    Ok(Box::new(WebShell { fig }))
+                    // Back from a provider's sign-in page (`?code=…&state=…`): finished on the first frame.
+                    Ok(Box::new(WebShell { fig, back: figcraft_collab_net::redirect_back() }))
                 }),
             )
             .await;
@@ -60,11 +64,37 @@ fn query() -> String {
 
 struct WebShell {
     fig: FigApp,
+    /// A sign-in the provider sent this page back from, to finish with the server.
+    back: Option<Result<Back, String>>,
+}
+
+impl WebShell {
+    /// Hand the code the provider sent back to the server (`account.signIn`, flow `code`); the
+    /// home screen shows the server's page.
+    fn finish_sign_in(&mut self, ctx: &egui::Context) {
+        let Some(back) = self.back.take() else { return };
+        self.fig.ui.home_view.section = Section::Server(0);
+        match back {
+            Ok(b) => {
+                let params = json!({
+                    "server": b.server, "provider": b.provider, "flow": "code",
+                    "code": b.code, "verifier": b.verifier, "redirectUri": b.redirect_uri,
+                });
+                self.fig.run_background(ctx, "account.signIn", params, Box::new(|_, _, _| {}));
+            }
+            Err(why) => {
+                self.fig.session.accounts.last = Some(Err(why.clone()));
+                self.fig.toast(why);
+            }
+        }
+    }
 }
 
 impl eframe::App for WebShell {
     // `FigApp::ui` runs its own per-frame logic first (fonts, theme), like the desktop app.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.finish_sign_in(&ctx);
         self.fig.ui(ui);
     }
 }

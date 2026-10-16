@@ -570,6 +570,13 @@ pub trait LiveLink: Send {
     fn browser_sign_in(&mut self, _server: &str, _provider: &str, _flow: &Flow) -> std::result::Result<String, String> {
         Err(NO_ACCOUNTS.into())
     }
+    /// Start signing in to the server at `server` by sending this page to `provider`'s (the
+    /// browser build hosted on the web), with `flow` (a [`Flow::Redirect`] from the server's
+    /// `About`): the page it goes to. The page is left for it; when the provider sends it back,
+    /// the app finishes with `account.signIn` and `flow: "code"`.
+    fn redirect_sign_in(&mut self, _server: &str, _provider: &str, _flow: &Flow) -> std::result::Result<String, String> {
+        Err("signing in by sending this page to the provider works only in the browser".into())
+    }
     /// The servers you are signed in to and your session tokens there: joining a file on one of
     /// them signs in first (the engine tells the link before it joins or publishes).
     fn sign_ins(&mut self, _list: Vec<(String, String)>) {}

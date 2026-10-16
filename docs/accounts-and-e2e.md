@@ -150,7 +150,7 @@ that isn't theirs.
 | Kind | Flows | How the server checks |
 |---|---|---|
 | `password` (built into the server, step 12) | `password`, and `signUp` with `allow_signup` | Its own usernames: Argon2id hashes in `accounts/passwords.json`, compared in constant time; wrong passwords lock the username and the address out for a while (see *Basic accounts, folders and previews*) |
-| `oidc` | `browser` (authorization code + PKCE, loopback redirect) by default; `device` (RFC 8628) only when `flows` lists it, and the issuer has a device endpoint | Discovery document → token endpoint → ID token signature against the issuer's keys (cached, refetched when a key id is new), `iss`, `aud`, `exp`, `nbf`, `iat`; `email_verified` (or `trust_email`) for allow-lists |
+| `oidc` | `browser` (authorization code + PKCE, loopback redirect) by default; `device` (RFC 8628) only when `flows` lists it, and the issuer has a device endpoint; `redirect` (the same, for the browser app a server hosts: the page goes to the issuer and comes back to its own address with the code) when `web_redirect_uris` lists pages, exchanged with `web_client_id` when set; a code is exchanged only for the loopback page or a listed page (exact match) | Discovery document → token endpoint → ID token signature against the issuer's keys (cached, refetched when a key id is new), `iss`, `aud`, `exp`, `nbf`, `iat`; `email_verified` (or `trust_email`) for allow-lists |
 | `oidc` + `preset = "google"` or `"gitlab"` | The same | The same code; the preset only fills the issuer and the label |
 | `external` | `token` | POSTs `{"provider": …, "token": …}` to `verify_url`, expects `{"subject", "email"?, "email_verified"?, "name"?}` (200) or a refusal (401/403 with an optional `{"error"}`); reference verifier in [`examples/auth-verifier/`](../examples/auth-verifier/) |
 
@@ -468,7 +468,8 @@ keep talking to each other on everything they knew.
 | C → S | `Info` | What this server accepts |
 | S → C | `Info(ServerInfo)` | Auth mode, providers and their flows, e2e mode, protocol (only the flows older apps read: `Password` and `SignUp` are left out) |
 | C → S | `About` (step 12) | What the server says about itself |
-| S → C | `About(ServerAbout)` | Its name, the whole `ServerInfo` (every flow), its version; older servers refuse `About`: ask `Info` |
+| S → C | `About(ServerAbout)` | Its name, the whole `ServerInfo` (every flow but `Redirect`), its version; older servers refuse `About`: ask `Info` |
+| C → S | `AboutAll` (hosted web app) | `About` with every flow, also `Flow::Redirect` (the browser build asks it; older servers refuse it: ask `About`) |
 | C → S | `SignIn(SignIn)` | `Session`, `Code`, `DeviceStart`, `DevicePoll`, `Token`, `SignOut` |
 | S → C | `SignedIn(Me)` / `Device(DeviceCode)` / `SignInPending` | |
 | C → S | `OpenAccount` then `Account(AccountReq)` | Files, publish, members, invites, devices, keyrings, recovery (step 9: see *Sealed files with accounts*) |

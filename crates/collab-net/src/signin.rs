@@ -18,13 +18,12 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
 use figcraft_auth::{DeviceCode, Flow, Me, ProviderInfo, SignIn, SignInReply};
-use sha2::{Digest, Sha256};
 
 use crate::invite::Endpoint;
 use crate::limits::NetLimits;
 use crate::manage;
+pub use crate::pkce::{Pkce, encode};
 
 /// How long a sign-in waits for the person (the browser page, or the code on another device).
 pub const WAIT: Duration = Duration::from_secs(300);
@@ -154,76 +153,12 @@ pub fn sign_in(
     }
 }
 
-/// A PKCE verifier and the `state` of one browser sign-in.
-pub struct Pkce {
-    pub verifier: String,
-    pub state: String,
-}
-
-fn b64(b: &[u8]) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
-}
-
-fn random(n: usize) -> Result<Vec<u8>, String> {
-    let mut b = vec![0u8; n];
-    getrandom::fill(&mut b).map_err(|e| format!("no secure random numbers: {e}"))?;
-    Ok(b)
-}
-
-/// `s` as a URL query value.
-pub fn encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(char::from(b));
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-impl Pkce {
-    pub fn new() -> Result<Pkce, String> {
-        Ok(Pkce { verifier: b64(&random(32)?), state: b64(&random(16)?) })
-    }
-
-    /// The S256 challenge.
-    pub fn challenge(&self) -> String {
-        b64(&Sha256::digest(self.verifier.as_bytes()))
-    }
-
-    /// The provider's page with everything it needs.
-    pub fn authorize_url(&self, page: &str, client_id: &str, scopes: &[String], params: &[(String, String)], redirect: &str) -> String {
-        let mut q = vec![
-            ("response_type".to_string(), "code".to_string()),
-            ("client_id".to_string(), client_id.to_string()),
-            ("redirect_uri".to_string(), redirect.to_string()),
-            ("scope".to_string(), scopes.join(" ")),
-            ("code_challenge".to_string(), self.challenge()),
-            ("code_challenge_method".to_string(), "S256".to_string()),
-            ("state".to_string(), self.state.clone()),
-        ];
-        q.extend(params.iter().filter(|(k, _)| !q.iter().any(|(have, _)| have == k)).cloned().collect::<Vec<_>>());
-        let query: Vec<String> = q.iter().map(|(k, v)| format!("{}={}", encode(k), encode(v))).collect();
-        format!("{page}{}{}", if page.contains('?') { '&' } else { '?' }, query.join("&"))
-    }
-}
-
 /// What the browser was sent back with: the code, or why not.
 pub fn callback(request_line: &str, state: &str) -> Option<Result<String, String>> {
     let target = request_line.strip_prefix("GET ")?.split(' ').next()?;
     let query = target.split_once('?').map_or("", |(_, q)| q);
-    let get = |k: &str| query.split('&').filter_map(|p| p.split_once('=')).find(|(key, _)| *key == k).map(|(_, v)| crate::invite::decode(v));
-    if get("state").flatten().as_deref() != Some(state) {
-        // Not our redirect (a favicon, a stale tab): keep waiting.
-        return None;
-    }
-    if let Some(err) = get("error").flatten() {
-        let more = get("error_description").flatten().map(|d| format!(": {d}")).unwrap_or_default();
-        return Some(Err(format!("the sign-in was stopped ({err}{more})")));
-    }
-    get("code").flatten().filter(|c| !c.is_empty() && c.len() <= 4096).map(Ok)
+    // Not our redirect (a favicon, a stale tab): keep waiting.
+    crate::pkce::answer(query, state)
 }
 
 const DONE: &str = "<!doctype html><meta charset=utf-8><title>FigCraft</title><body style=\"font-family:system-ui;margin:3em\"><h2>Signed in</h2><p>You can close this tab and go back to FigCraft.</p>";

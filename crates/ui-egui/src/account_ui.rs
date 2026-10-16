@@ -323,9 +323,11 @@ pub fn sign_in_block(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     let providers = info["providers"].as_array().cloned().unwrap_or_default();
     let mut start: Option<Value> = None;
     let has = |p: &Value, f: &str| p["flows"].as_array().is_some_and(|l| l.iter().any(|x| x == f));
-    // The browser build has no loopback page to come back to: a code typed on another device.
+    // The browser build has no loopback page to come back to: it sends the page to the provider
+    // (when the server lets it come back here), else a code typed on another device.
     let web = cfg!(target_arch = "wasm32");
-    let sso_flow = |p: &Value| if web { has(p, "device").then_some("device") } else { ["browser", "device"].into_iter().find(|f| has(p, f)) };
+    let sso_flows: &[&str] = if web { &["redirect", "device"] } else { &["browser", "device"] };
+    let sso_flow = |p: &Value| sso_flows.iter().copied().find(|f| has(p, f));
     // A username and password (basic sign-in).
     for p in providers.iter().filter(|p| has(p, "password")) {
         let id = p["id"].as_str().unwrap_or_default();
@@ -418,7 +420,7 @@ pub fn sign_in_block(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
         app.session.accounts.last = None;
         app.run_background(&ctx, SIGN_IN, params, Box::new(|_, _, _| {}));
     }
-    if cfg!(target_arch = "wasm32") {
+    if web && providers.iter().any(|p| sso_flow(p) == Some("device")) {
         widgets::label(ui, tr("In the browser you sign in with a code you enter on another device."), t.text_secondary);
     }
     if let Some(Err(why)) = &app.session.accounts.last {

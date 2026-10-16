@@ -12,22 +12,30 @@
 //!
 //! An `https://` page can't open an unencrypted `ws://` connection (browsers block mixed content)
 //! except to this machine; [`NetLink::join`] says so up front.
+//!
+//! Requests outside a session (what a server accepts, signing in, your files there, an admin's
+//! requests) go out in the background ([`LiveLink::background`]), each on a connection of its own
+//! driven by an [`Exchange`]. Signing in with a provider sends the whole tab to its page
+//! ([`LiveLink::redirect_sign_in`]); when it comes back, [`redirect_back`] reads the code.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use figcraft_collab::message::{ClientMsg, Presence};
-use figcraft_engine::live::{Event, HostOptions, LiveLink, SessionId, SessionInfo};
+use figcraft_collab::message::{self, ClientMsg, Presence};
+use figcraft_engine::live::{Event, Flow, HostOptions, LiveLink, NO_SESSION, NetReply, NetRequest, SessionId, SessionInfo};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::closure::Closure;
 use web_sys::{BinaryType, CloseEvent, MessageEvent, WebSocket};
 use web_time::Instant;
 
 use crate::driver::{Driver, Socket};
-use crate::inbox::Waker;
-use crate::invite::Invite;
+use crate::exchange::{Exchange, Next};
+use crate::inbox::{Inbox, Waker};
+use crate::invite::{Endpoint, Invite};
 use crate::join::GuestConfig;
+use crate::limits::NetLimits;
+use crate::pkce::{self, Back, Redirect};
 use crate::sessions::Sessions;
 
 /// Close code for leaving normally.
@@ -139,16 +147,187 @@ fn secure_page() -> bool {
     web_sys::window().and_then(|w| w.location().protocol().ok()).is_some_and(|p| p == "https:")
 }
 
+/// How long a request outside a session waits for the server (milliseconds).
+const REQUEST_TIMEOUT_MS: i32 = 20_000;
+
+/// One request outside a session, on its connection.
+struct Request {
+    job: u64,
+    x: Exchange,
+    /// What to send once the connection is open.
+    first: Option<ClientMsg>,
+    ws: Option<(WebSocket, Handlers)>,
+    /// Where the answer goes.
+    inbox: Inbox,
+    /// Gives up when the server doesn't answer in time (kept alive while the request is).
+    _timer: Closure<dyn FnMut()>,
+    timeout: Option<i32>,
+}
+
+thread_local! {
+    static REQUESTS: RefCell<BTreeMap<u64, Rc<RefCell<Request>>>> = RefCell::default();
+}
+
+/// Send `req` on a connection of its own; its answer arrives in `inbox` as [`Event::Net`] with
+/// `job`.
+fn start_request(job: u64, req: NetRequest, inbox: Inbox, limits: &NetLimits) {
+    let (x, first) = match Exchange::start(req, limits) {
+        Ok(started) => started,
+        Err(reply) => return inbox.push(Event::Net { job, reply }),
+    };
+    let id = NEXT_ID.with(|n| n.replace(n.get() + 1));
+    let timer = Closure::<dyn FnMut()>::new(move || with_request(id, |r| Next::Done(Box::new(r.x.timed_out()))));
+    let timeout = web_sys::window()
+        .and_then(|w| w.set_timeout_with_callback_and_timeout_and_arguments_0(timer.as_ref().unchecked_ref(), REQUEST_TIMEOUT_MS).ok());
+    let r = Rc::new(RefCell::new(Request { job, x, first: Some(first), ws: None, inbox, _timer: timer, timeout }));
+    REQUESTS.with(|t| t.borrow_mut().insert(id, r));
+    with_request(id, |r| match open_request(id, &r.x.url) {
+        Ok(ws) => {
+            r.ws = Some(ws);
+            Next::Wait
+        }
+        Err(e) => r.x.closed(&e),
+    });
+}
+
+/// Run `f` on request `id`, then do what it says (send, open again, or finish).
+fn with_request(id: u64, f: impl FnOnce(&mut Request) -> Next) {
+    let Some(rc) = REQUESTS.with(|t| t.borrow().get(&id).cloned()) else { return };
+    let Ok(mut r) = rc.try_borrow_mut() else {
+        log::warn!("server request: an event arrived while the request was busy");
+        return;
+    };
+    let mut next = f(&mut r);
+    // Opening again may fail at once: that is a close too (`Reopen` comes once, so this ends).
+    for _ in 0..4 {
+        next = match next {
+            Next::Wait => return,
+            Next::Send(m) => match message::encode(&m) {
+                Ok(b) if r.ws.as_ref().is_some_and(|(ws, _)| ws.send_with_u8_array(&b).is_ok()) => return,
+                _ => r.x.closed("the message couldn't be sent"),
+            },
+            Next::Reopen(m) => {
+                close_socket(r.ws.take());
+                r.first = Some(m);
+                match open_request(id, &r.x.url) {
+                    Ok(ws) => {
+                        r.ws = Some(ws);
+                        return;
+                    }
+                    Err(e) => r.x.closed(&e),
+                }
+            }
+            Next::Done(reply) => {
+                close_socket(r.ws.take());
+                if let (Some(w), Some(t)) = (web_sys::window(), r.timeout.take()) {
+                    w.clear_timeout_with_handle(t);
+                }
+                r.inbox.push(Event::Net { job: r.job, reply });
+                REQUESTS.with(|t| t.borrow_mut().remove(&id));
+                return;
+            }
+        };
+    }
+}
+
+/// A connection for request `id` to `url`, its events going to the request.
+fn open_request(id: u64, url: &str) -> Result<(WebSocket, Handlers), String> {
+    let ws = WebSocket::new(url).map_err(|e| format!("the browser won't open {url}: {}", js_error(&e)))?;
+    ws.set_binary_type(BinaryType::Arraybuffer);
+    let open = Closure::<dyn FnMut()>::new(move || {
+        with_request(id, |r| match r.first.take() {
+            Some(m) => Next::Send(m),
+            None => Next::Wait,
+        })
+    });
+    let message = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| match e.data().dyn_into::<js_sys::ArrayBuffer>() {
+        Ok(buf) => {
+            let bytes = js_sys::Uint8Array::new(&buf).to_vec();
+            with_request(id, |r| r.x.message(&bytes));
+        }
+        Err(_) => with_request(id, |r| r.x.text()),
+    });
+    let close = Closure::<dyn FnMut(CloseEvent)>::new(move |e: CloseEvent| {
+        let reason = e.reason();
+        with_request(id, |r| r.x.closed(&reason));
+    });
+    ws.set_onopen(Some(open.as_ref().unchecked_ref()));
+    ws.set_onmessage(Some(message.as_ref().unchecked_ref()));
+    ws.set_onclose(Some(close.as_ref().unchecked_ref()));
+    Ok((ws, Handlers { _open: open, _message: message, _close: close }))
+}
+
+/// Close a connection normally; it reports nothing more.
+fn close_socket(ws: Option<(WebSocket, Handlers)>) {
+    let Some((ws, _handlers)) = ws else { return };
+    ws.set_onopen(None);
+    ws.set_onmessage(None);
+    ws.set_onclose(None);
+    let _ = ws.close_with_code(CLOSE_NORMAL);
+}
+
+/// Where a redirect sign-in keeps what it needs while the tab is away (the tab's session storage).
+const REDIRECT_KEY: &str = "figcraft.signIn";
+
+fn session_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.session_storage().ok().flatten())
+}
+
+/// The page's own address: its origin and path (what a redirect comes back to).
+fn page_address() -> Option<String> {
+    let l = web_sys::window()?.location();
+    Some(format!("{}{}", l.origin().ok()?, l.pathname().ok()?))
+}
+
+/// The page was loaded by a provider sending it back from a sign-in this tab started: the sign-in
+/// to finish (`account.signIn` with `flow: "code"` and these), or why it stopped. `None` for any
+/// other page load. The answer is taken off the page's address either way, so a reload doesn't
+/// send it again.
+pub fn redirect_back() -> Option<Result<Back, String>> {
+    let window = web_sys::window()?;
+    let location = window.location();
+    let search = location.search().ok()?;
+    let query = search.strip_prefix('?').unwrap_or(&search);
+    let storage = session_storage();
+    let kept = storage.as_ref().and_then(|s| s.get_item(REDIRECT_KEY).ok().flatten());
+    let back = pkce::came_back(query, kept.as_deref())?;
+    if let Some(s) = &storage {
+        let _ = s.remove_item(REDIRECT_KEY);
+    }
+    let rest = pkce::without_answer(query);
+    let clean = format!(
+        "{}{}{}",
+        location.pathname().unwrap_or_default(),
+        if rest.is_empty() { String::new() } else { format!("?{rest}") },
+        location.hash().unwrap_or_default()
+    );
+    if let Ok(history) = window.history() {
+        let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&clean));
+    }
+    Some(back)
+}
+
 /// The browser's [`LiveLink`]: joins sessions; hosting needs the desktop app.
 pub struct NetLink {
     /// Each session's number in the thread-local table.
     sessions: Sessions<u64>,
+    /// Answers to requests outside a session.
+    requests: Inbox,
+    /// The servers you are signed in to and your session tokens there (by [`Endpoint::url`]).
+    sign_ins: Vec<(String, String)>,
+    limits: NetLimits,
 }
 
 impl NetLink {
     /// `wake` is called whenever something arrives for the UI (egui's `request_repaint`).
     pub fn new(wake: Waker) -> Self {
-        Self { sessions: Sessions::new(wake) }
+        Self { requests: Inbox::new(wake.clone()), sessions: Sessions::new(wake), sign_ins: Vec::new(), limits: NetLimits::default() }
+    }
+
+    /// Your session token on `server`, if you are signed in there.
+    fn session_for(&self, server: &Endpoint) -> Option<String> {
+        let url = server.url();
+        self.sign_ins.iter().find(|(s, _)| *s == url).map(|(_, t)| t.clone())
     }
 
     fn with(&self, session: SessionId, f: impl FnOnce(&mut Driver<BrowserSocket>, Instant)) {
@@ -174,7 +353,8 @@ impl LiveLink for NetLink {
         }
         let id = NEXT_ID.with(|n| n.replace(n.get() + 1));
         let inbox = self.sessions.inbox();
-        let cfg = GuestConfig { code, ..GuestConfig::new(invite, name.to_string()) };
+        let token = self.session_for(&invite.server);
+        let cfg = GuestConfig { code, session: token, ..GuestConfig::new(invite, name.to_string()) };
         let driver = Driver::start(BrowserSocket { id, ws: None }, cfg, inbox.clone(), Instant::now());
         let timer = Closure::<dyn FnMut()>::new(move || with_driver(id, |d, now| d.tick(now)));
         let mut g = Guest { driver, timer, timeout: None };
@@ -215,8 +395,34 @@ impl LiveLink for NetLink {
         self.with(session, |d, now| d.send(msg, now));
     }
 
+    fn background(&mut self, job: u64, req: NetRequest) -> bool {
+        start_request(job, req, self.requests.clone(), &self.limits);
+        true
+    }
+
+    fn sign_ins(&mut self, list: Vec<(String, String)>) {
+        self.sign_ins = list.into_iter().filter_map(|(s, t)| Endpoint::parse(&s).ok().map(|(e, _)| (e.url(), t))).collect();
+    }
+
+    fn redirect_sign_in(&mut self, server: &str, provider: &str, flow: &Flow) -> Result<String, String> {
+        let page = page_address().ok_or("this page has no address")?;
+        let (pending, url) = Redirect::start(server, provider, flow, &page)?;
+        let storage = session_storage().ok_or("this browser keeps nothing for the tab (session storage is off): sign in from the desktop app")?;
+        storage.set_item(REDIRECT_KEY, &pending.to_text()).map_err(|e| format!("couldn't keep the sign-in for the tab: {}", js_error(&e)))?;
+        let location = web_sys::window().ok_or("no window")?.location();
+        location.assign(&url).map_err(|e| format!("couldn't go to the sign-in page: {}", js_error(&e)))?;
+        Ok(url)
+    }
+
+    fn accounts(&mut self, req: NetRequest) -> NetReply {
+        // A page can't wait for a socket: requests go out in the background only.
+        req.failure()("the browser asks servers in the background only".into())
+    }
+
     fn poll(&mut self) -> Vec<(SessionId, Event)> {
-        self.sessions.poll()
+        let mut out: Vec<(SessionId, Event)> = self.requests.drain().into_iter().map(|e| (NO_SESSION, e)).collect();
+        out.extend(self.sessions.poll());
+        out
     }
 }
 

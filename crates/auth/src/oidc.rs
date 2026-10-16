@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::config::ProviderConfig;
 use crate::jwt::{self, Expect, Jwks};
-use crate::provider::{AuthError, DeviceStart, Fetch, FetchError, Identity, IdentityProvider};
+use crate::provider::{AuthError, DeviceStart, Fetch, FetchError, Identity, IdentityProvider, loopback_redirect};
 use crate::wire::{Flow, ProviderInfo};
 
 /// How long a discovery document and a key set are kept before being fetched again.
@@ -49,6 +49,17 @@ struct Cache {
     refetched: Option<Instant>,
 }
 
+/// Most `web_redirect_uris` one provider lists.
+pub const MAX_WEB_REDIRECTS: usize = 16;
+
+/// The client a browser build hosted on the web signs in with (the `web_*` keys).
+struct WebClient {
+    client_id: String,
+    client_secret: String,
+    /// Where its pages may come back to, each matched exactly.
+    redirect_uris: Vec<String>,
+}
+
 /// An OpenID Connect issuer.
 pub struct Oidc {
     id: String,
@@ -60,6 +71,8 @@ pub struct Oidc {
     params: Vec<(String, String)>,
     browser: bool,
     device: bool,
+    /// Sign-in from pages on the web ([`Flow::Redirect`]), when `web_redirect_uris` lists some.
+    web: Option<WebClient>,
     /// An email counts as verified when the token doesn't say (`trust_email`).
     trust_email: bool,
     fetch: Arc<dyn Fetch>,
@@ -95,13 +108,8 @@ impl Oidc {
         if cfg.client_id.trim().is_empty() {
             return Err(format!("provider {:?}: set `client_id` (from the issuer's app registration)", cfg.id));
         }
-        let client_secret = match (cfg.client_secret.trim(), cfg.client_secret_file.trim()) {
-            (s, "") => s.to_string(),
-            ("", f) => {
-                std::fs::read_to_string(f).map_err(|e| format!("provider {:?}: can't read `client_secret_file` {f}: {e}", cfg.id))?.trim().to_string()
-            }
-            _ => return Err(format!("provider {:?}: set `client_secret` or `client_secret_file`, not both", cfg.id)),
-        };
+        let client_secret = secret(&cfg.id, "client_secret", &cfg.client_secret, &cfg.client_secret_file)?;
+        let web = web_client(cfg)?;
         let flows: Vec<String> =
             if cfg.flows.is_empty() { vec!["browser".into()] } else { cfg.flows.iter().map(|f| f.trim().to_ascii_lowercase()).collect() };
         if let Some(bad) = flows.iter().find(|f| *f != "browser" && *f != "device") {
@@ -125,6 +133,7 @@ impl Oidc {
             params: cfg.params.clone(),
             browser: flows.iter().any(|f| f == "browser"),
             device: flows.iter().any(|f| f == "device"),
+            web,
             trust_email: cfg.trust_email,
             fetch,
             cache: Mutex::new(Cache { discovery: None, keys: None, refetched: None }),
@@ -169,8 +178,16 @@ impl Oidc {
         Ok(k)
     }
 
-    /// Who an ID token from this issuer says it is (signature, issuer, audience, times).
+    /// Who an ID token from this issuer says it is (signature, issuer, audience, times): issued to
+    /// this provider's client, or to its web client.
     pub fn check_id_token(&self, token: &str) -> Result<Identity, AuthError> {
+        let mut audiences = vec![self.client_id.as_str()];
+        audiences.extend(self.web.as_ref().map(|w| w.client_id.as_str()).filter(|w| *w != self.client_id));
+        self.check_id_token_for(token, &audiences)
+    }
+
+    /// [`check_id_token`](Self::check_id_token) for a token issued to one of `audiences`.
+    fn check_id_token_for(&self, token: &str, audiences: &[&str]) -> Result<Identity, AuthError> {
         let d = self.discovery()?;
         let parsed = jwt::parse(token)?;
         let mut keys = self.keys(&d, false)?;
@@ -181,16 +198,82 @@ impl Oidc {
         let key = jwt::key_for(&keys, &parsed)
             .ok_or_else(|| AuthError::Refused("the sign-in couldn't be checked: it was signed with an unknown key".into()))?;
         jwt::verify_signature(&parsed, key)?;
-        jwt::check_claims(&parsed.claims, &Expect { issuer: &d.issuer, audience: &self.client_id, now: now() })?;
+        let mut checked = Err(AuthError::Refused("the sign-in was meant for another app".into()));
+        for audience in audiences {
+            checked = jwt::check_claims(&parsed.claims, &Expect { issuer: &d.issuer, audience, now: now() });
+            if checked.is_ok() {
+                break;
+            }
+        }
+        checked?;
         Ok(identity(&self.id, &parsed.claims, self.trust_email))
     }
 
     fn with_secret<'a>(&'a self, form: &mut Vec<(&'a str, &'a str)>) {
-        form.push(("client_id", &self.client_id));
-        if !self.client_secret.is_empty() {
-            form.push(("client_secret", &self.client_secret));
-        }
+        with_client(form, &self.client_id, &self.client_secret);
     }
+
+    /// The web client, when `redirect_uri` is exactly one of its pages.
+    fn web_for(&self, redirect_uri: &str) -> Option<&WebClient> {
+        self.web.as_ref().filter(|w| w.redirect_uris.iter().any(|u| u == redirect_uri))
+    }
+}
+
+fn with_client<'a>(form: &mut Vec<(&'a str, &'a str)>, client_id: &'a str, client_secret: &'a str) {
+    form.push(("client_id", client_id));
+    if !client_secret.is_empty() {
+        form.push(("client_secret", client_secret));
+    }
+}
+
+/// A client secret given as `key`, or in the file `<key>_file` names (not both).
+fn secret(id: &str, key: &str, value: &str, file: &str) -> Result<String, String> {
+    match (value.trim(), file.trim()) {
+        (s, "") => Ok(s.to_string()),
+        ("", f) => Ok(std::fs::read_to_string(f).map_err(|e| format!("provider {id:?}: can't read `{key}_file` {f}: {e}"))?.trim().to_string()),
+        _ => Err(format!("provider {id:?}: set `{key}` or `{key}_file`, not both")),
+    }
+}
+
+/// A page a browser build may come back to: a whole `https://` address (or `http://` to this
+/// machine, for trying it out) without a `#fragment`.
+pub fn valid_web_redirect(uri: &str) -> bool {
+    let rest = match uri.strip_prefix("https://") {
+        Some(rest) => rest,
+        None if loopback_redirect(uri) => uri.split_once("://").map_or("", |(_, r)| r),
+        None => return false,
+    };
+    let host = rest.split(['/', '?']).next().unwrap_or_default();
+    uri.len() <= 500 && !host.is_empty() && !uri.contains('#') && !uri.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// The `web_*` keys of `cfg`.
+fn web_client(cfg: &ProviderConfig) -> Result<Option<WebClient>, String> {
+    let id = &cfg.id;
+    let uris: Vec<String> = cfg.web_redirect_uris.iter().map(|u| u.trim().to_string()).collect();
+    let client_id = cfg.web_client_id.trim();
+    let has_secret = !cfg.web_client_secret.trim().is_empty() || !cfg.web_client_secret_file.trim().is_empty();
+    if uris.is_empty() {
+        if !client_id.is_empty() || has_secret {
+            return Err(format!("provider {id:?}: `web_client_id` and its secret need `web_redirect_uris` (the pages sign-ins come back to)"));
+        }
+        return Ok(None);
+    }
+    if uris.len() > MAX_WEB_REDIRECTS {
+        return Err(format!("provider {id:?}: at most {MAX_WEB_REDIRECTS} `web_redirect_uris`"));
+    }
+    if let Some(bad) = uris.iter().find(|u| !valid_web_redirect(u)) {
+        return Err(format!("provider {id:?}: `web_redirect_uris` entry {bad:?} must be a whole https:// address without a #fragment"));
+    }
+    if client_id.is_empty() && has_secret {
+        return Err(format!("provider {id:?}: a web client secret needs `web_client_id`"));
+    }
+    let (client_id, client_secret) = if client_id.is_empty() {
+        (cfg.client_id.trim().to_string(), secret(id, "client_secret", &cfg.client_secret, &cfg.client_secret_file)?)
+    } else {
+        (client_id.to_string(), secret(id, "web_client_secret", &cfg.web_client_secret, &cfg.web_client_secret_file)?)
+    };
+    Ok(Some(WebClient { client_id, client_secret, redirect_uris: uris }))
 }
 
 /// The identity in a checked token's claims. Without an `email_verified` claim the email counts
@@ -224,16 +307,29 @@ fn oauth_error(e: &FetchError) -> Option<String> {
 impl IdentityProvider for Oidc {
     fn info(&self) -> ProviderInfo {
         let mut flows = Vec::new();
-        if self.browser {
-            // Without the discovery document the page isn't known: the flow is left out until the
-            // issuer answers (apps ask again).
+        if self.browser || self.web.is_some() {
+            // Without the discovery document the page isn't known: the flows are left out until
+            // the issuer answers (apps ask again).
             match self.discovery() {
-                Ok(d) => flows.push(Flow::Browser {
-                    authorize_url: d.authorization_endpoint,
-                    client_id: self.client_id.clone(),
-                    scopes: self.scopes.clone(),
-                    params: self.params.clone(),
-                }),
+                Ok(d) => {
+                    if self.browser {
+                        flows.push(Flow::Browser {
+                            authorize_url: d.authorization_endpoint.clone(),
+                            client_id: self.client_id.clone(),
+                            scopes: self.scopes.clone(),
+                            params: self.params.clone(),
+                        });
+                    }
+                    if let Some(w) = &self.web {
+                        flows.push(Flow::Redirect {
+                            authorize_url: d.authorization_endpoint,
+                            client_id: w.client_id.clone(),
+                            scopes: self.scopes.clone(),
+                            params: self.params.clone(),
+                            redirect_uris: w.redirect_uris.clone(),
+                        });
+                    }
+                }
                 Err(e) => log::warn!("provider {}: {e}", self.id),
             }
         }
@@ -243,13 +339,22 @@ impl IdentityProvider for Oidc {
         ProviderInfo { id: self.id.clone(), label: self.label.clone(), flows }
     }
 
+    fn web_redirect(&self, redirect_uri: &str) -> bool {
+        self.web_for(redirect_uri).is_some()
+    }
+
     fn exchange_code(&self, code: &str, verifier: &str, redirect_uri: &str) -> Result<Identity, AuthError> {
-        if !self.browser {
-            return Err(AuthError::Unsupported);
-        }
+        // A page listed in `web_redirect_uris` signs in with the web client; the desktop app's
+        // loopback page with the provider's own.
+        let (client_id, client_secret) = match self.web_for(redirect_uri) {
+            Some(w) => (w.client_id.as_str(), w.client_secret.as_str()),
+            None if self.browser && loopback_redirect(redirect_uri) => (self.client_id.as_str(), self.client_secret.as_str()),
+            None if self.browser => return Err(AuthError::Refused("that sign-in came back to a page this server doesn't know".into())),
+            None => return Err(AuthError::Unsupported),
+        };
         let d = self.discovery()?;
         let mut form = vec![("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect_uri), ("code_verifier", verifier)];
-        self.with_secret(&mut form);
+        with_client(&mut form, client_id, client_secret);
         let body = self.fetch.post_form(&d.token_endpoint, &form).map_err(|e| match oauth_error(&e) {
             Some(code) => AuthError::Refused(format!("the sign-in was refused ({code}): try again")),
             None => unavailable(e),
@@ -257,7 +362,7 @@ impl IdentityProvider for Oidc {
         let answer: Value = serde_json::from_slice(&body).map_err(|_| AuthError::Unavailable("the issuer's answer couldn't be read".into()))?;
         let id_token =
             answer["id_token"].as_str().ok_or_else(|| AuthError::Unavailable("the issuer sent no ID token (is \"openid\" in the scopes?)".into()))?;
-        self.check_id_token(id_token)
+        self.check_id_token_for(id_token, &[client_id])
     }
 
     fn start_device(&self) -> Result<DeviceStart, AuthError> {

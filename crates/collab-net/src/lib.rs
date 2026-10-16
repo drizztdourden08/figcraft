@@ -16,10 +16,13 @@
 #[cfg(any(target_arch = "wasm32", test))]
 mod driver;
 pub mod editors;
+#[cfg(any(target_arch = "wasm32", test))]
+mod exchange;
 pub mod inbox;
 pub mod invite;
 mod join;
 pub mod limits;
+pub mod pkce;
 pub mod sealing;
 mod sessions;
 pub mod throttle;
@@ -56,18 +59,22 @@ pub use limits::NetLimits;
 #[cfg(not(target_arch = "wasm32"))]
 pub use link::{DEFAULT_PORT, NetLink, lan_ip};
 #[cfg(target_arch = "wasm32")]
-pub use web::NetLink;
+pub use web::{NetLink, redirect_back};
 
 #[cfg(test)]
 mod code_tests;
 #[cfg(test)]
 mod driver_tests;
 #[cfg(test)]
+mod exchange_tests;
+#[cfg(test)]
 mod invite_tests;
 #[cfg(test)]
 mod links_tests;
 #[cfg(test)]
 mod loopback_tests;
+#[cfg(test)]
+mod pkce_tests;
 #[cfg(test)]
 mod sealing_tests;
 #[cfg(test)]

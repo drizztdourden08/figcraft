@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use figcraft_auth::{Gate, Links, Origin, Person};
+use figcraft_auth::{Gate, Links, Origin, Person, ServerAbout};
 use figcraft_collab::message::{
     self, Access, AccountReply, AccountReq, Admin, AdminReply, ClientMsg, Hello, HostInfo, LibraryReply, LibraryReq, Manage, OpenAccount,
     OpenHosting, OpenLibrary, OpenPlugins, PROTOCOL, PluginReply, PluginReq, Presence, Resolve, ServerMsg, reads_hosting,
@@ -933,7 +933,11 @@ fn before_first(
     for _ in 0..MAX_STEPS {
         match next_message(ws, max)? {
             Some((ClientMsg::Info, _)) => say(out, &ServerMsg::Info(Box::new(gate.info()))),
-            Some((ClientMsg::About, _)) => say(out, &ServerMsg::About(Box::new(gate.about()))),
+            Some((ClientMsg::About, _)) => {
+                let about = gate.about();
+                say(out, &ServerMsg::About(Box::new(ServerAbout { info: about.info.without_redirects(), ..about })));
+            }
+            Some((ClientMsg::AboutAll, _)) => say(out, &ServerMsg::About(Box::new(gate.about()))),
             Some((ClientMsg::SignIn(req), _)) => {
                 let (reply, who) = gate.sign_in_from(req, from);
                 if who.is_some() {
