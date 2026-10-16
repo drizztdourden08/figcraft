@@ -6,7 +6,9 @@
 //!   parents. An empty folder someone made is theirs (`folders.json`): others see it once a file
 //!   they're in is put there. Renaming a folder moves the files in it that you may edit, and your
 //!   own folders; a folder you remove must hold no file you're in. Folder names are plain text on
-//!   the server, also for sealed files.
+//!   the server, also for sealed files. Where everyone is in every file (`[auth] file_access =
+//!   "everyone"`) folders are everyone's: everyone sees every folder, empty ones too, and may
+//!   rename or remove them.
 //! - **Recent files.** When someone signed in opens a file, the server notes when
 //!   (`recents.json`, the newest [`MAX_RECENTS_EACH`] per person); listings say when you last
 //!   opened each file.
@@ -126,7 +128,7 @@ impl Store {
         for id in self.file_ids() {
             let _ = self.role_of(&id, who);
         }
-        self.file_ids().into_iter().filter_map(|id| Some((id.clone(), self.people(&id)?.role(&who.account)?))).collect()
+        self.file_ids().into_iter().filter_map(|id| Some((id.clone(), self.role_in(&id, &who.account)?))).collect()
     }
 
     /// The folders `who` sees (sorted).
@@ -137,7 +139,8 @@ impl Store {
                 with_parents(&e.meta.folder, &mut out);
             }
         }
-        for f in self.folders.iter().filter(|f| f.account == who.account) {
+        let everyone = self.everyone();
+        for f in self.folders.iter().filter(|f| everyone || f.account == who.account) {
             with_parents(&f.path, &mut out);
         }
         out.sort();
@@ -158,7 +161,8 @@ impl Store {
         if path.is_empty() {
             return Err("give the folder a name".into());
         }
-        if self.folders.iter().any(|f| f.account == who.account && f.path == path) {
+        let everyone = self.everyone();
+        if self.folders.iter().any(|f| (everyone || f.account == who.account) && f.path == path) {
             return Ok(());
         }
         if self.folders.iter().filter(|f| f.account == who.account).count() >= MAX_FOLDERS_EACH || self.folders.len() >= MAX_FOLDERS {
@@ -193,7 +197,8 @@ impl Store {
             changed += 1;
         }
         let mut mine = false;
-        for f in self.folders.iter_mut().filter(|f| f.account == who.account && within(&f.path, &from)) {
+        let everyone = self.everyone();
+        for f in self.folders.iter_mut().filter(|f| (everyone || f.account == who.account) && within(&f.path, &from)) {
             f.path = moved(&f.path);
             mine = true;
         }
@@ -218,7 +223,8 @@ impl Store {
             return Err("the folder isn't empty: move its files out first".into());
         }
         let before = self.folders.len();
-        self.folders.retain(|f| !(f.account == who.account && within(&f.path, &path)));
+        let everyone = self.everyone();
+        self.folders.retain(|f| !((everyone || f.account == who.account) && within(&f.path, &path)));
         if self.folders.len() == before {
             return Err("you have no folder by that name".into());
         }

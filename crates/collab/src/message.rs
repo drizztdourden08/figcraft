@@ -363,6 +363,41 @@ pub enum Admin {
     RemoveUser { username: String },
     /// The usernames ([`AdminReply::Users`]).
     Users,
+    // ---- Team access (m9/team-access): appended, keep this block together. Servers older than
+    // it can't read these. ----
+    /// Let `email` sign in (servers with SSO): kept in the data directory beside the settings'
+    /// `allow_emails`; `admin`: they are an admin too ([`AdminReply::Done`]).
+    AllowEmail { email: String, admin: bool },
+    /// Take an email off the list admins keep (one in the settings stays: change it there).
+    DisallowEmail { email: String },
+    /// Who may sign in ([`AdminReply::Allowed`]).
+    Allowed,
+    /// Make someone who signed in an admin, or not (the settings' `admins` stay admins).
+    SetAdmin { account: String, admin: bool },
+}
+
+/// An email allowed to sign in ([`Admin::Allowed`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowedEmail {
+    pub email: String,
+    /// They are an admin too.
+    pub admin: bool,
+    /// From the server's settings (`allow_emails` or `admins`): changed there, not here.
+    pub settings: bool,
+    /// The person who signed in with it, once they have.
+    pub account: Option<String>,
+}
+
+/// Who may sign in on a server with accounts ([`Admin::Allowed`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowList {
+    /// Anyone the server's identity providers vouch for may sign in (no list narrows it).
+    pub open: bool,
+    pub emails: Vec<AllowedEmail>,
+    /// Domains whose addresses may sign in (the settings' `allow_domains`).
+    pub domains: Vec<String>,
+    /// People made admins from the app (by account), beside the emails.
+    pub admin_accounts: Vec<String>,
 }
 
 /// A secret travelling in a message (a password): its text, never shown by `Debug`.
@@ -552,6 +587,8 @@ pub enum AdminReply {
         password: Option<Secret>,
     },
     Users(Vec<UserInfo>),
+    // ---- Team access (m9/team-access): appended. ----
+    Allowed(AllowList),
 }
 
 /// A file with what its operator moderates by.
@@ -1016,6 +1053,28 @@ pub enum AccountReq {
     GetThumbnail {
         file: String,
     },
+    // ---- Team access (m9/team-access): appended, keep this block together. Servers older than
+    // it can't read these. ----
+    /// Someone's picture as the server keeps it ([`AccountReply::Avatar`]): anyone signed in on
+    /// the server may ask for anyone's.
+    Avatar {
+        account: String,
+    },
+    /// Who is on the server and how files are shared there ([`AccountReply::Team`]).
+    Team,
+}
+
+/// Someone on a server with accounts ([`AccountReq::Team`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMember {
+    pub account: String,
+    /// What they are called (from their identity provider; apps show it, never the email).
+    pub name: String,
+    pub admin: bool,
+    /// The server keeps a picture of them ([`AccountReq::Avatar`]).
+    pub avatar: bool,
+    /// Their email: only admins are told.
+    pub email: Option<String>,
 }
 
 /// A device of an owner or editor of a sealed file ([`AccountReq::EditorKeys`]).
@@ -1153,6 +1212,18 @@ pub enum AccountReply {
     Thumbnail {
         image: Vec<u8>,
         set: u64,
+    },
+    // ---- Team access (m9/team-access): appended, keep together. ----
+    /// Someone's picture (`image` empty: none) and its type (`image/png` or `image/jpeg`).
+    Avatar {
+        image: Vec<u8>,
+        mime: String,
+    },
+    /// `file_access`: `"everyone"` (everyone on the server is in every file) or `"members"`;
+    /// everyone who signed in here.
+    Team {
+        file_access: String,
+        people: Vec<TeamMember>,
     },
 }
 

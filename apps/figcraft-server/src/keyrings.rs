@@ -5,6 +5,10 @@
 //! or editor app online wraps for them) and when a file needs a new epoch (someone was taken out
 //! or a device revoked: an owner's app starts it).
 //!
+//! Where everyone is in every file (`[auth] file_access = "everyone"`), a sealed file's key goes
+//! to every device of everyone on the server, any of them (all editors) may start a new epoch, and
+//! taking someone off the server starts one for every sealed file.
+//!
 //! `keyring.json`:
 //!
 //! ```json
@@ -91,10 +95,19 @@ impl Store {
         Ok(())
     }
 
-    /// Every member of `file` with their devices.
+    /// Every member of `file` with their devices (everyone's, where everyone is in every file).
     fn member_devices(&self, file: &str) -> Vec<(Role, DeviceRec)> {
+        if self.everyone() {
+            return self.accounts.all_devices().into_iter().filter_map(|d| Some((self.role_in(file, &d.account)?, d))).collect();
+        }
         let Some(people) = self.people(file) else { return Vec::new() };
         people.members.iter().flat_map(|m| self.accounts.devices_of(&m.account).into_iter().map(move |d| (m.role, d))).collect()
+    }
+
+    /// May someone with `role` start a new epoch of a file's key? Owners; where everyone is in
+    /// every file, editors too (a file there may have no owner left).
+    fn may_rotate(&self, role: Role) -> bool {
+        role == Role::Owner || (self.everyone() && role == Role::Editor)
     }
 
     fn keys_pending(&mut self, who: &Person) -> Vec<PendingFile> {
@@ -105,7 +118,7 @@ impl Store {
             if !self.sealed(&file) {
                 continue;
             }
-            let Some(role) = self.people(&file).and_then(|p| p.role(&who.account)) else { continue };
+            let Some(role) = self.role_in(&file, &who.account) else { continue };
             let Ok(ring) = self.keyring(&file) else { continue };
             let devices = self.member_devices(&file);
             let may = |d: &DeviceRec| matches!(role, Role::Owner | Role::Editor) || d.account == who.account;
@@ -120,7 +133,7 @@ impl Store {
                 }
             }
             let current = ring.current();
-            let owner = role == Role::Owner;
+            let owner = self.may_rotate(role);
             let rotate = ring.rotate && owner && current.is_some_and(|c| c < u32::MAX);
             if rotate || (owner && current.is_none()) {
                 // A new epoch (or the first copies of a file published before keyrings), for every
@@ -151,7 +164,7 @@ impl Store {
         let mut ring = self.keyring(file)?;
         let mine: BTreeSet<String> = self.accounts.devices_of(&who.account).into_iter().map(|d| d.id).collect();
         if rotate {
-            if role != Role::Owner {
+            if !self.may_rotate(role) {
                 return Err("only the file's owners can start a new epoch of its key".into());
             }
             if ring.epochs.contains_key(&epoch) {
@@ -180,7 +193,7 @@ impl Store {
                 return Err("that isn't a wrapped file key".into());
             }
             let d = self.accounts.device(&device).ok_or("no device with that id is registered here")?;
-            if self.people(file).and_then(|p| p.role(&d.account)).is_none() {
+            if self.role_in(file, &d.account).is_none() {
                 return Err("that device's person isn't in this file".into());
             }
             if d.account != who.account && !editor {
@@ -217,7 +230,7 @@ impl Store {
     fn revoke_device(&mut self, who: &Person, device: &str) -> Result<(), String> {
         self.accounts.revoke_device(&who.account, device)?;
         for file in self.file_ids() {
-            if self.people(&file).and_then(|p| p.role(&who.account)).is_some() {
+            if self.role_in(&file, &who.account).is_some() {
                 self.keys_forget(&file, &who.account, Some(device))?;
             }
         }
@@ -248,6 +261,22 @@ impl Store {
             everyone &= devices.iter().any(|d| !d.recovery);
             list.extend(devices.into_iter().map(|d| EditorDevice { account: d.account, device: d.id, public: d.public, recovery: d.recovery }));
         }
+        // Where everyone is in every file, everyone's devices sign (the owners and editors listed
+        // must still have a device before signatures are required; a file without any needs one
+        // device somewhere).
+        if self.everyone() {
+            let all: Vec<DeviceRec> = self
+                .accounts
+                .all_devices()
+                .into_iter()
+                .filter(|d| !list.iter().any(|e: &EditorDevice| e.device == d.id))
+                .filter(|d| self.role_in(file, &d.account).is_some_and(|r| r != Role::Viewer))
+                .collect();
+            if editors.is_empty() {
+                everyone = all.iter().any(|d| !d.recovery);
+            }
+            list.extend(all.into_iter().map(|d| EditorDevice { account: d.account, device: d.id, public: d.public, recovery: d.recovery }));
+        }
         let entry = self.entry(file)?;
         if entry.meta.signed_from.is_none() && everyone {
             let seq = open(file).map_or(entry.meta.seq, |o| o.seq);
@@ -264,7 +293,7 @@ impl Store {
     fn devices_of(&self, who: &Person, account: &str) -> Result<AccountReply, String> {
         let shares = account == who.account
             || who.admin
-            || self.file_ids().iter().any(|f| self.people(f).is_some_and(|p| p.role(&who.account).is_some() && p.role(account).is_some()));
+            || self.file_ids().iter().any(|f| self.role_in(f, &who.account).is_some() && self.role_in(f, account).is_some());
         if !shares {
             return Err("you share no file with them here".into());
         }

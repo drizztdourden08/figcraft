@@ -16,6 +16,9 @@ verifier of your own…), and each file has members with a role. A server withou
   [basic accounts (usernames and passwords)](#basic-accounts-usernames-and-passwords)
 - [The settings](#the-settings)
 - [Who may sign in](#who-may-sign-in)
+- [Team access](#team-access): [who sees which files](#who-sees-which-files),
+  [adding people](#adding-people), [names and pictures](#names-and-pictures),
+  [new files and saving](#new-files-and-saving)
 - [Day to day](#day-to-day)
 - [Folders, recent files and previews](#folders-recent-files-and-previews)
 - [Data and backups](#data-and-backups)
@@ -29,10 +32,11 @@ verifier of your own…), and each file has members with a role. A server withou
 | Mode | How people get in |
 |---|---|
 | `links` (default; `"open"` is the same) | An **open** server: share links and join codes, as described in [`server.md`](server.md). No sign-in. |
-| `accounts` | Signing in is required. A person opens a file only when they are one of its members (or an admin). Share links and join codes don't work. |
+| `accounts` | Signing in is required. Everyone allowed on the server sees and edits every file (`file_access = "everyone"`, the default; see [Team access](#team-access)), or, with `file_access = "members"`, a person opens a file only when they are one of its members (or an admin). Share links and join codes don't work. |
 | `accounts+links` | Both: members sign in, and a file's owners can still make share links and join codes; someone with a link gets in without signing in. |
 
-Each member of a file has a **role**:
+Each member of a file has a **role** (with `file_access = "everyone"` the creator is the owner and
+everyone else an editor; nobody is invited per file):
 
 - **owner**: edits, invites people, changes their roles, removes them, renames or removes the file,
   and (with `accounts+links`) makes and revokes its share links. A file always keeps at least one
@@ -471,6 +475,7 @@ allow_emails = []                   # default []: verified emails that may sign 
 allow_domains = ["example.com"]     # default []: domains whose verified emails may sign in
                                     # (both lists empty: anyone a provider vouches for)
 session_days = 30                   # default 30: a sign-in lasts this long without being used (0.01 to 3650)
+file_access = "everyone"            # default "everyone": everyone allowed here is in every file; "members": per-file members
 
 # One block per provider (at least one with accounts, at most 32).
 [[auth.provider]]
@@ -556,12 +561,19 @@ After a provider has said who someone is, the server decides whether they may si
   both), a leading `@` is ignored, and case doesn't matter. An email the provider didn't verify
   counts for nothing.
 
-People who are refused see why in the app: `ann@other.com isn't allowed on this server: ask its
-operator`, or, when their sign-in gave no verified email, `this server lets in only some email
+People who are refused see why in the app: `ann@other.com isn't allowed on this server: ask one
+of its admins to add you`, or, when their sign-in gave no verified email, `this server lets in only some email
 addresses, and your sign-in didn't give a verified one`.
 
-Being allowed to sign in doesn't open any file: with `accounts`, a person sees only the files they
-are a member of (or invited to) and those they publish.
+With `file_access = "everyone"` (the default) being allowed to sign in is being in every file. With
+`file_access = "members"` it doesn't open any file: a person sees only the files they are a member
+of (or invited to) and those they publish.
+
+Admins also keep a list of their own from the app (see [Adding people](#adding-people)): its
+emails count as if they were in `allow_emails`. So with both of the settings' lists empty, the
+server lets in anyone a provider vouches for **until an admin adds the first email**; from then on
+only the emails listed (in the settings or by admins), the domains in `allow_domains`, and admins
+get in.
 
 **Sessions.** Signing in gives the app a session token of the server's own; the app uses it from
 then on, without the provider. A session lasts `session_days` from its last use (so a person who
@@ -569,6 +581,64 @@ uses FigCraft every week stays signed in) and a person keeps at most 20 (the old
 Every use checks the allow-lists again: narrow them and restart, and people no longer allowed are
 refused on their next connection, with the same message as at sign-in. Shortening `session_days` applies to new sign-ins; existing sessions keep the expiry
 they had.
+
+## Team access
+
+### Who sees which files
+
+`[auth] file_access` says how files are shared on a server with accounts:
+
+| `file_access` | Who sees and opens a file |
+|---|---|
+| `"everyone"` (default) | Everyone allowed on the server. **Files** lists every file for everyone; anyone opens and edits any of them (role *editor*); whoever made a file is its owner (renames, removes it); admins as always. Folders are everyone's (an empty folder someone made shows for all). Per-file **invites, member lists, role changes and leaving** are refused with *this server gives everyone on it access to every file: ask an admin to add people to the server*. |
+| `"members"` | Each file's members, invited by its owners (what servers did before this setting; set it to keep that). |
+
+Sealed files with `"everyone"`: a file's key is wrapped for **every device of everyone** on the
+server (the next app online that holds the key does it), every editor's device signs, any editor
+may start a new epoch, and **taking someone off the server** (admin **Remove…**) starts a new epoch
+for every sealed file: what is written after can't be read with the keys they had.
+
+### Adding people
+
+The model: an admin adds people to the server, they sign in and see the files.
+
+- **Basic accounts** (usernames and passwords): admins add users (Admin ▸ Usernames, **Add user**;
+  `admin.createUser`). People the admins added this way aren't narrowed by the admins' email list
+  below (the settings' `allow_emails`/`allow_domains` still apply to them, as before).
+- **Single sign-on**: admins add emails (`admin.allowEmail {email, admin?}`; the list is kept in
+  `data/accounts/allowed.json`, merged with the settings' `allow_emails`, `allow_domains` and
+  `admins`). `admin.allowed` lists everything that lets people in, marking what comes from
+  `server.toml` (changed there, not from the app); `admin.disallowEmail` takes an email off (its
+  person's sessions end when nothing else lets them in; their files stay).
+- **Admins** make other people admins, or not (`admin.setAdmin {account, admin}`, kept in the same
+  file); the settings' `admins` stay admins. An email added with `admin: true` is an admin once
+  they sign in.
+
+### Names and pictures
+
+People show by their **name**, never their email: the provider's `name`, else `given_name` and
+`family_name`, else `preferred_username` (the email only when none of them is there; the app hides
+it). Everyone signed in sees everyone's name (`account.people`); admins also see emails.
+
+When a provider gives a **picture** (OpenID Connect's `picture`), the server fetches it when the
+person signs in, at most once a day: only `https://` addresses (or `http://` on the server's own
+machine, for trying it out), PNG or JPEG, at most 256 KiB. It keeps a copy in
+`data/avatars/<account>.png|jpg` and gives it to anyone signed in on the server
+(`account.avatar`); anything else is not kept (a copy from before stays). People without a picture
+show their initials.
+
+### New files and saving
+
+- **New file on the server**: `account.newFile {folder?, name?, sealed?}` makes a blank file on
+  the server as you (sealed when the server's `[e2e] mode` is `"required"`) and opens it.
+- **Default server** (Preferences ▸ Servers, `servers.setDefault`): the **+** tab and File ▸ New
+  make new files on that server's root (when you are signed in there). `servers.setStartHome`
+  opens a server's home when the desktop app starts.
+- **Save** (Ctrl+S): a file on a server is saved there (its edits go to the server as they are
+  made; Save sends what is left and says whether the server has it all). An untitled file goes to
+  the default server's root. A file with a path on this computer, not on a server, saves to that
+  path as before. **Save locally** (`file.saveLocally`) is what Save as was: a copy on this
+  computer.
 
 ## Day to day
 
@@ -590,8 +660,9 @@ The app shows a server by the name given to it there, never by its address.
   first, then **All files** (and folders, with the path to go back up, once the server keeps
   folders), each with your role and *Encrypted* for sealed files. A click opens one (as a member,
   no link needed). **Put an open file here** publishes an open file to the server as yours.
-- **People**: each of your files; one opens to show who is in it, and owners change roles, remove
-  people, take invites back and **Invite** by email.
+- **People**: everyone on the server, by name and picture. With `file_access = "members"`, each of
+  your files too: one opens to show who is in it, and owners change roles, remove people, take
+  invites back and **Invite** by email.
 - **Account**: **Change password** (basic sign-in), and on servers that keep sealed files your
   devices, the recovery key, **Revoke**, **Make a recovery key** (shown once) and **Use a recovery
   key**. Someone whose devices changed gets a gentle note in People, with **Show safety number**.
@@ -609,7 +680,7 @@ and the others below, `admin.*`.
 - **Publishing** a file to the server while signed in makes the publisher its **owner**; no server
   key is needed. A person owns at most 1,000 files on one server. With `accounts` the file gets no
   share links; with `accounts+links` it gets an edit and a view link as before.
-- **Inviting**: an owner invites people by email with a role. Someone who has already signed in to
+- **Inviting** (`file_access = "members"` only): an owner invites people by email with a role. Someone who has already signed in to
   the server becomes a member at once; anyone else is kept as an invite and becomes a member the
   first time they sign in with that (verified) email and open the file or list their files. A file
   has at most 500 members and invites together.
@@ -617,7 +688,8 @@ and the others below, `admin.*`.
   else owner first).
 - **Removing people**: an owner removes a member (they are disconnected from the file at once) or
   withdraws an invite; anyone can leave a file; the last owner can't leave or be removed. To keep
-  someone out of the whole server, take them off the allow-lists (there is no per-person ban yet).
+  someone out of the whole server, take them off the allow-lists (`admin.disallowEmail`, or
+  `server.toml`) and remove them (**Remove…**).
 - **Admins** see and manage every file, including those published with the server key: an admin
   invites the right person as owner to hand such a file over.
 - **accounts+links**: owners make, list and revoke a file's share links and join codes from their
@@ -630,7 +702,7 @@ On a server with accounts, people's files can be filed in **folders** and have *
 - A file has **one** folder (`Marketing/2026`: names joined by `/`, at most 8 deep), the same for
   everyone in it; its owners and editors move it. A folder exists while a file is in it; people see
   the folders of the files they're in. An empty folder someone makes is theirs until a file is put
-  there. Renaming a folder moves the files in it that you may edit; a folder you remove must be
+  there (with `file_access = "everyone"` every folder is everyone's, empty ones too). Renaming a folder moves the files in it that you may edit; a folder you remove must be
   empty of files you're in. Folder names are plain text on the server, also for sealed files: name
   folders knowing the operator can read them.
 - When someone opens a file, the server notes when (`recents.json`): the app shows a Recent row.
@@ -785,7 +857,7 @@ already used or expired, or the redirect didn't match: sign in again.
 **`the issuer sent no ID token (is "openid" in the scopes?)`**: add `"openid"` to `scopes` (the
 default has it).
 
-**`… isn't allowed on this server: ask its operator`**: the person's verified email isn't in
+**`… isn't allowed on this server: ask one of its admins to add you`**: the person's verified email isn't in
 `allow_emails` and its domain isn't in `allow_domains`. Add them and restart. **`… your sign-in
 didn't give a verified one`**: the provider sent no verified email (Entra ID never says: see
 `trust_email` in [The settings](#the-settings); in Keycloak, mark the email verified).

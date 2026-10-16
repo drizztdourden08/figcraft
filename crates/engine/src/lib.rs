@@ -55,6 +55,7 @@ pub mod snap;
 pub mod style_vars;
 pub mod synthetic;
 pub mod synthetic_ds;
+pub mod team;
 pub mod templates;
 pub mod textedit;
 pub mod textpreview;
@@ -398,7 +399,8 @@ pub struct VersionPreview {
 pub const PREVIEW_READ_ONLY: &str = "you're viewing an earlier version: restore it or go back to the current version to edit";
 
 /// Commands that first end a version preview: they act on the document itself.
-const ENDS_PREVIEW: &[&str] = &["file.save", "file.saveAs", "file.close", "file.revert", "file.saveVersion", "file.duplicate", "version.restore"];
+const ENDS_PREVIEW: &[&str] =
+    &["file.save", "file.saveAs", "file.saveLocally", "file.close", "file.revert", "file.saveVersion", "file.duplicate", "version.restore"];
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -674,6 +676,14 @@ pub struct Prefs {
     pub home_sort: String,
     /// Which way: `"desc"` (newest first, Z to A) or `"asc"`.
     pub home_order: String,
+    /// New files go to this server (its root, as you): the + tab and File ▸ New make them there,
+    /// and File ▸ Save puts an untitled file there ([`server_files`]'s `account.newFile`;
+    /// `servers.setDefault`). `None`: new files stay on this computer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_server: Option<String>,
+    /// The desktop app opens this server's home when it starts (`servers.setStartHome`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_server_home: Option<String>,
 }
 
 impl Default for Prefs {
@@ -707,6 +717,8 @@ impl Default for Prefs {
             home_views: BTreeMap::new(),
             home_sort: "modified".into(),
             home_order: "desc".into(),
+            default_server: None,
+            open_server_home: None,
         }
     }
 }

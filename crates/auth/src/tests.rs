@@ -1,7 +1,7 @@
 use crate::*;
 
 fn who(email: Option<&str>, verified: bool) -> Identity {
-    Identity { provider: "p".into(), subject: "s".into(), email: email.map(Into::into), email_verified: verified, name: None }
+    Identity { provider: "p".into(), subject: "s".into(), email: email.map(Into::into), email_verified: verified, name: None, picture: None }
 }
 
 #[test]

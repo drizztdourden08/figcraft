@@ -13,20 +13,13 @@ use crate::{DocState, EngineError, Result, Session, bad, spec};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        spec!("file.new", "New design file", "{name?}", false, |s, p| {
-            let name = string(p, "name").unwrap_or_else(|| "Untitled".into());
-            let mut doc = Document::new(name);
-            // A property of the page from here on: a later change of theme leaves it alone.
-            let background = s.new_page_background();
-            for page in doc.pages.clone() {
-                if let Some(NodeKind::Page { background: b, .. }) = doc.node_mut(page).map(|n| &mut n.kind) {
-                    *b = background;
-                }
-            }
-            s.docs.push(DocState::new(doc, None));
-            s.active = s.docs.len() - 1;
-            Ok(json!({"index": s.active}))
-        }),
+        spec!(
+            "file.new",
+            "New design file",
+            "{name?, local? (true: on this computer even with a default server)} → {index} (on this computer), or with a default server you are signed in to (`servers.setDefault`) account.newFile's answer: a blank file on that server's root, opened in a new tab",
+            false,
+            crate::team::file_new
+        ),
         spec!(
             "file.open",
             "Open",
@@ -41,8 +34,21 @@ pub fn specs() -> Vec<CommandSpec> {
             false,
             open_recent
         ),
-        spec!("file.save", "Save", "{path?} (programmatic saves need a path the first time)", false, save),
+        spec!(
+            "file.save",
+            "Save",
+            "{path? (save on this computer at that path)} → {path, bytes} (on this computer) | {saved: true, where: \"server\", server, serverName, file, pending (batches the server hasn't confirmed yet), synced (pending is 0)} (a file on a server: its edits go there as they are made, what is left is sent now) | {saved: true, where: \"server\", server, serverName, publishing: true, status} (an untitled file with a default server: it goes to that server's root). A file with a path on this computer and not on a server saves to its path; programmatic saves of an untitled file need a path when no default server is set",
+            false,
+            save
+        ),
         spec!("file.saveAs", "Save as", "{path}", false, save_as),
+        spec!(
+            "file.saveLocally",
+            "Save locally",
+            "{path} → {path, bytes}: a copy of the file on this computer (what Save as does; a file on a server stays there)",
+            false,
+            save_as
+        ),
         spec!(
             "file.export",
             "Export",
@@ -813,6 +819,10 @@ fn save_to(s: &mut Session, path: String) -> Result<Value> {
 fn save(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(path) = string(p, "path") {
         return save_to(s, path);
+    }
+    // On a server (or untitled, with a default server): saved there.
+    if let Some(v) = crate::team::save_to_server(s)? {
+        return Ok(v);
     }
     match s.docs.get(crate::branches::file_tab(s)).ok_or(EngineError::NoDocument)?.path.clone() {
         Some(path) => save_to(s, path),

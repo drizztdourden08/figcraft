@@ -691,6 +691,9 @@ pub struct Live {
     pub spotlight: Option<u32>,
     /// You spotlight: everyone follows you.
     pub spotlighting: bool,
+    /// The folder on the server the file goes into once it is published there
+    /// (`account.newFile {folder}`).
+    pub folder: Option<String>,
 }
 
 impl Live {
@@ -1153,6 +1156,7 @@ impl Session {
                 }
                 let server = live.server.clone();
                 live.published = Some(p.clone());
+                let folder = live.folder.take();
                 // A sealed file's key, so you can open it again (its links carry it).
                 self.keep_file_key(&server, &p.file, &p.edit);
                 self.online_published(&server, &p);
@@ -1165,6 +1169,10 @@ impl Session {
                 // And its preview goes to the server.
                 if let Some(s) = crate::accounts::server_of(&p.edit) {
                     self.thumbs_after_publish(&s, &p.file);
+                }
+                // A new file made in a folder goes there.
+                if let Some(folder) = folder {
+                    self.team_after_publish(&server, &p.file, &folder);
                 }
             }
             Event::Shared(Ok(links)) => {
@@ -1775,7 +1783,13 @@ fn publish(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// Start publishing the open file to `server` for command `cmd` (`share`: with links and join
 /// codes for others too): the new session.
-fn start_publish(s: &mut Session, cmd: &str, server: &str, p: &Value, share: bool) -> Result<SessionId> {
+pub(crate) fn start_publish(s: &mut Session, cmd: &str, server: &str, p: &Value, share: bool) -> Result<SessionId> {
+    publish_with(s, cmd, server, p, share, true)
+}
+
+/// [`start_publish`]; `register`: register this device with the server first (false: the caller
+/// did, before anything it can't make twice).
+pub(crate) fn publish_with(s: &mut Session, cmd: &str, server: &str, p: &Value, share: bool, register: bool) -> Result<SessionId> {
     let key = string(p, "key").map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     let (doc, uid) = s.ds().map(|ds| (ds.doc.clone(), ds.uid))?;
     let name = string(p, "name").map(|n| n.trim().chars().filter(|c| !c.is_control()).take(256).collect::<String>()).filter(|n| !n.is_empty());
@@ -1789,11 +1803,14 @@ fn start_publish(s: &mut Session, cmd: &str, server: &str, p: &Value, share: boo
     s.share_sign_ins();
     // Signed in, perhaps sealed: this device registered there first, so the new file's first
     // session can sign its batches (`docs/accounts-and-e2e.md` › *Editor signatures*).
-    if session.is_some()
-        && sealed != Some(false)
-        && let Err(e) = s.device_id(cmd, server)
-    {
-        log::info!("devices: not registered with {server} before publishing: {e}");
+    if register && session.is_some() && sealed != Some(false) {
+        match s.device_id(cmd, server) {
+            // Run in the background (the browser app): the command runs again with the answer,
+            // before anything is published, so a file goes up once.
+            Err(EngineError::Waiting) => return Err(EngineError::Waiting),
+            Err(e) => log::info!("devices: not registered with {server} before publishing: {e}"),
+            Ok(_) => {}
+        }
     }
     let opts =
         PublishOptions { server: server.trim().to_string(), key, name: name.unwrap_or_else(|| doc.name.clone()), me, doc, share, session, sealed };

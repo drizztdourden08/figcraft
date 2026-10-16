@@ -839,3 +839,16 @@ members and keyrings and builds the providers from its config.
     numbers and key-change warnings.
 12. **Built**: basic accounts (usernames and passwords), the server's name, folders, recent files
     and previews (server, protocol and engine; the app's screens next).
+13. **Built** (server, protocol and engine; the app's screens next): team access. `[auth]
+    file_access = "everyone"` (the default: everyone allowed on the server is in every file as an
+    editor, the creator owns it, per-file invites are refused; sealed files' keys go to everyone's
+    devices, any editor rotates, removing a person rotates every sealed file) or `"members"` (the
+    per-file model above). Admins add people from the app (`Admin::AllowEmail`, `DisallowEmail`,
+    `Allowed`, kept in `accounts/allowed.json` and merged with the settings' lists) and make admins
+    (`Admin::SetAdmin`). Names come from `name`, else `given_name` + `family_name`, else
+    `preferred_username`; the provider's `picture` is fetched by the server (https, PNG/JPEG, 256 KiB,
+    at most daily) into `avatars/` and served (`AccountReq::Avatar`); `AccountReq::Team` lists
+    everyone with how files are shared. In the engine: `account.people`, `account.avatar`,
+    `account.newFile`, `admin.allowEmail`/`disallowEmail`/`allowed`/`setAdmin`,
+    `servers.setDefault`/`setStartHome`, `file.new` on the default server, `file.save` to the
+    server, `file.saveLocally`. See [`server-accounts.md`](server-accounts.md#team-access).

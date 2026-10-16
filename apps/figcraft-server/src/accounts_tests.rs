@@ -16,7 +16,8 @@ use crate::Running;
 use crate::config::Config;
 use crate::test_util::{Raw, TempDir, config, key};
 
-/// Tokens are `subject|email|name`; `bad` is refused.
+/// Tokens are `subject|email|name`, then `|picture` (its address) when they have one; `bad` is
+/// refused.
 struct Fake;
 
 impl IdentityProvider for Fake {
@@ -27,7 +28,15 @@ impl IdentityProvider for Fake {
     fn verify_token(&self, token: &str) -> Result<Identity, AuthError> {
         let mut p = token.split('|');
         let (Some(sub), Some(email), Some(name)) = (p.next(), p.next(), p.next()) else { return Err(AuthError::Refused("bad token".into())) };
-        Ok(Identity { provider: "fake".into(), subject: sub.into(), email: Some(email.into()), email_verified: true, name: Some(name.into()) })
+        let picture = p.next().map(String::from);
+        Ok(Identity {
+            provider: "fake".into(),
+            subject: sub.into(),
+            email: Some(email.into()),
+            email_verified: true,
+            name: Some(name.into()),
+            picture,
+        })
     }
 }
 
@@ -37,7 +46,16 @@ pub(crate) fn registry() -> Registry {
     r
 }
 
+/// A server with accounts whose files have their own members (`file_access = "members"`: what the
+/// tests of per-file members go by; [`team_config`] is the default, everyone in every file).
 pub(crate) fn accounts_config(dir: &std::path::Path, mode: &str) -> Config {
+    let mut c = team_config(dir, mode);
+    c.auth.file_access = "members".into();
+    c
+}
+
+/// A server with accounts as it comes: everyone on it is in every file.
+pub(crate) fn team_config(dir: &std::path::Path, mode: &str) -> Config {
     Config {
         auth: AuthConfig {
             mode: mode.into(),
@@ -417,7 +435,14 @@ impl IdentityProvider for Pages {
     }
 
     fn exchange_code(&self, code: &str, _verifier: &str, _redirect_uri: &str) -> Result<Identity, AuthError> {
-        Ok(Identity { provider: "pages".into(), subject: code.into(), email: Some(format!("{code}@example.com")), email_verified: true, name: None })
+        Ok(Identity {
+            provider: "pages".into(),
+            subject: code.into(),
+            email: Some(format!("{code}@example.com")),
+            email_verified: true,
+            name: None,
+            picture: None,
+        })
     }
 }
 

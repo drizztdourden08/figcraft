@@ -3,7 +3,8 @@
 //! (`accounts/sessions.json`, tokens kept only as hashes), and their devices and recovery copies
 //! for sealed files (`accounts/devices.json`, `accounts/recovery.json`; see `devices`), and the
 //! usernames and passwords of basic accounts (`accounts/passwords.json`, see
-//! [`crate::passwords`]). This is the server's [`Gate`]: sign-in
+//! [`crate::passwords`]), the emails and admins admins added from the app (`accounts/allowed.json`)
+//! and people's pictures (`avatars/`, see [`team`]). This is the server's [`Gate`]: sign-in
 //! steps run in the connection's own thread, so a slow provider holds up only that connection.
 //!
 //! The store looks people up here too (who an invited email belongs to); everything sits behind
@@ -16,8 +17,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use figcraft_auth::config::PASSWORD_KIND;
 use figcraft_auth::registry::Registry;
 use figcraft_auth::{
-    AuthConfig, AuthError, AuthMode, DeviceCode, E2eMode, Fetch, Flow, Gate, Identity, IdentityProvider, Me, Origin, Person, Policy, ProviderConfig,
-    ServerAbout, ServerInfo, SignIn, SignInReply,
+    AuthConfig, AuthError, AuthMode, DeviceCode, E2eMode, Fetch, FileAccess, Flow, Gate, Identity, IdentityProvider, Me, Origin, Person, Policy,
+    ProviderConfig, ServerAbout, ServerInfo, SignIn, SignInReply,
 };
 use figcraft_collab::message::UserInfo;
 use figcraft_collab_net::token;
@@ -54,6 +55,16 @@ pub struct Account {
     pub created: u64,
     #[serde(default)]
     pub seen: u64,
+    /// Where their provider says their picture is (kept as a small copy in `avatars/`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    /// When the picture was last fetched (seconds since 1970; 0: never).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub avatar_at: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// A session (`sessions.json`).
@@ -85,6 +96,9 @@ struct State {
 #[path = "devices.rs"]
 pub mod devices;
 
+#[path = "team.rs"]
+pub mod team;
+
 /// The accounts side of a server.
 pub struct Accounts {
     mode: AuthMode,
@@ -101,6 +115,15 @@ pub struct Accounts {
     passwords: Option<(String, Arc<Passwords>)>,
     /// Holds back password guessing.
     guard: Mutex<Guard>,
+    /// Who sees which files (`[auth] file_access`).
+    file_access: FileAccess,
+    /// The emails and admins admins added from the app (`allowed.json`). Taken after `state`
+    /// when both are needed, never the other way round.
+    allowed: Mutex<team::Allowed>,
+    /// Where people's pictures are fetched from (none offline).
+    fetch: Option<Arc<dyn Fetch>>,
+    /// People's pictures (`<data>/avatars`).
+    avatars: PathBuf,
 }
 
 /// Why a password sent in the clear is refused.
@@ -142,7 +165,9 @@ impl Accounts {
     pub fn open(data: &Path, cfg: &AuthConfig, e2e: E2eMode, registry: &Registry, fetch: Arc<dyn Fetch>) -> Result<Accounts, String> {
         cfg.check()?;
         let built = build_providers(&data.join(DIR), cfg, |p| registry.build(p, fetch.clone()).map(Some))?;
-        Self::with_providers(data, cfg, e2e, built)
+        let mut a = Self::with_providers(data, cfg, e2e, built)?;
+        a.fetch = Some(fetch);
+        Ok(a)
     }
 
     /// Who has signed in on a stopped server's data directory, for the command line: the
@@ -161,7 +186,12 @@ impl Accounts {
         let sessions: Vec<Session> = read(&dir.join(SESSIONS))?;
         let devices: Vec<devices::DeviceRec> = read(&dir.join(devices::DEVICES))?;
         let recovery: Vec<devices::RecoveryRec> = read(&dir.join(devices::RECOVERY))?;
+        let allowed: team::Allowed = read(&dir.join(team::ALLOWED))?;
         Ok(Accounts {
+            file_access: cfg.file_access()?,
+            allowed: Mutex::new(allowed),
+            fetch: None,
+            avatars: data.join(team::AVATARS),
             mode: cfg.mode()?,
             e2e,
             policy: cfg.policy(),
@@ -194,6 +224,10 @@ impl Accounts {
             name: String::new(),
             passwords: None,
             guard: Mutex::new(Guard::default()),
+            file_access: FileAccess::Members,
+            allowed: Mutex::new(team::Allowed::default()),
+            fetch: None,
+            avatars: data.join(team::AVATARS),
         }
     }
 
@@ -203,6 +237,11 @@ impl Accounts {
 
     pub fn e2e(&self) -> E2eMode {
         self.e2e
+    }
+
+    /// Who sees which files (meaningful on a server with accounts).
+    pub fn file_access(&self) -> FileAccess {
+        self.file_access
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -249,13 +288,16 @@ impl Accounts {
     /// Someone a provider vouched for: allowed by the policy? Then their account (made the first
     /// time) and a new session.
     fn signed_in(&self, who: Identity) -> (SignInReply, Option<Person>) {
-        if let Err(reason) = self.policy.admit(&who) {
+        let known = self.state().people.iter().find(|a| a.provider == who.provider && a.subject == who.subject).map(|a| a.id.clone());
+        if let Err(reason) = self.admit(&who, known.as_deref()) {
             log::info!("event=sign_in_refused provider={} reason=policy", who.provider);
             return (SignInReply::Refused { reason }, None);
         }
         match self.start_session(&who) {
             Ok((me, person)) => {
                 log::info!("event=signed_in provider={} account={}", who.provider, person.account);
+                // Their picture, fetched now and then (the sign-in doesn't wait for more).
+                self.refresh_avatar(&person.account, who.picture.as_deref());
                 (SignInReply::SignedIn(me), Some(person))
             }
             Err(reason) => (SignInReply::Refused { reason }, None),
@@ -284,6 +326,8 @@ impl Accounts {
                     name: String::new(),
                     created: t,
                     seen: t,
+                    picture: None,
+                    avatar_at: 0,
                 });
                 s.people.len() - 1
             }
@@ -336,8 +380,9 @@ impl Accounts {
             email: account.email.clone(),
             email_verified: account.email.is_some(),
             name: Some(account.name.clone()),
+            picture: None,
         };
-        self.policy.admit(&who)?;
+        self.admit(&who, Some(&account.id))?;
         let expires = t.saturating_add(self.session_secs);
         if let Some(x) = s.sessions.get_mut(i)
             && expires.saturating_sub(x.expires) >= TOUCH
@@ -381,13 +426,17 @@ impl Accounts {
             self.save_sessions(&s)?;
         }
         self.forget_devices(&mut s, account)?;
+        drop(s);
+        self.forget_avatar(account);
+        self.forget_admin(account)?;
         log::info!("event=person_removed account={account}");
         Ok(Some(gone))
     }
 
-    /// Is this person an admin (their verified email is in `admins`)?
+    /// Is this person an admin (their verified email is in `admins` or was made one from the app,
+    /// or their account was)?
     pub fn is_admin(&self, a: &Account) -> bool {
-        a.email.as_ref().is_some_and(|e| self.policy.admins.contains(e))
+        a.email.as_ref().is_some_and(|e| self.policy.admins.contains(e)) || self.allowed().is_admin(a)
     }
 
     /// Everyone who has signed in, each with their sessions not expired.
@@ -467,7 +516,7 @@ impl Accounts {
             Err(reason) => return refuse(&reason),
         };
         // An email typed here isn't verified: on a server that lets in only some, an admin adds people.
-        if !self.policy.open() {
+        if !self.policy().open() {
             return refuse("this server lets in only some email addresses: ask an admin for an account");
         }
         if let Err(why) = self.guard().try_signup(from.ip, std::time::Instant::now()) {

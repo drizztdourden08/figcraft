@@ -12,7 +12,12 @@ pub struct Identity {
     pub email: Option<String>,
     /// The provider checked the email belongs to them (allow-lists use only verified emails).
     pub email_verified: bool,
+    /// What people are called (OpenID Connect's `name`, else `given_name` and `family_name`,
+    /// else `preferred_username`); apps show it, never the email.
     pub name: Option<String>,
+    /// The address of their picture (OpenID Connect's `picture`): the server fetches and keeps a
+    /// small copy (`docs/server-accounts.md` › *Names and pictures*).
+    pub picture: Option<String>,
 }
 
 /// Why a sign-in didn't work.
@@ -102,6 +107,12 @@ pub trait IdentityProvider: Send + Sync {
 /// Answers are the response body of a 2xx; anything else is an error carrying the status and body.
 pub trait Fetch: Send + Sync {
     fn get(&self, url: &str) -> Result<Vec<u8>, FetchError>;
+    /// An image (someone's picture), at most `max` bytes (a larger answer is an error). Default:
+    /// [`get`](Self::get), then the size checked.
+    fn get_image(&self, url: &str, max: usize) -> Result<Vec<u8>, FetchError> {
+        let body = self.get(url)?;
+        if body.len() > max { Err(FetchError::Network(format!("the picture is larger than {max} bytes"))) } else { Ok(body) }
+    }
     fn post_form(&self, url: &str, form: &[(&str, &str)]) -> Result<Vec<u8>, FetchError>;
     fn post_json(&self, url: &str, body: &[u8]) -> Result<Vec<u8>, FetchError>;
 }

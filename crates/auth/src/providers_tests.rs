@@ -169,7 +169,8 @@ fn oidc_signs_in_with_a_code_and_checks_the_token() {
                 subject: "u-1".into(),
                 email: Some("ann@example.com".into()),
                 email_verified: true,
-                name: Some("Ann".into())
+                name: Some("Ann".into()),
+                picture: None
             }
         );
         let sent = fake.sent.lock().unwrap().join(" ");
@@ -367,7 +368,7 @@ fn registry_takes_kinds_of_your_own() {
             ProviderInfo { id: "mine".into(), label: "Mine".into(), flows: vec![Flow::Token { label: "Mine".into() }] }
         }
         fn verify_token(&self, token: &str) -> Result<Identity, AuthError> {
-            Ok(Identity { provider: "mine".into(), subject: token.into(), email: None, email_verified: false, name: None })
+            Ok(Identity { provider: "mine".into(), subject: token.into(), email: None, email_verified: false, name: None, picture: None })
         }
     }
     let fake = Arc::new(Fake::default());
@@ -552,4 +553,19 @@ fn oidc_web_settings_are_checked() {
     assert!(p.web_redirect("http://localhost:8767/"));
     assert!(crate::oidc::valid_web_redirect("https://figcraft.example.com/signin"));
     assert!(!crate::oidc::valid_web_redirect("https://exa mple.com/"));
+}
+
+/// People are called by their name, else their given and family names, else their username;
+/// never by their email. Their picture's address comes along.
+#[test]
+fn names_fall_back_to_given_and_family_names_then_the_username() {
+    let id = |c: Value| crate::oidc::identity("p", &c, false);
+    let who = id(json!({"sub": "1", "email": "a@x.test", "name": " Ann Lee ", "given_name": "Ann", "picture": "https://x.test/a.png"}));
+    assert_eq!((who.name.as_deref(), who.picture.as_deref()), (Some("Ann Lee"), Some("https://x.test/a.png")));
+    assert_eq!(id(json!({"sub": "1", "given_name": "Bo", "family_name": "Ray"})).name.as_deref(), Some("Bo Ray"));
+    assert_eq!(id(json!({"sub": "1", "family_name": "Ray"})).name.as_deref(), Some("Ray"));
+    assert_eq!(id(json!({"sub": "1", "email": "c@x.test", "preferred_username": "cy"})).name.as_deref(), Some("cy"));
+    assert_eq!(id(json!({"sub": "1", "email": "c@x.test"})).name, None, "the email isn't a name: the server and apps fall back to it");
+    let long = format!("https://x.test/{}", "a".repeat(3000));
+    assert_eq!(id(json!({"sub": "1", "picture": long})).picture, None, "an address that long isn't kept");
 }

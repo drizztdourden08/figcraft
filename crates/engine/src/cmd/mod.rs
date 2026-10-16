@@ -108,6 +108,7 @@ fn registry() -> &'static Registry {
         list.extend(crate::accounts::specs());
         list.extend(crate::devices::specs());
         list.extend(crate::server_files::specs());
+        list.extend(crate::team::specs());
         list.extend(crate::servers::specs());
         list.extend(crate::admin::specs());
         list.extend(crate::invite_links::specs());
