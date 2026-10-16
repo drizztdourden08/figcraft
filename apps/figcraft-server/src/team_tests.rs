@@ -401,6 +401,26 @@ fn new_files_on_the_server_and_saving_there() {
     // Forgetting the default: new files stay here.
     ex(&mut ann, "servers.setDefault", json!({"server": null}));
     assert!(ex(&mut ann, "file.new", json!({}))["server"].is_null());
-    drop(ann);
+
+    // Run in the background (as the browser app runs it): one new tab, one file, whatever runs
+    // again when the server's answers arrive.
+    let mut bo = session("Bo");
+    ex(&mut bo, "account.signIn", json!({"server": url, "token": "u2|bo@example.com|Bo"}));
+    let tabs = bo.docs.len();
+    let first = bo.start_background("account.newFile", json!({"server": url, "name": "Sketch"})).unwrap();
+    assert!(first.is_none(), "it waits for the server: {first:?}");
+    assert_eq!(bo.docs.len(), tabs, "nothing made before the answers");
+    pump(&mut [&mut bo], "the background new file", |s| !s[0].waiting_for("account.newFile"));
+    let (cmd, r) = bo.take_background_done().unwrap();
+    assert_eq!(cmd, "account.newFile");
+    let r = r.unwrap();
+    assert_eq!(r["server"], url.as_str());
+    assert_eq!(bo.docs.len(), tabs + 1);
+    // A background run leaves the tab in front as it was: the UI brings `index` forward.
+    bo.active = r["index"].as_u64().unwrap() as usize;
+    pump(&mut [&mut bo], "Bo's file on the server", |s| live(s[0]) && s[0].live().published.is_some());
+    let browse = ex(&mut bo, "account.browse", json!({"server": url}));
+    assert_eq!(browse["files"].as_array().unwrap().iter().filter(|f| f["name"] == "Sketch").count(), 1, "{browse}");
+    drop((ann, bo));
     server.stop();
 }

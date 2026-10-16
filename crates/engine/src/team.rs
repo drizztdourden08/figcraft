@@ -110,7 +110,7 @@ pub(crate) fn new_on_server(s: &mut Session, cmd: &str, server: &str, p: &Value)
     if let Some(b) = sealed {
         opts["sealed"] = json!(b);
     }
-    let id = crate::live::start_publish(s, cmd, server, &opts, false)?;
+    let id = crate::live::publish_with(s, cmd, server, &opts, false, false)?;
     if let Some(live) = s.live_mut().filter(|l| l.id == id) {
         live.folder = folder.clone();
     }

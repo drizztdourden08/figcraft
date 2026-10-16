@@ -435,7 +435,14 @@ impl IdentityProvider for Pages {
     }
 
     fn exchange_code(&self, code: &str, _verifier: &str, _redirect_uri: &str) -> Result<Identity, AuthError> {
-        Ok(Identity { provider: "pages".into(), subject: code.into(), email: Some(format!("{code}@example.com")), email_verified: true, name: None })
+        Ok(Identity {
+            provider: "pages".into(),
+            subject: code.into(),
+            email: Some(format!("{code}@example.com")),
+            email_verified: true,
+            name: None,
+            picture: None,
+        })
     }
 }
 

@@ -339,7 +339,7 @@ impl Accounts {
                 email: if admin { a.email.clone() } else { None },
             })
             .collect();
-        out.sort_by(|x, y| x.name.to_lowercase().cmp(&y.name.to_lowercase()));
+        out.sort_by_key(|x| x.name.to_lowercase());
         out
     }
 
