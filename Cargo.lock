@@ -1430,6 +1430,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "figcraft-auth"
+version = "0.6.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "toml",
+]
+
+[[package]]
 name = "figcraft-cli"
 version = "0.6.0"
 dependencies = [
@@ -1448,6 +1458,7 @@ name = "figcraft-collab"
 version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
+ "figcraft-auth",
  "figcraft-color",
  "figcraft-doc",
  "figcraft-geom",
@@ -1463,6 +1474,7 @@ name = "figcraft-collab-net"
 version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
+ "figcraft-auth",
  "figcraft-collab",
  "figcraft-doc",
  "figcraft-engine",
@@ -1640,6 +1652,7 @@ dependencies = [
  "crc32fast",
  "ctrlc",
  "env_logger",
+ "figcraft-auth",
  "figcraft-collab",
  "figcraft-collab-net",
  "figcraft-doc",

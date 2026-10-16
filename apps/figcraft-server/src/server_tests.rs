@@ -269,3 +269,41 @@ fn fuzzed_frames_dont_hurt_the_server() {
     assert!(same(a.doc().unwrap(), b.doc().unwrap()));
     server.stop();
 }
+
+#[test]
+fn info_says_links_only_by_default_and_hello_still_follows() {
+    let dir = TempDir::new("info");
+    let mut server = crate::start(&config(dir.path())).unwrap();
+    let addr = server.addr();
+    let endpoint = Endpoint::parse(&format!("ws://{addr}/")).unwrap().0;
+    let info = manage::info(&endpoint, &NetLimits::default(), Duration::from_secs(10)).unwrap();
+    assert_eq!(info, figcraft_auth::ServerInfo::default());
+    assert_eq!(info.auth, figcraft_auth::AuthMode::Links);
+    assert_eq!(info.e2e, figcraft_auth::E2eMode::Off);
+    // Asking first doesn't change what follows: a hello on the same connection is answered as ever.
+    let mut a = session("Ada");
+    let p = publish(&mut a, dir.path(), addr);
+    let invite = Invite::parse(&p.edit).unwrap();
+    let mut raw = Raw::connect(addr);
+    raw.send(&ClientMsg::Info);
+    assert!(matches!(raw.next(), ServerMsg::Info(i) if *i == figcraft_auth::ServerInfo::default()));
+    raw.send(&ClientMsg::Hello(message::Hello {
+        protocol: message::PROTOCOL,
+        file: invite.file.clone(),
+        token: invite.token.clone(),
+        name: "Raw".into(),
+        color: String::new(),
+        client_version: message::client_version(),
+        resume: None,
+    }));
+    assert!(matches!(raw.next(), ServerMsg::Welcome { .. }));
+    // Too many steps before hello end the connection.
+    let mut chatty = Raw::connect(addr);
+    for _ in 0..16 {
+        chatty.send(&ClientMsg::Info);
+        assert!(matches!(chatty.next(), ServerMsg::Info(_)));
+    }
+    chatty.send(&ClientMsg::Info);
+    assert!(matches!(chatty.next(), ServerMsg::Refused { .. }));
+    server.stop();
+}

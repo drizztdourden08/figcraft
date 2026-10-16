@@ -1,0 +1,17 @@
+[package]
+name = "figcraft-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FigCraft accounts: who may join a figcraft-server, the identity providers that say who someone is (OpenID Connect, an external verifier, or your own), sign-in messages and the server's sign-in settings (no networking)"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+toml = "1"

@@ -5,6 +5,8 @@ use figcraft_doc::NodeId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use figcraft_auth::ServerInfo;
+
 use crate::Error;
 use crate::change::Change;
 
@@ -626,6 +628,9 @@ pub enum ClientMsg {
     },
     /// Ask which file a join code opens (the first message on a connection, instead of `Hello`).
     Resolve(Resolve),
+    /// Ask what the server accepts (before a connection's first message; answered with
+    /// [`ServerMsg::Info`]). Servers from before accounts refuse it: they take links only.
+    Info,
 }
 
 /// Server → client.
@@ -694,6 +699,9 @@ pub enum ServerMsg {
         file: String,
         token: String,
     },
+    /// The answer to [`ClientMsg::Info`]: who may get in and how to sign in, and whether files
+    /// are sealed.
+    Info(Box<ServerInfo>),
 }
 
 /// `YYYY-MM-DD HH:MM UTC` for seconds since 1970 (how servers and apps show the times in these

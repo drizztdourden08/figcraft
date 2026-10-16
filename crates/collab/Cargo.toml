@@ -10,6 +10,8 @@ workspace = true
 
 [dependencies]
 figcraft-doc = { workspace = true }
+# Sign-in messages ride in the session protocol (data only).
+figcraft-auth = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

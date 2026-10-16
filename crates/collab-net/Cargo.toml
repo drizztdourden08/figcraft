@@ -12,6 +12,8 @@ workspace = true
 figcraft-engine = { workspace = true }
 figcraft-collab = { workspace = true }
 figcraft-doc = { workspace = true }
+# Who may get in (sign-in before a connection's first message).
+figcraft-auth = { workspace = true }
 log = { workspace = true }
 # `std::time::Instant` natively, the browser's clock in the web build.
 web-time = "1"
