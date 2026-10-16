@@ -5,18 +5,16 @@ use hpke::aead::ChaCha20Poly1305;
 use hpke::kdf::HkdfSha256;
 use hpke::kem::X25519HkdfSha256;
 use hpke::{Deserializable, Kem, OpModeR, OpModeS, Serializable};
-use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::keys::{FILE_KEY_LEN, FileKey};
 use crate::{SealError, random};
+pub use figcraft_collab::sealed::{DevicePublic, Wrapped};
 
 /// HPKE `info`: what the shared secret is for (and the format's version).
 const WRAP_INFO: &[u8] = b"figcraft file key v1";
 /// Bytes of [`DeviceKeys::to_secret_bytes`].
 const SECRET_LEN: usize = 64;
-/// An X25519 public key, an Ed25519 public key.
-const KEY_LEN: usize = 32;
 /// The wrapped file key's ciphertext: the key and its ChaCha20-Poly1305 tag.
 const WRAPPED_CT_LEN: usize = FILE_KEY_LEN + 16;
 
@@ -33,48 +31,6 @@ pub struct DeviceKeys {
 impl std::fmt::Debug for DeviceKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeviceKeys").field("public", &self.public().ok()).finish_non_exhaustive()
-    }
-}
-
-/// A device's public keys, registered with the server under its owner's identity.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct DevicePublic {
-    /// X25519 public key: file keys are wrapped to it.
-    #[serde(with = "crate::bin")]
-    pub agreement: [u8; 32],
-    /// Ed25519 public key: checks the device's signatures.
-    #[serde(with = "crate::bin")]
-    pub signing: [u8; 32],
-}
-
-/// A file key wrapped to one device: RFC 9180 HPKE base mode, DHKEM(X25519, HKDF-SHA256),
-/// HKDF-SHA256, ChaCha20-Poly1305, `info` = `"figcraft file key v1"`, associated data = the file
-/// id; the plaintext is [`FileKey::to_bytes`] (68 bytes, so the ciphertext is 84).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Wrapped {
-    /// The encapsulated (ephemeral X25519 public) key.
-    #[serde(with = "crate::bin")]
-    pub enc: [u8; 32],
-    #[serde(with = "crate::bin")]
-    pub ciphertext: Vec<u8>,
-}
-
-impl Wrapped {
-    /// `enc (32) ‖ ciphertext (84)`.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(KEY_LEN + self.ciphertext.len());
-        out.extend_from_slice(&self.enc);
-        out.extend_from_slice(&self.ciphertext);
-        out
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Wrapped, SealError> {
-        if bytes.len() != KEY_LEN + WRAPPED_CT_LEN {
-            return Err(SealError::Malformed("wrapped key"));
-        }
-        let enc: [u8; 32] = bytes.get(..KEY_LEN).and_then(|b| b.try_into().ok()).ok_or(SealError::Malformed("wrapped key"))?;
-        let ciphertext = bytes.get(KEY_LEN..).ok_or(SealError::Malformed("wrapped key"))?.to_vec();
-        Ok(Wrapped { enc, ciphertext })
     }
 }
 

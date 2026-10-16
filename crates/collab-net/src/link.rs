@@ -284,6 +284,15 @@ impl LiveLink for NetLink {
         }
     }
 
+    fn rekey(&mut self, session: SessionId, keys: &str) -> Result<(), String> {
+        let ring = figcraft_collab_seal::parse_ring_fragment(keys).map_err(|_| "those aren't keys of a sealed file".to_string())?;
+        match self.sessions.get(session) {
+            Some(Active::Guest(g)) => g.rekey(&ring),
+            Some(Active::Host(_)) => Err("a session hosted here isn't sealed".into()),
+            None => Err("this session is over".into()),
+        }
+    }
+
     fn remove(&mut self, session: SessionId, client: u32) -> Result<(), String> {
         match self.sessions.get(session) {
             Some(Active::Host(h)) if h.me().client_id == client => Err("you can't remove yourself: stop the session instead".into()),

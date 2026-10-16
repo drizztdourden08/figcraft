@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use figcraft_auth::E2eMode;
 use figcraft_collab::Replica;
 use figcraft_collab::message::{self, AccountReply, AccountReq, Admin, AdminReply, ClientMsg, HostInfo, Presence, ServerMsg};
-use figcraft_collab_seal::{FileKey, Slot, link_fragment, seal, seal_change};
+use figcraft_collab_seal::{FileKey, Slot, ring_fragment, seal, seal_change};
 use figcraft_doc::Document;
 use figcraft_engine::live::{Event, Published, Shared, Status};
 use tungstenite::protocol::frame::coding::CloseCode;
@@ -28,7 +28,7 @@ use tungstenite::protocol::{CloseFrame, Role as WsRole, WebSocket};
 use tungstenite::{Bytes, Message};
 
 use crate::inbox::Inbox;
-use crate::invite::{Endpoint, Invite};
+use crate::invite::{Endpoint, Invite, Keys};
 pub use crate::join::GuestConfig;
 use crate::join::{Next, Outcome, Resuming, Seen, Taken, after, closed, hello, outgoing, resolved, sign_in, take, unresolved};
 use crate::manage;
@@ -61,6 +61,8 @@ pub const NO_SEALED_FILES: &str = "this server doesn't keep end-to-end encrypted
 pub struct Guest {
     cmd: Sender<Cmd>,
     thread: Option<JoinHandle<()>>,
+    /// A sealed file's keys, shared with the connection ([`Guest::rekey`]).
+    keys: Keys,
 }
 
 enum Cmd {
@@ -77,6 +79,7 @@ enum Cmd {
 impl Guest {
     /// Start joining (returns at once; progress arrives in `inbox`).
     pub fn start(mut cfg: GuestConfig, inbox: Inbox) -> io::Result<Guest> {
+        let keys = cfg.invite.key.clone().unwrap_or_default();
         let (tx, rx) = channel();
         let me = tx.clone();
         let thread = std::thread::Builder::new().name("live-guest".into()).spawn(move || {
@@ -97,7 +100,7 @@ impl Guest {
             }
             supervise(&cfg, &inbox, &rx, &me);
         })?;
-        Ok(Guest { cmd: tx, thread: Some(thread) })
+        Ok(Guest { cmd: tx, thread: Some(thread), keys })
     }
 
     /// Upload `job.doc` to the server as a new file, then join it with its edit link (returns at
@@ -106,12 +109,19 @@ impl Guest {
     pub fn publish(job: Publish, cfg: GuestConfig, inbox: Inbox) -> io::Result<Guest> {
         let (tx, rx) = channel();
         let me = tx.clone();
+        let keys = Keys::default();
+        let shared_keys = keys.clone();
         let thread = std::thread::Builder::new().name("live-publish".into()).spawn(move || {
             inbox.push(Event::Status(Status::Connecting));
-            let (cfg, published, hosting) = match upload(&job, cfg) {
+            let (mut cfg, published, hosting) = match upload(&job, cfg) {
                 Ok(done) => done,
                 Err(e) => return inbox.push(Event::Status(Status::Failed { reason: format!("Couldn't publish to the server: {e}") })),
             };
+            // A sealed file's new key, in the handle the app rekeys the session through.
+            if let Some(k) = cfg.invite.key.take() {
+                shared_keys.add(&k.ring());
+                cfg.invite.key = Some(shared_keys);
+            }
             // Before anyone hears the file is there, so what others join with shows with it. The
             // file's first links stay its owner's (this app joins with one): others get their own,
             // which stopping takes away again.
@@ -145,7 +155,17 @@ impl Guest {
             }
             supervise(&cfg, &inbox, &rx, &me);
         })?;
-        Ok(Guest { cmd: tx, thread: Some(thread) })
+        Ok(Guest { cmd: tx, thread: Some(thread), keys })
+    }
+
+    /// Add epochs of a sealed file's key (from its keyring): what is sent from now on is sealed
+    /// with the newest. Fails for a session that isn't sealed.
+    pub fn rekey(&self, ring: &figcraft_collab_seal::Keyring) -> Result<(), String> {
+        if self.keys.ring().is_empty() {
+            return Err("this session's file isn't end-to-end encrypted".into());
+        }
+        self.keys.add(ring);
+        Ok(())
     }
 
     /// Your latest presence.
@@ -245,9 +265,9 @@ pub(crate) fn upload_file(
 }
 
 /// Links others join a sealed file with carry its key; a join code can't, so they have none.
-pub(crate) fn keyed(mut shared: Shared, key: Option<&FileKey>) -> Shared {
-    let Some(key) = key else { return shared };
-    let fragment = format!("#{}", link_fragment(key));
+pub(crate) fn keyed(mut shared: Shared, key: Option<&Keys>) -> Shared {
+    let Some(ring) = key.map(Keys::ring).filter(|r| !r.is_empty()) else { return shared };
+    let fragment = format!("#{}", ring_fragment(&ring));
     for l in std::iter::once(&mut shared.edit).chain(shared.view.as_mut()) {
         if !l.link.contains('#') {
             l.link.push_str(&fragment);
@@ -299,7 +319,7 @@ pub(crate) fn upload_sealed(
         let id = token::file_id()?;
         let snapshot = plain.iter().map(|c| seal_change(&file_key, &id, c)).collect::<Result<Vec<_>, _>>().map_err(sealing)?;
         let sealed_name = seal(&file_key, &id, &Slot::Meta { what: "name".into() }, name.as_bytes()).map_err(sealing)?;
-        let link = |token: String| Invite { server: server.clone(), file: id.clone(), token, key: Some(file_key.clone()) };
+        let link = |token: String| Invite { server: server.clone(), file: id.clone(), token, key: Some(Keys::from(file_key.clone())) };
         let refused = match (session, key) {
             // Signed in, without the server's key: as yours (a server with accounts).
             (Some(session), None) => {

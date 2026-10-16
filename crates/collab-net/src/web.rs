@@ -194,6 +194,19 @@ impl LiveLink for NetLink {
         }
     }
 
+    fn rekey(&mut self, session: SessionId, keys: &str) -> Result<(), String> {
+        let ring = figcraft_collab_seal::parse_ring_fragment(keys).map_err(|_| "those aren't keys of a sealed file".to_string())?;
+        let Some(id) = self.sessions.get(session).copied() else { return Err("this session is over".into()) };
+        let mut out = Err("this session's file isn't end-to-end encrypted".to_string());
+        with_driver(id, |d, _| {
+            if let Some(k) = d.keys() {
+                k.add(&ring);
+                out = Ok(());
+            }
+        });
+        out
+    }
+
     fn presence(&mut self, session: SessionId, p: &Presence) {
         self.with(session, |d, now| d.presence(p.clone(), now));
     }

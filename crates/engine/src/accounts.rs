@@ -97,7 +97,7 @@ pub fn server_of(link: &str) -> Option<String> {
 
 impl Session {
     /// The server a command means: its `server`, else the one in Preferences.
-    fn account_server(&self, cmd: &str, p: &Value) -> Result<String> {
+    pub(crate) fn account_server(&self, cmd: &str, p: &Value) -> Result<String> {
         let s = string(p, "server").unwrap_or_else(|| self.prefs.publish_server.clone());
         let s = if s.trim().is_empty() { crate::live::DEFAULT_SERVER.to_string() } else { s };
         if s.trim().is_empty() {
@@ -170,7 +170,7 @@ impl Session {
     }
 
     /// One request on your account at `server`.
-    fn account_request(&mut self, cmd: &str, server: &str, req: AccountReq) -> Result<AccountReply> {
+    pub(crate) fn account_request(&mut self, cmd: &str, server: &str, req: AccountReq) -> Result<AccountReply> {
         let Some(me) = self.signed_in(server) else {
             return Err(bad(cmd, "you aren't signed in to this server: `account.signIn` first"));
         };
@@ -407,6 +407,8 @@ fn invite(s: &mut Session, p: &Value) -> Result<Value> {
     let email = req_string(CMD, p, "email")?;
     let role = role(CMD, p)?;
     s.account_request(CMD, &server, AccountReq::Invite { file, email: email.clone(), role })?;
+    // A sealed file's key goes to their devices (`devices`).
+    s.keys_changed(&server);
     Ok(json!({"invited": email, "role": role.id()}))
 }
 
@@ -428,6 +430,8 @@ fn remove_member(s: &mut Session, p: &Value) -> Result<Value> {
         (None, None) => return Err(bad(CMD, "give `account` (a member) or `email` (an invite)")),
     };
     s.account_request(CMD, &server, req)?;
+    // A sealed file starts a new epoch of its key (`devices`).
+    s.keys_changed(&server);
     Ok(json!({"removed": true}))
 }
 

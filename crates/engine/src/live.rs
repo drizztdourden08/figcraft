@@ -556,6 +556,12 @@ pub trait LiveLink: Send {
     /// The servers you are signed in to and your session tokens there: joining a file on one of
     /// them signs in first (the engine tells the link before it joins or publishes).
     fn sign_ins(&mut self, _list: Vec<(String, String)>) {}
+    /// Add epochs of a sealed file's key to session `session`, which joined it: `keys` is a link
+    /// fragment (`k=…&k=…`, see `figcraft_collab_seal::ring_fragment`). What the session sends
+    /// from now on is sealed with the newest. Errors: no such sealed session, or keys that aren't.
+    fn rekey(&mut self, _session: SessionId, _keys: &str) -> std::result::Result<(), String> {
+        Err("this link can't change a session's keys".into())
+    }
     /// Send `req` and wait for the answer (through the methods above).
     fn request(&mut self, req: NetRequest) -> NetReply {
         match req {
@@ -985,6 +991,8 @@ impl Session {
     /// Take in what happened in every session (the UI calls it every frame; the network wakes the
     /// UI when something arrives). Returns whether anything changed.
     pub fn live_poll(&mut self) -> bool {
+        // Keys of sealed files, now and then (in the background).
+        self.keys_tick();
         let Some(link) = self.live.link.as_mut() else { return false };
         let events = link.poll();
         if events.is_empty() {
@@ -1095,6 +1103,12 @@ impl Session {
                 // A sealed file's key, so you can open it again (its links carry it).
                 self.keep_file_key(&server, &p.file, &p.edit);
                 self.online_published(&server, &p);
+                // Signed in: the key goes to your other devices through the server's keyring.
+                if sealed_link(&p.edit)
+                    && let Some(s) = crate::accounts::server_of(&p.edit)
+                {
+                    self.keys_after_publish(&s);
+                }
             }
             Event::Shared(Ok(links)) => {
                 let links = clean_shared(links);
@@ -1280,10 +1294,15 @@ impl Session {
     /// good or sync broke. Its tab shows why.
     fn live_fail(&mut self, id: SessionId, reason: String) {
         log::warn!("live session: {reason}");
+        // A sealed file's key moved on: the new one is fetched and the file joined again.
+        let moved = if reason == crate::devices::NEW_EPOCH { self.keys_target(id) } else { None };
         self.live.leave(id);
         if let Some(live) = self.live.sessions.get_mut(&id) {
             live.reset();
             live.status = Status::Failed { reason: reason.clone() };
+        }
+        if let Some(target) = moved {
+            self.keys_moved_on(id, target);
         }
         self.message = Some(reason);
     }
@@ -1597,6 +1616,8 @@ impl Session {
             "access": l.client.as_ref().map(Client::access).or(info.map(|i| i.access)),
             // End-to-end encrypted: the session's link carries the file's key.
             "sealed": info.is_some_and(|i| sealed_link(&i.link)) || l.published.as_ref().is_some_and(|p| sealed_link(&p.edit)),
+            // A sealed file whose key this device doesn't have yet (see `devices`).
+            "waitingForAccess": self.waiting_for_access(l.id),
             "readOnly": l.doc_uid.is_some_and(|u| self.live_read_only(u).is_some()),
             "published": l.published,
             "code": l.share.as_ref().and_then(Share::code),
@@ -1932,8 +1953,20 @@ pub(crate) fn start_join(
     let (name, tab) = (display_name(&s.prefs), s.tab());
     // Where you are signed in, joining signs in first.
     s.share_sign_ins();
-    // A sealed file of yours opens with the key kept for it (a member's link has none).
-    let link = s.link_with_key(link);
+    // A sealed file opens with the keys this device holds (a member's link has none): kept here,
+    // or wrapped to this device on a server with accounts. Without them yet, the join waits.
+    let link = match s.sealed_join(cmd, link)? {
+        crate::devices::JoinKeys::Link(l) => l,
+        crate::devices::JoinKeys::Waiting { server, file } => {
+            let (id, ()) = s.live.start(cmd, |_, _| Ok(()))?;
+            let reason = crate::devices::WAITING_FOR_ACCESS.to_string();
+            s.live.open(Live { id, status: Status::Failed { reason: reason.clone() }, tab, ..Live::default() });
+            let w = crate::devices::Waiting { session: id, after: None, server, file, link: link.to_string(), published, share };
+            s.wait_for_access(w);
+            s.message = Some(reason);
+            return Ok(id);
+        }
+    };
     let (id, ()) = s.live.start(cmd, |l, id| l.join_resuming(id, &link, &name, resume).map_err(|e| bad(cmd, e)))?;
     let server = share.as_ref().map(|s| s.server.clone()).unwrap_or_default();
     // The session's file opens in a tab of its own; until then the join shows on this one.

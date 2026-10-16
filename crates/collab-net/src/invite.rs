@@ -18,9 +18,61 @@
 //! A sealed (end-to-end encrypted) file's link carries its key after `#`: `…&token=…#k=<key>`
 //! (and a member's link on a server with accounts `…&file=…#k=<key>`). The fragment never leaves
 //! the app: it isn't in the WebSocket request ([`Invite::endpoint`]), in a hello or in any error,
-//! and `Debug` doesn't print the key ([`FileKey`]).
+//! and `Debug` doesn't print the key ([`FileKey`]). A file whose key changed epochs (someone was
+//! taken out of it) carries every epoch the app holds: `#k=<oldest>&…&k=<newest>` (the newest
+//! seals new writes; see [`Keys`]).
 
-use figcraft_collab_seal::{FileKey, link_fragment, parse_link_fragment};
+use std::sync::{Arc, PoisonError, RwLock};
+
+use figcraft_collab_seal::{FileKey, Keyring, MAX_LINK_EPOCHS, parse_ring_fragment, ring_fragment};
+
+/// A sealed file's keys for a session: every epoch the app holds. Shared by every copy of the
+/// invite it came with, so a newer epoch added while the session runs ([`Keys::add`]: the app
+/// learned it from the file's keyring) is what the next writes are sealed with. `Debug` prints the
+/// epochs only.
+#[derive(Clone, Default)]
+pub struct Keys(Arc<RwLock<Keyring>>);
+
+impl Keys {
+    pub fn new(ring: Keyring) -> Keys {
+        Keys(Arc::new(RwLock::new(ring)))
+    }
+
+    /// Every epoch held now.
+    pub fn ring(&self) -> Keyring {
+        self.0.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// The newest epoch's key: what new writes are sealed with.
+    pub fn current(&self) -> Option<FileKey> {
+        self.0.read().unwrap_or_else(PoisonError::into_inner).current().cloned()
+    }
+
+    /// Add the epochs of `ring` (for every copy of the invite).
+    pub fn add(&self, ring: &Keyring) {
+        self.0.write().unwrap_or_else(PoisonError::into_inner).merge(ring);
+    }
+}
+
+impl From<FileKey> for Keys {
+    fn from(key: FileKey) -> Keys {
+        Keys::new(Keyring::from(key))
+    }
+}
+
+impl PartialEq for Keys {
+    fn eq(&self, other: &Keys) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.ring() == other.ring()
+    }
+}
+
+impl Eq for Keys {}
+
+impl std::fmt::Debug for Keys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Keys({:?})", self.ring())
+    }
+}
 
 /// Where a session or a server listens: `ws://host:port/path` or `wss://…` (TLS).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,13 +93,15 @@ pub struct Invite {
     pub file: String,
     /// The link's secret.
     pub token: String,
-    /// A sealed file's key, from the link's `#k=…` (`None`: the file isn't sealed, or the link
+    /// A sealed file's keys, from the link's `#k=…` (`None`: the file isn't sealed, or the link
     /// doesn't say).
-    pub key: Option<FileKey>,
+    pub key: Option<Keys>,
 }
 
-/// Longest link accepted (anything longer isn't one of ours).
+/// Longest link accepted, before its fragment (anything longer isn't one of ours).
 const MAX_LINK: usize = 2048;
+/// Longest fragment: [`MAX_LINK_EPOCHS`] keys of 91 characters with their `&k=`.
+const MAX_FRAGMENT: usize = MAX_LINK_EPOCHS * 96;
 
 const NOT: &str = "that's not a live session invite: expected figcraft://join?host=…&file=…&token=… or ws://host:port/?file=…&token=…";
 
@@ -124,13 +178,13 @@ impl Invite {
 
     /// The same invite with a sealed file's key (its links end with `#k=…`).
     pub fn with_key(mut self, key: Option<FileKey>) -> Self {
-        self.key = key;
+        self.key = key.map(Keys::from);
         self
     }
 
-    /// `#k=…` for a sealed file, else nothing.
+    /// `#k=…` for a sealed file (every epoch held), else nothing.
     fn fragment(&self) -> String {
-        self.key.as_ref().map(|k| format!("#{}", link_fragment(k))).unwrap_or_default()
+        self.key.as_ref().map(|k| k.ring()).filter(|r| !r.is_empty()).map(|r| format!("#{}", ring_fragment(&r))).unwrap_or_default()
     }
 
     /// The `figcraft://join?…` link (without `&token=…` for a member's link: [`member`](Self::member);
@@ -178,14 +232,15 @@ impl Invite {
     /// (then the invite names only the server, until the server says what the code opens).
     pub fn parse_join(link: &str) -> Result<(Invite, Option<String>), String> {
         let link = clean(link);
-        if link.len() > MAX_LINK {
+        let (before, fragment) = link.split_once('#').unwrap_or((link, ""));
+        if before.len() > MAX_LINK || fragment.len() > MAX_FRAGMENT {
             return Err(NOT.into());
         }
-        // A sealed file's key, after `#` (other fragments are ignored).
+        // A sealed file's keys, after `#` (other fragments are ignored).
         let (link, key) = match link.split_once('#') {
             Some((link, fragment)) if fragment.split('&').any(|p| p.starts_with("k=")) => {
-                let key = parse_link_fragment(fragment).map_err(|_| "the invite link's key (after #k=) isn't one: copy the whole link again")?;
-                (link, Some(key))
+                let ring = parse_ring_fragment(fragment).map_err(|_| "the invite link's key (after #k=) isn't one: copy the whole link again")?;
+                (link, Some(Keys::new(ring)))
             }
             Some((link, _)) => (link, None),
             None => (link, None),

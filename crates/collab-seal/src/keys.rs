@@ -185,6 +185,18 @@ impl Keyring {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+
+    /// How many epochs it holds.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Add every epoch of `other` (an epoch already here keeps its key).
+    pub fn merge(&mut self, other: &Keyring) {
+        for (e, k) in &other.keys {
+            self.keys.entry(*e).or_insert_with(|| k.clone());
+        }
+    }
 }
 
 impl From<FileKey> for Keyring {
@@ -212,4 +224,32 @@ pub fn parse_link_fragment(fragment: &str) -> Result<FileKey, SealError> {
     }
     let bytes = Zeroizing::new(URL_SAFE_NO_PAD.decode(value).map_err(|_| SealError::Malformed("link key"))?);
     FileKey::from_bytes(&bytes)
+}
+
+/// Most epochs a link fragment carries ([`ring_fragment`], [`parse_ring_fragment`]).
+pub const MAX_LINK_EPOCHS: usize = 1024;
+
+/// A fragment carrying every epoch of `ring`, oldest first: `k=…&k=…` (each as in
+/// [`link_fragment`]; the newest is the one new writes are sealed with). A file that never changed
+/// epochs has one, the same text as [`link_fragment`]. At most [`MAX_LINK_EPOCHS`] (the newest).
+pub fn ring_fragment(ring: &Keyring) -> String {
+    let skip = ring.len().saturating_sub(MAX_LINK_EPOCHS);
+    ring.keys.values().skip(skip).map(link_fragment).collect::<Vec<_>>().join("&")
+}
+
+/// Every key in a link fragment (each `k=…` parameter; with or without the `#`; other parameters
+/// are ignored). Fails when there is none, more than [`MAX_LINK_EPOCHS`], or one isn't a key.
+pub fn parse_ring_fragment(fragment: &str) -> Result<Keyring, SealError> {
+    let fragment = fragment.strip_prefix('#').unwrap_or(fragment);
+    let mut ring = Keyring::new();
+    for (i, p) in fragment.split('&').filter(|p| p.starts_with("k=")).enumerate() {
+        if i >= MAX_LINK_EPOCHS {
+            return Err(SealError::Malformed("link key"));
+        }
+        ring.insert(parse_link_fragment(p)?);
+    }
+    if ring.is_empty() {
+        return Err(SealError::Malformed("link key"));
+    }
+    Ok(ring)
 }

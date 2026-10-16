@@ -8,10 +8,12 @@
 //! from a link without the key (a member's link on a server with accounts, `account.files`) and
 //! read its name in listings. A key is a password: it is kept on this computer only, never logged,
 //! never in a command's result other than the share links it is part of, and `Debug` leaves it out.
-//! (Keys kept per device on the server, so other devices and invited members get them, are step 9.)
+//! On a server with accounts the keys also travel to your other devices and to members through
+//! the file's keyring there ([`crate::devices`]); a file whose key changed epochs keeps every epoch
+//! here (`k=…&k=…`).
 
 use figcraft_collab::sealed::{Sealed, parse_sealed_name};
-use figcraft_collab_seal::{Keyring, Slot, open, parse_link_fragment, seal};
+use figcraft_collab_seal::{Slot, open, parse_ring_fragment, seal};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -33,7 +35,8 @@ pub struct KeptKey {
     pub server: String,
     /// The file's id there.
     pub file: String,
-    /// The link fragment that carries the key (`k=…`, without the `#`): a password.
+    /// The link fragment that carries the key (`k=…`, every epoch held: `k=…&k=…`; without the
+    /// `#`): a password.
     pub key: String,
 }
 
@@ -48,7 +51,7 @@ impl KeptKey {
     fn clean(self) -> Option<KeptKey> {
         let id = (1..=64).contains(&self.file.len()) && self.file.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
         let server = !self.server.is_empty() && self.server.len() <= 512 && !self.server.contains(char::is_control);
-        (id && server && parse_link_fragment(&self.key).is_ok()).then_some(self)
+        (id && server && parse_ring_fragment(&self.key).is_ok()).then_some(self)
     }
 }
 
@@ -65,10 +68,10 @@ pub(crate) fn read<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Vec<K
     Ok(out)
 }
 
-/// The key a link carries after `#` (`k=…`), if it has one.
+/// The keys a link carries after `#` (`k=…`, or `k=…&k=…` for every epoch), if it has some.
 pub fn link_key(link: &str) -> Option<&str> {
     let (_, fragment) = link.split_once('#')?;
-    fragment.split('&').find(|p| p.starts_with("k="))
+    fragment.split('&').any(|p| p.starts_with("k=")).then_some(fragment)
 }
 
 /// A sealed file's link (its key is in it).
@@ -77,7 +80,7 @@ pub fn sealed_link(link: &str) -> bool {
 }
 
 /// The file id a `figcraft://join?…` (or `ws://…?file=…`) link names.
-fn link_file(link: &str) -> Option<&str> {
+pub(crate) fn link_file(link: &str) -> Option<&str> {
     let query = link.split('#').next()?.split_once('?')?.1;
     query.split('&').find_map(|p| p.strip_prefix("file="))
 }
@@ -85,7 +88,7 @@ fn link_file(link: &str) -> Option<&str> {
 /// A sealed file's name as listings give it (`sealed:…`), opened with `key` (a link fragment).
 fn open_name(key: &str, file: &str, listed: &str) -> Option<String> {
     let sealed = parse_sealed_name(listed)?;
-    let ring = Keyring::from(parse_link_fragment(key).ok()?);
+    let ring = parse_ring_fragment(key).ok()?;
     let bytes = open(&ring, file, &Slot::Meta { what: "name".into() }, &sealed).ok()?;
     let name: String = String::from_utf8(bytes).ok()?.trim().chars().filter(|c| !c.is_control()).take(256).collect();
     Some(name)
@@ -143,7 +146,8 @@ impl Session {
     /// `name` sealed for `file` on `server` with the key kept for it (`None`: no key kept, the
     /// file isn't a sealed one of yours).
     pub(crate) fn seal_name(&self, server: &str, file: &str, name: &str) -> Option<std::result::Result<Sealed, String>> {
-        let key = parse_link_fragment(self.file_key(server, file)?).map_err(|e| e.to_string());
+        let ring = parse_ring_fragment(self.file_key(server, file)?).map_err(|e| e.to_string());
+        let key = ring.and_then(|r| r.current().cloned().ok_or_else(|| "no key".to_string()));
         Some(key.and_then(|k| seal(&k, file, &Slot::Meta { what: "name".into() }, name.as_bytes()).map_err(|e| e.to_string())))
     }
 

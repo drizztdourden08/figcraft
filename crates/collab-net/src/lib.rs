@@ -30,6 +30,8 @@ pub mod host;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod hub;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod keychain;
+#[cfg(not(target_arch = "wasm32"))]
 mod link;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod links;

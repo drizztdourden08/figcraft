@@ -133,7 +133,7 @@ fn sealed_links_carry_the_key_in_the_fragment_only() {
     // A join code with a key keeps the key for the file the code opens.
     let (coded, code) = Invite::parse_join(&format!("figcraft://join?server=ws://10.0.0.5:47900/&code=K7M2QX9TD#{fragment}")).unwrap();
     assert!(code.is_some());
-    assert_eq!(coded.key, Some(key));
+    assert_eq!(coded.key.map(|k| k.ring()), Some(figcraft_collab_seal::Keyring::from(key)));
 }
 
 proptest! {
@@ -157,4 +157,25 @@ proptest! {
         let sealed = i.with_key(figcraft_collab_seal::FileKey::generate().ok());
         prop_assert_eq!(Invite::parse(&sealed.link()), Ok(sealed));
     }
+}
+
+/// A file whose key changed epochs carries every epoch in its link; the newest seals, and keys
+/// added later reach every copy of the invite.
+#[test]
+fn links_carry_every_epoch_and_keys_are_shared() {
+    let first = figcraft_collab_seal::FileKey::generate().unwrap();
+    let second = first.rotate().unwrap();
+    let mut ring = figcraft_collab_seal::Keyring::from(first.clone());
+    ring.insert(second.clone());
+    let link = format!("{}#{}", invite().link(), figcraft_collab_seal::ring_fragment(&ring));
+    let i = Invite::parse(&link).unwrap();
+    let keys = i.key.clone().unwrap();
+    assert_eq!(keys.ring(), ring);
+    assert_eq!(keys.current(), Some(second.clone()));
+    assert_eq!(i.link(), link);
+    let copy = i.clone();
+    let third = second.rotate().unwrap();
+    keys.add(&figcraft_collab_seal::Keyring::from(third.clone()));
+    assert_eq!(copy.key.as_ref().unwrap().current(), Some(third), "every copy sees the new epoch");
+    assert!(!format!("{i:?}").contains(&figcraft_collab_seal::link_fragment(&first)[2..30]));
 }

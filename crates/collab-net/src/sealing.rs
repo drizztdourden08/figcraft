@@ -23,7 +23,8 @@
 use figcraft_collab::Change;
 use figcraft_collab::message::{AcceptedOf, CatchUpOf, ClientMsg, ServerMsg, Signal};
 use figcraft_collab::sealed::SealedChange;
-use figcraft_collab_seal::{FileKey, Keyring, open_change, open_presence, open_signal, seal_change, seal_presence, seal_signal};
+use figcraft_collab_seal::{FileKey, Keyring, SealError, open_change, open_presence, open_signal, seal_change, seal_presence, seal_signal};
+pub use figcraft_engine::devices::NEW_EPOCH;
 
 use crate::invite::Invite;
 
@@ -38,26 +39,41 @@ pub const WRONG_KEY: &str = "The link's key doesn't open this file (it is for an
 pub const NOT_SEALED: &str =
     "This link is for an end-to-end encrypted file, but the server sent the file unencrypted: it wasn't opened (ask whoever shared it)";
 
-/// The keys of a sealed file's session: its id and keyring.
+/// The keys of a sealed file's session: its id, the key new writes are sealed with (the newest
+/// epoch) and every epoch held (what opens).
 pub(crate) struct Seal<'a> {
     file: &'a str,
-    key: &'a FileKey,
+    key: FileKey,
     ring: Keyring,
 }
 
 impl<'a> Seal<'a> {
-    /// The session behind `invite` is sealed (its link has a key).
+    /// The session behind `invite` is sealed (its link has a key). Read again for every message:
+    /// the app may add a newer epoch while the session runs.
     pub(crate) fn of(invite: &'a Invite) -> Option<Seal<'a>> {
-        let key = invite.key.as_ref()?;
-        Some(Seal { file: &invite.file, key, ring: Keyring::from(key.clone()) })
+        let ring = invite.key.as_ref()?.ring();
+        let key = ring.current()?.clone();
+        Some(Seal { file: &invite.file, key, ring })
     }
 
-    fn open_all(&self, changes: &[SealedChange]) -> Vec<Change> {
-        changes.iter().filter_map(|c| open_change(&self.ring, self.file, c).ok()).collect()
+    /// The changes that open. One sealed with an epoch newer than every key held means the file's
+    /// key moved on (someone was taken out): the session ends with [`NEW_EPOCH`] and the app
+    /// fetches the new key and joins again, rather than skip what everyone else opens.
+    fn open_all(&self, changes: &[SealedChange]) -> Result<Vec<Change>, String> {
+        let newest = self.key.epoch();
+        let mut out = Vec::with_capacity(changes.len());
+        for c in changes {
+            match open_change(&self.ring, self.file, c) {
+                Ok(c) => out.push(c),
+                Err(SealError::UnknownEpoch(e)) if e > newest => return Err(NEW_EPOCH.into()),
+                Err(_) => {}
+            }
+        }
+        Ok(out)
     }
 
-    fn open_accepted(&self, a: AcceptedOf<SealedChange>) -> AcceptedOf<Change> {
-        AcceptedOf { seq: a.seq, author: a.author, batch_id: a.batch_id, changes: self.open_all(&a.changes) }
+    fn open_accepted(&self, a: AcceptedOf<SealedChange>) -> Result<AcceptedOf<Change>, String> {
+        Ok(AcceptedOf { seq: a.seq, author: a.author, batch_id: a.batch_id, changes: self.open_all(&a.changes)? })
     }
 
     /// Seal what the sync client (or the engine) sends; `me`: this client's id, once welcomed.
@@ -67,15 +83,15 @@ impl<'a> Seal<'a> {
         let failed = |e: figcraft_collab_seal::SealError| format!("Couldn't encrypt a change for the server: {e}");
         Ok(Some(match msg {
             ClientMsg::Changes { base_seq, batch_id, changes } => {
-                let changes = changes.iter().map(|c| seal_change(self.key, self.file, c)).collect::<Result<Vec<_>, _>>().map_err(failed)?;
+                let changes = changes.iter().map(|c| seal_change(&self.key, self.file, c)).collect::<Result<Vec<_>, _>>().map_err(failed)?;
                 ClientMsg::SealedChanges { base_seq, batch_id, changes }
             }
             ClientMsg::Presence(p) => match me {
-                Some(me) => ClientMsg::SealedPresence(seal_presence(self.key, self.file, me, &p).map_err(failed)?),
+                Some(me) => ClientMsg::SealedPresence(seal_presence(&self.key, self.file, me, &p).map_err(failed)?),
                 None => return Ok(None),
             },
             ClientMsg::Signal(s) if s.kind != Signal::SPOTLIGHT => match me {
-                Some(me) => ClientMsg::SealedSignal(seal_signal(self.key, self.file, me, &s).map_err(failed)?),
+                Some(me) => ClientMsg::SealedSignal(seal_signal(&self.key, self.file, me, &s).map_err(failed)?),
                 None => return Ok(None),
             },
             other => other,
@@ -88,18 +104,18 @@ impl<'a> Seal<'a> {
             ServerMsg::SealedWelcome { session, client_id, seq, catch_up, processed, peers, access } => {
                 let catch_up = match catch_up {
                     CatchUpOf::Snapshot(s) => {
-                        let opened = self.open_all(&s);
+                        let opened = self.open_all(&s)?;
                         if opened.is_empty() && !s.is_empty() {
                             return Err(WRONG_KEY.into());
                         }
                         CatchUpOf::Snapshot(opened)
                     }
-                    CatchUpOf::Delta(d) => CatchUpOf::Delta(d.into_iter().map(|a| self.open_accepted(a)).collect()),
+                    CatchUpOf::Delta(d) => CatchUpOf::Delta(d.into_iter().map(|a| self.open_accepted(a)).collect::<Result<_, _>>()?),
                 };
                 ServerMsg::Welcome { session, client_id, seq, catch_up, processed, peers, access }
             }
-            ServerMsg::SealedChanges(a) => ServerMsg::Changes(self.open_accepted(a)),
-            ServerMsg::SealedReject { batch_id, reason, fixes } => ServerMsg::Reject { batch_id, reason, fixes: self.open_all(&fixes) },
+            ServerMsg::SealedChanges(a) => ServerMsg::Changes(self.open_accepted(a)?),
+            ServerMsg::SealedReject { batch_id, reason, fixes } => ServerMsg::Reject { batch_id, reason, fixes: self.open_all(&fixes)? },
             ServerMsg::SealedPresence { client_id, blob } => match open_presence(&self.ring, self.file, client_id, &blob) {
                 Ok(presence) => ServerMsg::Presence { client_id, presence },
                 Err(_) => return Ok(None),

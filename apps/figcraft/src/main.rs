@@ -138,6 +138,9 @@ fn main() -> eframe::Result {
             c.request_repaint();
         }
     }))));
+    // Sealed files with accounts: this install's device key lives in the OS keychain (else with
+    // the preferences).
+    session.keys.keychain = figcraft_collab_net::keychain::os_keychain();
     for f in &args.files {
         if let Err(e) = session.execute("file.open", &json!({"path": f})) {
             log::error!("{f}: {e}");
