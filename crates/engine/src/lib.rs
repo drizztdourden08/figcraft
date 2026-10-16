@@ -7,6 +7,7 @@
 //! edits and are journaled the same way.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod accounts;
 pub mod al_keys;
 pub mod annotations;
 pub mod arc_handles;
@@ -641,6 +642,9 @@ pub struct Prefs {
     /// [`online`]), most recently opened first, at most [`online::MAX_ONLINE_FILES`].
     #[serde(skip_serializing_if = "Vec::is_empty", deserialize_with = "online::read")]
     pub online_files: Vec<online::OnlineFile>,
+    /// The servers you are signed in to, with your session tokens there (see `accounts`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<accounts::SignedIn>,
     /// The Getting started tips on the home screen were closed (Help ▸ Getting started shows them
     /// again).
     pub getting_started_dismissed: bool,
@@ -677,6 +681,7 @@ impl Default for Prefs {
             publish_server: live::DEFAULT_SERVER.into(),
             recent_files: Vec::new(),
             online_files: Vec::new(),
+            accounts: Vec::new(),
             getting_started_dismissed: false,
             home_views: BTreeMap::new(),
             home_sort: "modified".into(),
@@ -738,6 +743,8 @@ pub struct Session {
     pub live: live::Lives,
     /// Commands the UI runs without waiting on a server ([`Session::start_background`]).
     pub background: background::Background,
+    /// Sign-ins under way (this run).
+    pub accounts: accounts::Accounts,
 }
 
 impl Default for Session {
@@ -772,6 +779,7 @@ impl Session {
             plugins: plugins::Runtime::default(),
             live: live::Lives::default(),
             background: background::Background::default(),
+            accounts: accounts::Accounts::default(),
         }
     }
 

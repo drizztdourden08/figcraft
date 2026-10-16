@@ -113,6 +113,7 @@ fn answer(s: &mut Session, wire: &Arc<Mutex<Wire>>) -> usize {
             NetRequest::Upload(_) => NetReply::Upload(Err("no".into())),
             NetRequest::Hosting { .. } => NetReply::Hosting(Err("no".into())),
             NetRequest::Share { .. } => NetReply::Share(Err("no".into())),
+            other => other.failure()("no".into()),
         };
         w.answers.push(Event::Net { job: *job, reply: Box::new(reply) });
     }

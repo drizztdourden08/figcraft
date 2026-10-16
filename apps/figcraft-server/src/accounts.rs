@@ -106,7 +106,7 @@ impl Accounts {
     pub fn offline(data: &Path, cfg: &AuthConfig, e2e: E2eMode) -> Result<Accounts, String> {
         cfg.check()?;
         let registry = Registry::builtin();
-        let fetch: Arc<dyn Fetch> = Arc::new(crate::fetch::Https::new());
+        let fetch: Arc<dyn Fetch> = Arc::new(crate::fetch::Https::new()?);
         let providers = cfg.provider.iter().filter_map(|p| Some((p.id.clone(), registry.build(p, fetch.clone()).ok()?))).collect();
         Self::with_providers(data, cfg, e2e, providers)
     }

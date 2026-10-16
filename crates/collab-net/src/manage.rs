@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use figcraft_auth::{ServerInfo, SignIn, SignInReply};
 use figcraft_collab::message::{
-    self, Access, Admin, AdminReply, ClientMsg, HostInfo, LibraryReply, LibraryReq, Manage, NewLink, OpenHosting, OpenLibrary, OpenPlugins, PROTOCOL,
-    PluginReply, PluginReq, Resolve, ServerMsg,
+    self, Access, AccountReply, AccountReq, Admin, AdminReply, ClientMsg, HostInfo, LibraryReply, LibraryReq, Manage, NewLink, OpenAccount,
+    OpenHosting, OpenLibrary, OpenPlugins, PROTOCOL, PluginReply, PluginReq, Resolve, ServerMsg,
 };
 use figcraft_engine::live::{Shared, SharedLink};
 use tungstenite::{Bytes, Message, WebSocket};
@@ -126,6 +126,58 @@ pub fn info(server: &Endpoint, limits: &NetLimits, timeout: Duration) -> Result<
     };
     close(ws);
     Ok(answer)
+}
+
+/// One sign-in step with the server at `server`, on a connection of its own (a session token from
+/// it signs in later connections). A server older than accounts can't read it.
+pub fn sign_in(server: &Endpoint, req: SignIn, limits: &NetLimits, timeout: Duration) -> Result<SignInReply, String> {
+    let mut ws = connect(server, limits, timeout)?;
+    send(&mut ws, &ClientMsg::SignIn(req))?;
+    let answer = reply(&mut ws, limits, |m| match m {
+        ServerMsg::SignIn(r) => Some(*r),
+        _ => None,
+    })
+    .map_err(|e| if e.contains("couldn't be read") { format!("{} has no accounts (it is older than this app)", server.display()) } else { e })?;
+    close(ws);
+    Ok(answer)
+}
+
+/// Send `requests` on an account connection to the server at `server`, signed in with `session`:
+/// the replies, in order. Fails when the sign-in has ended or the server has no accounts. Never
+/// echoes the token.
+pub fn account(
+    server: &Endpoint,
+    session: &str,
+    requests: Vec<AccountReq>,
+    limits: &NetLimits,
+    timeout: Duration,
+) -> Result<Vec<AccountReply>, String> {
+    let mut ws = connect(server, limits, timeout)?;
+    send(&mut ws, &ClientMsg::SignIn(SignIn::Session { token: session.to_string() }))?;
+    match reply(&mut ws, limits, |m| match m {
+        ServerMsg::SignIn(r) => Some(*r),
+        _ => None,
+    })? {
+        SignInReply::SignedIn(_) => {}
+        SignInReply::Refused { reason } => return Err(format!("your sign-in to this server ended ({reason}): sign in again")),
+        _ => return Err("the server didn't sign you in".into()),
+    }
+    send(&mut ws, &ClientMsg::OpenAccount(OpenAccount { protocol: PROTOCOL, client_version: message::client_version() }))?;
+    let account = |m: ServerMsg| match m {
+        ServerMsg::Account(r) => Some(*r),
+        _ => None,
+    };
+    match reply(&mut ws, limits, account)? {
+        AccountReply::Ready { .. } => {}
+        other => return Err(format!("the server answered {other:?} instead of opening your account")),
+    }
+    let mut replies = Vec::with_capacity(requests.len());
+    for r in requests {
+        send(&mut ws, &ClientMsg::Account(r))?;
+        replies.push(reply(&mut ws, limits, account)?);
+    }
+    close(ws);
+    Ok(replies)
 }
 
 /// Ask the server at `server` which file join code `code` opens: the file's id and its link's

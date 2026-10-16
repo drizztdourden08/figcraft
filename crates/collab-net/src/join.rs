@@ -5,6 +5,7 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
+use figcraft_auth::{SignIn, SignInReply};
 use figcraft_collab::Client;
 use figcraft_collab::message::{ClientMsg, Peer, Resume, ServerMsg};
 use figcraft_engine::live::{Event, Role, SessionInfo, Status};
@@ -44,6 +45,9 @@ pub struct GuestConfig {
     /// Join as the client you were (an app that starts over after a crash): the first hello
     /// carries it, and a server that still knows the id gives it back.
     pub resume: Option<Resume>,
+    /// Your session token on this server (signed in there): sent before each hello, so the server
+    /// knows who you are (a server with accounts lets members in by it).
+    pub session: Option<String>,
 }
 
 impl GuestConfig {
@@ -58,6 +62,7 @@ impl GuestConfig {
             max_backoff: Duration::from_secs(10),
             attempts: 12,
             resume: None,
+            session: None,
         }
     }
 
@@ -152,6 +157,11 @@ pub(crate) fn after(outcome: Outcome, cfg: &GuestConfig, was_live: bool, attempt
 /// by the native guest's reader and writer threads.)
 pub(crate) type Resuming = Mutex<Option<Resume>>;
 
+/// What a new connection says first: signing in with the session token, when there is one.
+pub(crate) fn sign_in(cfg: &GuestConfig) -> Option<ClientMsg> {
+    cfg.session.as_ref().filter(|t| !t.is_empty()).map(|token| ClientMsg::SignIn(SignIn::Session { token: token.clone() }))
+}
+
 /// The hello for a new connection: back after a drop, the same client catching up from where it
 /// was.
 pub(crate) fn hello(cfg: &GuestConfig, resume: &Resuming) -> ClientMsg {
@@ -233,6 +243,12 @@ pub(crate) fn take(m: ServerMsg, cfg: &GuestConfig, inbox: &Inbox, seen: &mut Se
             }
         }
         ServerMsg::Refused { reason } => return Taken::End(Outcome::Refused(reason)),
+        // The answer to signing in with the session token (sent before the hello).
+        ServerMsg::SignIn(r) => {
+            if let SignInReply::Refused { reason } = *r {
+                return Taken::End(Outcome::Refused(format!("your sign-in to this server ended ({reason}): sign in again")));
+            }
+        }
         ServerMsg::Changes(ref acc) => {
             if let Ok(mut r) = resume.lock()
                 && let Some(r) = r.as_mut()
@@ -253,7 +269,6 @@ pub(crate) fn take(m: ServerMsg, cfg: &GuestConfig, inbox: &Inbox, seen: &mut Se
         | ServerMsg::Plugins(_)
         | ServerMsg::Resolved { .. }
         | ServerMsg::Info(_)
-        | ServerMsg::SignIn(_)
         | ServerMsg::Account(_) => {}
     }
     Taken::Continue

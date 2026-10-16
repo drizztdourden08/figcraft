@@ -28,6 +28,8 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rustls-pki-types = { version = "1", features = ["std"] }
 webpki-roots = "1"
 getrandom = "0.4"
+# PKCE challenges when signing in through a browser.
+sha2 = { workspace = true }
 base64 = { workspace = true }
 
 # The browser client: the page's WebSocket API.
