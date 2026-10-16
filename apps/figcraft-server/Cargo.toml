@@ -20,7 +20,9 @@ workspace = true
 figcraft-collab = { workspace = true }
 figcraft-collab-net = { workspace = true }
 # Who may get in: accounts and identity providers.
-figcraft-auth = { workspace = true }
+figcraft-auth = { workspace = true, features = ["providers"] }
+# HTTPS to identity providers (discovery, keys, token exchanges).
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 # Checking a team library before keeping it (read as files using it read it).
 figcraft-format = { workspace = true }
 # Checking plugin bundles before the plugin directory keeps them (never run here).

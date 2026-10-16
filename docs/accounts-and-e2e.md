@@ -1,9 +1,11 @@
 # Accounts and end-to-end encryption (draft)
 
-Status: milestone M9 ("accounts and teams" in [`ROADMAP.md`](../ROADMAP.md)). **Step 2 is
-built**: `crates/auth` (the sign-in types, the `IdentityProvider` and `Gate` traits, the `[auth]`
-and `[e2e]` settings) and `Info`, which every server answers (`links`, nothing sealed, until the
-next steps). Sections say what is built as the implementation lands. Builds on [`collab-protocol.md`](collab-protocol.md)
+Status: milestone M9 ("accounts and teams" in [`ROADMAP.md`](../ROADMAP.md)). **Steps 2 and 3
+are built**: `crates/auth` (the sign-in types, the `IdentityProvider` and `Gate` traits, the
+`[auth]` and `[e2e]` settings, and with its `providers` feature the `oidc` and `external` providers
+and their registry), `Info` and `SignIn`, and accounts on `figcraft-server`: people and sessions,
+members and invites per file, roles in sessions, account connections, admins (see
+[`server.md`](server.md#accounts-sign-in)). `[e2e]` accepts only `off` until sealing lands. Sections say what is built as the implementation lands. Builds on [`collab-protocol.md`](collab-protocol.md)
 (live sessions) and [`server.md`](server.md) (running `figcraft-server`).
 
 Goal: a `figcraft-server` can (1) let people in by **who they are** instead of only by share links,

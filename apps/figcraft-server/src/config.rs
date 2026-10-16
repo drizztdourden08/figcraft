@@ -3,6 +3,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+use figcraft_auth::{AuthConfig, E2eConfig, E2eMode};
 use figcraft_collab_net::{Endpoint, NetLimits};
 use serde::Deserialize;
 
@@ -69,6 +70,11 @@ pub struct Config {
     pub connects_per_minute: u32,
     pub publishes_per_hour: u32,
     pub messages_per_second: u32,
+    /// Who may get in: share links (default), or people signing in through identity providers
+    /// (`[auth]`, `[[auth.provider]]`; see `docs/accounts-and-e2e.md`).
+    pub auth: AuthConfig,
+    /// Whether files are end-to-end encrypted (`[e2e]`).
+    pub e2e: E2eConfig,
 }
 
 impl Default for Config {
@@ -99,6 +105,8 @@ impl Default for Config {
             connects_per_minute: 30,
             publishes_per_hour: 10,
             messages_per_second: 200,
+            auth: AuthConfig::default(),
+            e2e: E2eConfig::default(),
         }
     }
 }
@@ -161,6 +169,13 @@ impl Config {
 
     /// Check everything (before starting).
     pub fn check(&self) -> Result<(), String> {
+        self.auth.check()?;
+        if self.e2e.mode()? != E2eMode::Off {
+            return Err("`e2e.mode`: sealed files aren't available in this version yet; leave it \"off\"".into());
+        }
+        if self.auth.mode()?.accounts() && self.open_publish {
+            return Err("`open_publish` publishes without signing in: turn it off on a server with accounts".into());
+        }
         self.addr()?;
         self.public()?;
         self.proxy()?;

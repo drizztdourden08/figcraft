@@ -459,7 +459,9 @@ impl Client {
             | ServerMsg::Hosting(_)
             | ServerMsg::Reported { .. }
             | ServerMsg::Resolved { .. }
-            | ServerMsg::Info(_) => Ok(Vec::new()),
+            | ServerMsg::Info(_)
+            | ServerMsg::SignIn(_)
+            | ServerMsg::Account(_) => Ok(Vec::new()),
             ServerMsg::Welcome { .. } if self.online => Err(Error::Protocol("already joined".into())),
             ServerMsg::Welcome { session, client_id, seq, catch_up, processed, peers, access } => {
                 if session != self.session || client_id != self.id {

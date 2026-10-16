@@ -5,7 +5,7 @@ use figcraft_doc::NodeId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use figcraft_auth::ServerInfo;
+use figcraft_auth::{ServerInfo, SignIn, SignInReply};
 
 use crate::Error;
 use crate::change::Change;
@@ -586,6 +586,174 @@ pub enum PluginReply {
     },
 }
 
+/// What someone may do in a file on a server with accounts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Role {
+    /// Edits, and manages who else gets in (members, invites, links), renames and removes it.
+    Owner,
+    #[default]
+    Editor,
+    Viewer,
+}
+
+impl Role {
+    /// `"owner"`, `"editor"` or `"viewer"`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Role::Owner => "owner",
+            Role::Editor => "editor",
+            Role::Viewer => "viewer",
+        }
+    }
+
+    /// From [`id`](Self::id) (any case, surrounding spaces ignored).
+    pub fn parse(s: &str) -> Option<Role> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "owner" => Some(Role::Owner),
+            "editor" | "edit" => Some(Role::Editor),
+            "viewer" | "view" => Some(Role::Viewer),
+            _ => None,
+        }
+    }
+
+    /// What it lets a session do.
+    pub fn access(self) -> Access {
+        match self {
+            Role::Owner | Role::Editor => Access::Edit,
+            Role::Viewer => Access::View,
+        }
+    }
+}
+
+/// Opens an account connection (after signing in, instead of [`Hello`]): your files and who gets
+/// into them. Answered with [`AccountReply::Ready`] or `Refused`; requests are [`AccountReq`]
+/// messages, each answered with one [`AccountReply`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpenAccount {
+    pub protocol: u32,
+    pub client_version: String,
+}
+
+/// Someone in a file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Member {
+    pub account: String,
+    pub name: String,
+    pub email: Option<String>,
+    pub role: Role,
+}
+
+/// An email invited to a file before its person signed in here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Invited {
+    pub email: String,
+    pub role: Role,
+}
+
+/// A file you're in.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MyFile {
+    pub info: FileInfo,
+    pub role: Role,
+}
+
+/// A request on an account connection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AccountReq {
+    /// The files you're in ([`AccountReply::Files`]).
+    Files,
+    /// Keep a document as a new file you own ([`AccountReply::Published`]).
+    Publish {
+        name: String,
+        snapshot: Vec<Change>,
+    },
+    /// Who is in a file, and who is invited ([`AccountReply::Members`]).
+    Members {
+        file: String,
+    },
+    /// Let an email in with a role (owners): someone who signed in here with it becomes a member
+    /// at once; anyone else when they first sign in.
+    Invite {
+        file: String,
+        email: String,
+        role: Role,
+    },
+    /// Change a member's role (owners; a file always keeps an owner).
+    SetRole {
+        file: String,
+        account: String,
+        role: Role,
+    },
+    /// Take a member out (owners; they are disconnected), or an invite back.
+    RemoveMember {
+        file: String,
+        account: String,
+    },
+    Uninvite {
+        file: String,
+        email: String,
+    },
+    /// Leave a file (not its last owner).
+    Leave {
+        file: String,
+    },
+    /// Owners: rename the file, or remove it (everyone in it is disconnected).
+    Rename {
+        file: String,
+        name: String,
+    },
+    RemoveFile {
+        file: String,
+    },
+    /// Owners, on a server that also takes links: the file's links, a new one, revoke one, a join
+    /// code for one (as [`Admin`] does with the server key).
+    Links {
+        file: String,
+    },
+    CreateLink {
+        file: String,
+        access: Access,
+        label: String,
+    },
+    Revoke {
+        file: String,
+        link: String,
+    },
+    Code {
+        file: String,
+        token: String,
+    },
+}
+
+/// The answer to an [`AccountReq`] (the first one on a connection answers [`OpenAccount`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AccountReply {
+    /// Signed in as this account: requests may follow.
+    Ready {
+        account: String,
+    },
+    Files(Vec<MyFile>),
+    Published {
+        file: FileInfo,
+    },
+    Members {
+        members: Vec<Member>,
+        invited: Vec<Invited>,
+    },
+    Links(Vec<LinkInfo>),
+    Link(NewLink),
+    Code {
+        code: String,
+    },
+    Done,
+    Failed {
+        reason: String,
+    },
+}
+
 /// Client → server.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -631,6 +799,14 @@ pub enum ClientMsg {
     /// Ask what the server accepts (before a connection's first message; answered with
     /// [`ServerMsg::Info`]). Servers from before accounts refuse it: they take links only.
     Info,
+    /// A sign-in step (before a connection's first message): answered with [`ServerMsg::SignIn`].
+    /// When it signs the connection in, what follows (`Hello`, `Manage`, [`OpenAccount`]) is done
+    /// as that person.
+    SignIn(SignIn),
+    /// Open an account connection (instead of `Hello`, after signing in).
+    OpenAccount(OpenAccount),
+    /// A request on an account connection.
+    Account(AccountReq),
 }
 
 /// Server → client.
@@ -702,6 +878,10 @@ pub enum ServerMsg {
     /// The answer to [`ClientMsg::Info`]: who may get in and how to sign in, and whether files
     /// are sealed.
     Info(Box<ServerInfo>),
+    /// The answer to [`ClientMsg::SignIn`].
+    SignIn(Box<SignInReply>),
+    /// The answer to an account connection's request.
+    Account(Box<AccountReply>),
 }
 
 /// `YYYY-MM-DD HH:MM UTC` for seconds since 1970 (how servers and apps show the times in these

@@ -5,7 +5,8 @@
 //! <data>/LOCK                    held while a server (or a command changing the directory) uses it
 //! <data>/server.json             where the running server listens (for the command line)
 //! <data>/server.key              the server key: managing files (publish, links, removal)
-//! <data>/files/<id>/meta.json    name, created, updated, sequence number
+//! <data>/files/<id>/meta.json    name, created, updated, sequence number; with accounts, its
+//!                                members and invites (see `members`)
 //! <data>/files/<id>/links.json   share links: id, access, label, created, SHA-256 of the token,
 //!                                and a join code's hash and wrapped token (see `codes`)
 //! <data>/files/<id>/snapshot.bin the session state at the last compaction
@@ -35,19 +36,23 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Cursor, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use figcraft_auth::Person;
+use figcraft_collab::message::AccountReq;
 use figcraft_collab::message::{
     Access, Admin, AdminReply, ClientMsg, FileInfo, FileRow, FileUsage, HostInfo, LibraryReply, LibraryReq, LinkInfo, MAX_OWNED, NewLink, OwnedFile,
     PluginReply, PluginReq, ReportInfo, Usage,
 };
 use figcraft_collab::{Change, Replica, Server, same_secret};
-use figcraft_collab_net::hub::{Admission, Backend, Closing, Handled, OpenFile, ip_key};
+use figcraft_collab_net::hub::{AccountHandled, Admission, Backend, Closing, Handled, OpenFile, ip_key};
 use figcraft_collab_net::token;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::abuse::{Abuse, AbuseConfig, Action};
+use crate::accounts::Accounts;
 use crate::codes::{self, Sealed};
 use crate::directory::{Directory, DirectoryConfig};
 use crate::disk::{self, LIBRARY, LINKS, LOG, LOG_HEADER, META, SNAPSHOT, USAGE};
@@ -171,6 +176,9 @@ struct Meta {
     /// When someone last opened it (seconds since 1970).
     #[serde(default)]
     opened: u64,
+    /// Its members and invites (servers with accounts).
+    #[serde(default, flatten)]
+    people: members::People,
 }
 
 impl Meta {
@@ -271,8 +279,13 @@ pub struct Store {
     cut_short: Vec<String>,
     /// The free space last seen on the data directory's disk, and when.
     free: Option<(Instant, Option<u64>)>,
+    /// Who signs in (none on a server of share links only).
+    accounts: Arc<Accounts>,
     _lock: File,
 }
+
+#[path = "members.rs"]
+pub mod members;
 
 /// Seconds since 1970.
 pub fn now() -> u64 {
@@ -366,6 +379,7 @@ impl Store {
             compactions: 0,
             cut_short: Vec::new(),
             free: None,
+            accounts: Arc::new(Accounts::links_only(root)),
             _lock: lock,
         };
         for problem in startup_problems {
@@ -444,6 +458,33 @@ impl Store {
         }
         let bytes = [SNAPSHOT, LOG].iter().filter_map(|n| fs::metadata(path.join(n)).ok()).map(|m| m.len()).sum();
         Ok(Entry { meta, links, log: None, bytes, forced: 0 })
+    }
+
+    /// Who signs in here (the server sets it when `[auth]` asks for accounts).
+    pub fn set_accounts(&mut self, accounts: Arc<Accounts>) {
+        self.accounts = accounts;
+    }
+
+    /// The ids of the files kept.
+    fn file_ids(&self) -> Vec<String> {
+        self.files.keys().cloned().collect()
+    }
+
+    /// A file's members and invites.
+    fn people(&self, file: &str) -> Option<&members::People> {
+        self.files.get(file).map(|e| &e.meta.people)
+    }
+
+    /// A file's listing.
+    fn file_info(&self, file: &str, open: &dyn Fn(&str) -> Option<OpenFile>) -> Option<FileInfo> {
+        self.files.get(file).map(|e| self.info(file, e, open(file)))
+    }
+
+    /// Write a file's `meta.json` again.
+    fn save_meta(&mut self, file: &str) -> Result<(), String> {
+        let path = self.dir(file).join(META);
+        let entry = self.entry(file)?;
+        write_json(&path, &entry.meta).map_err(|e| format!("couldn't save the file's people: {e}"))
     }
 
     /// The server key (for managing files).
@@ -590,8 +631,17 @@ impl Store {
         let (edit, edit_token) = new_link(Access::Edit, "Published (edit)", t)?;
         let (view, view_token) = new_link(Access::View, "Published (view)", t)?;
         let owner = ip.map(|_| token::secret()).transpose()?;
-        let meta =
-            Meta { name, created: t, updated: t, seq: 0, library: None, owner: owner.as_deref().map(hash), ip: ip.map(|i| i.to_string()), opened: 0 };
+        let meta = Meta {
+            name,
+            created: t,
+            updated: t,
+            seq: 0,
+            library: None,
+            owner: owner.as_deref().map(hash),
+            ip: ip.map(|i| i.to_string()),
+            opened: 0,
+            people: members::People::default(),
+        };
         let dir = self.dir(&id);
         let written = fs::create_dir_all(&dir)
             .map_err(|e| e.to_string())
@@ -1313,6 +1363,32 @@ fn new_link(access: Access, label: &str, created: u64) -> Result<(Link, String),
 }
 
 impl Backend for Store {
+    fn admit_as(&mut self, file: &str, token: &str, who: Option<&Person>) -> Result<Admission, String> {
+        let mode = self.accounts.mode();
+        if !mode.accounts() {
+            return self.admit(file, token);
+        }
+        if mode.links() && !token.is_empty() {
+            return self.admit(file, token);
+        }
+        self.admit_member(file, who)
+    }
+
+    fn manage_as(&mut self, key: &str, who: Option<&Person>) -> Result<(), String> {
+        if self.admin_may_manage(who) {
+            return Ok(());
+        }
+        self.manage(key)
+    }
+
+    fn open_account(&mut self, _who: &Person) -> Result<(), String> {
+        if self.accounts.mode().accounts() { Ok(()) } else { Err("this server has no accounts".into()) }
+    }
+
+    fn account(&mut self, who: &Person, req: AccountReq, open: &dyn Fn(&str) -> Option<OpenFile>) -> AccountHandled {
+        self.account_request(who, req, open)
+    }
+
     fn admit(&mut self, file: &str, token: &str) -> Result<Admission, String> {
         let entry = self.entry(file)?;
         let link = Self::link_of(entry, token).and_then(|i| entry.links.get(i));

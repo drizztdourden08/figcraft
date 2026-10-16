@@ -271,6 +271,44 @@ otherwise it changes the directory itself. A new link is shown only when it is m
 keeps only a hash of its token, so a lost link can't be recovered (revoke it and make another).
 Publishing makes an edit link and a view link labelled `Published (edit)` and `Published (view)`.
 
+## Accounts (sign-in)
+
+By default people get into files with share links and join codes. With `[auth]` they can sign in
+instead, through **identity providers**, and each file has **members** with a role: owner (manages
+who gets in), editor or viewer. The design is in [`accounts-and-e2e.md`](accounts-and-e2e.md).
+
+```toml
+[auth]
+mode = "accounts"                  # "links" (default) | "accounts" | "accounts+links"
+admins = ["you@example.com"]       # manage the server without the key
+allow_domains = ["example.com"]    # who may sign in (both lists empty: anyone a provider vouches for)
+allow_emails = []
+
+[[auth.provider]]
+id = "google"
+kind = "oidc"
+preset = "google"                  # or: issuer = "https://sso.example.com/realms/design"
+client_id = "1234-abc.apps.googleusercontent.com"
+client_secret_file = "/etc/figcraft-server/google.secret"
+```
+
+- **`oidc`** works with any OpenID Connect issuer (Google, GitLab, Microsoft Entra ID with your
+  tenant's issuer, Keycloak, Authentik, Auth0, Okta, Zitadel…). Register a *desktop* (native)
+  application with the issuer: apps sign in through the system browser with a loopback redirect
+  (`http://127.0.0.1:<port>/`) and PKCE, and the server exchanges the code, so the client secret
+  stays on the server. Add `flows = ["browser", "device"]` to also offer the device flow (a code
+  typed on another device; for `figcraft-cli` and agents) when the issuer has one.
+- **`external`** asks a verifier you run who a pasted token is: `verify_url` receives
+  `{"provider", "token"}` and answers `{"subject", "email"?, "email_verified"?, "name"?}` (200), or
+  401/403 with `{"error"}`.
+- **Your own kind**: a server build can register an `IdentityProvider` implementation
+  (`figcraft_server::start_with` with a `figcraft_auth::registry::Registry`).
+
+Emails count only when the provider verified them. People and their sessions are kept in
+`<data>/accounts/` (session tokens only as hashes); members and invites in each file's
+`meta.json`. `accounts+links` keeps share links working beside accounts (owners make them from
+their account). `open_publish` can't be combined with accounts.
+
 ## Configuration
 
 Every flag is also a key of a TOML file given with `--config server.toml` (flags win; unknown keys

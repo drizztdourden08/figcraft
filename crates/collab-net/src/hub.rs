@@ -30,10 +30,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use figcraft_auth::{Gate, Links};
+use figcraft_auth::{Gate, Links, Person};
 use figcraft_collab::message::{
-    self, Access, Admin, AdminReply, ClientMsg, Hello, HostInfo, LibraryReply, LibraryReq, Manage, OpenHosting, OpenLibrary, OpenPlugins, PROTOCOL,
-    PluginReply, PluginReq, Presence, Resolve, ServerMsg, reads_hosting,
+    self, Access, AccountReply, AccountReq, Admin, AdminReply, ClientMsg, Hello, HostInfo, LibraryReply, LibraryReq, Manage, OpenAccount,
+    OpenHosting, OpenLibrary, OpenPlugins, PROTOCOL, PluginReply, PluginReq, Presence, Resolve, ServerMsg, reads_hosting,
 };
 use figcraft_collab::{Outgoing, Server};
 use figcraft_engine::live::{Event, MAX_NAME, PEOPLE, sanitize};
@@ -86,6 +86,24 @@ impl From<AdminReply> for Handled {
     }
 }
 
+/// An account request's reply, and what the hub must do about connections it affects.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccountHandled {
+    pub reply: AccountReply,
+    /// A link was revoked: `(file, link)`.
+    pub revoked: Option<(String, String)>,
+    /// A file was removed.
+    pub removed: Option<String>,
+    /// People taken out of files: `(file, account)`; their connections to it are closed.
+    pub left: Vec<(String, String)>,
+}
+
+impl From<AccountReply> for AccountHandled {
+    fn from(reply: AccountReply) -> Self {
+        Self { reply, revoked: None, removed: None, left: Vec::new() }
+    }
+}
+
 /// The address limits and blocks count a client by: its IPv4 address (an IPv4-mapped IPv6 address
 /// as IPv4), or its IPv6 address's /64 (one subscriber's block: they have billions of addresses).
 pub fn ip_key(ip: IpAddr) -> IpAddr {
@@ -122,6 +140,28 @@ pub trait Backend: Send + 'static {
     /// A hello for `file` with `token`: what it may do, or why it may not join (the reason is
     /// shown to the person joining; never echo the token).
     fn admit(&mut self, file: &str, token: &str) -> Result<Admission, String>;
+
+    /// A hello for `file` with `token` from someone signed in as `who` (or nobody): what they
+    /// may do. Hosts without accounts keep the default ([`admit`](Self::admit)).
+    fn admit_as(&mut self, file: &str, token: &str, _who: Option<&Person>) -> Result<Admission, String> {
+        self.admit(file, token)
+    }
+
+    /// May a managing connection with `key` from `who` (or nobody) manage the server? Hosts
+    /// without accounts keep the default ([`manage`](Self::manage)).
+    fn manage_as(&mut self, key: &str, _who: Option<&Person>) -> Result<(), String> {
+        self.manage(key)
+    }
+
+    /// May `who` open an account connection? (Hosts without accounts: no.)
+    fn open_account(&mut self, _who: &Person) -> Result<(), String> {
+        Err("this server has no accounts".into())
+    }
+
+    /// A request on `who`'s account connection.
+    fn account(&mut self, _who: &Person, _req: AccountReq, _open: &dyn Fn(&str) -> Option<OpenFile>) -> AccountHandled {
+        AccountReply::Failed { reason: "this server has no accounts".into() }.into()
+    }
 
     /// The session for a file that isn't open (after [`admit`](Self::admit) let someone in).
     fn open(&mut self, file: &str) -> Result<Server, String>;
@@ -403,6 +443,8 @@ enum HubIn {
         sock: TcpStream,
         /// Its size (in flight until handled).
         bytes: usize,
+        /// Who signed in on it first, if anyone.
+        person: Option<Person>,
     },
     Msg {
         conn: u64,
@@ -859,11 +901,26 @@ fn next_message(ws: &mut WebSocket<Duplex>, max: usize) -> Result<Option<(Client
 /// Most steps (asking what the server accepts, signing in) before a connection's first message.
 const MAX_STEPS: usize = 16;
 
-/// Answer what comes before a connection's first message (`Info`), then return that message.
-fn before_first(ws: &mut WebSocket<Duplex>, out: &Line, max: usize, gate: &dyn Gate) -> Result<Option<(ClientMsg, usize)>, String> {
+/// Answer what comes before a connection's first message (`Info`, sign-in steps: providers may
+/// be slow, so here, in the connection's own thread), then return that message. A sign-in that
+/// works makes `person` who the connection is.
+fn before_first(
+    ws: &mut WebSocket<Duplex>,
+    out: &Line,
+    max: usize,
+    gate: &dyn Gate,
+    person: &mut Option<Person>,
+) -> Result<Option<(ClientMsg, usize)>, String> {
     for _ in 0..MAX_STEPS {
         match next_message(ws, max)? {
             Some((ClientMsg::Info, _)) => say(out, &ServerMsg::Info(Box::new(gate.info()))),
+            Some((ClientMsg::SignIn(req), _)) => {
+                let (reply, who) = gate.sign_in(req);
+                if who.is_some() {
+                    *person = who;
+                }
+                say(out, &ServerMsg::SignIn(Box::new(reply)));
+            }
             other => return Ok(other),
         }
     }
@@ -960,14 +1017,16 @@ fn serve(mut stream: TcpStream, conn: u64, hub: &Sender<HubIn>, limits: NetLimit
         log::info!("event=refused ip={ip} reason=connections_per_address");
         end(Some("too many connections from your address: close some and try again"));
     } else {
-        match before_first(&mut ws, &out, limits.max_hello, shared.gate.as_ref()) {
+        let mut person = None;
+        match before_first(&mut ws, &out, limits.max_hello, shared.gate.as_ref(), &mut person) {
             Ok(Some((
                 first @ (ClientMsg::Hello(_)
                 | ClientMsg::Manage(_)
                 | ClientMsg::OpenLibrary(_)
                 | ClientMsg::OpenPlugins(_)
                 | ClientMsg::OpenHosting(_)
-                | ClientMsg::Resolve(_)),
+                | ClientMsg::Resolve(_)
+                | ClientMsg::OpenAccount(_)),
                 bytes,
             ))) => {
                 // Sessions and the operator may use the last connections; one-shot requests
@@ -984,7 +1043,8 @@ fn serve(mut stream: TcpStream, conn: u64, hub: &Sender<HubIn>, limits: NetLimit
                     end(Some(BUSY));
                 } else {
                     ws.set_config(|c| *c = config(max));
-                    let opened = sock.try_clone().is_ok_and(|s| hub.send(HubIn::Open { conn, ip, first, out: out.clone(), sock: s, bytes }).is_ok());
+                    let opened =
+                        sock.try_clone().is_ok_and(|s| hub.send(HubIn::Open { conn, ip, first, out: out.clone(), sock: s, bytes, person }).is_ok());
                     if opened && ws.get_ref().set_read_timeout(Some(idle)).is_ok() {
                         read_loop(&mut ws, conn, hub, limits, max, &shared.in_flight, &end);
                         let _ = hub.send(HubIn::Gone { conn });
@@ -1094,8 +1154,10 @@ fn linger(ws: &mut WebSocket<Duplex>) {
 
 /// What a connection is for.
 enum Kind {
-    /// In `file`'s session as client `id`, through link `link`.
-    Joined { file: String, id: u32, link: Option<String> },
+    /// In `file`'s session as client `id`, through link `link`, signed in as `account`.
+    Joined { file: String, id: u32, link: Option<String>, account: Option<String> },
+    /// Someone's account connection (their files and who gets into them).
+    Account { person: Person },
     /// Managing the server's files.
     Managing,
     /// Using `file`'s team library through link `link` of `access` (revoking it disconnects).
@@ -1111,6 +1173,8 @@ struct Pending {
     out: Line,
     sock: TcpStream,
     ip: IpAddr,
+    /// Who signed in on it (before its first message), if anyone.
+    person: Option<Person>,
 }
 
 /// A connection the hub took in.
@@ -1232,16 +1296,16 @@ impl<B: Backend> Hub<B> {
 
     fn handle(&mut self, m: HubIn) {
         match m {
-            HubIn::Open { conn, ip, first, out, sock, bytes } => {
+            HubIn::Open { conn, ip, first, out, sock, bytes, person } => {
                 self.in_flight.give(bytes);
-                // The operator (with the server key) gets in from anywhere; everyone else is
-                // checked (blocked addresses, connection rates).
-                let operator = matches!(&first, ClientMsg::Manage(m) if self.backend.manage(&m.key).is_ok());
+                // The operator (with the server key, or an admin signed in) gets in from anywhere;
+                // everyone else is checked (blocked addresses, connection rates).
+                let operator = matches!(&first, ClientMsg::Manage(m) if self.backend.manage_as(&m.key, person.as_ref()).is_ok());
                 if !operator && let Err(why) = self.backend.connect(ip) {
                     log::info!("event=refused ip={ip} reason={why:?}");
                     return refuse(&out, &why);
                 }
-                let c = Pending { out, sock, ip };
+                let c = Pending { out, sock, ip, person };
                 match first {
                     ClientMsg::Hello(hello) => self.join(conn, hello, c),
                     ClientMsg::Manage(m) => self.manage(conn, &m, c),
@@ -1249,6 +1313,7 @@ impl<B: Backend> Hub<B> {
                     ClientMsg::OpenPlugins(o) => self.open_plugins(conn, &o, c),
                     ClientMsg::OpenHosting(o) => self.open_hosting(conn, &o, c),
                     ClientMsg::Resolve(r) => self.resolve(&r, &c),
+                    ClientMsg::OpenAccount(o) => self.open_account(conn, &o, c),
                     _ => refuse(&c.out, "say hello first"),
                 }
             }
@@ -1341,6 +1406,18 @@ impl<B: Backend> Hub<B> {
                 ClientMsg::Ping => self.answer(conn, &ServerMsg::Pong),
                 _ => self.kick(&[conn], "only library requests are spoken on this connection"),
             },
+            Some(Kind::Account { person }) => match msg {
+                ClientMsg::Account(req) => {
+                    let person = person.clone();
+                    let rooms = &self.rooms;
+                    let open = |file: &str| rooms.get(file).map(Room::info);
+                    let handled = self.backend.account(&person, req, &open);
+                    self.answer(conn, &ServerMsg::Account(Box::new(handled.reply)));
+                    self.disconnect(handled.revoked, handled.removed, None, &handled.left);
+                }
+                ClientMsg::Ping => self.answer(conn, &ServerMsg::Pong),
+                _ => self.kick(&[conn], "only account requests are spoken on this connection"),
+            },
             Some(Kind::Plugins { publisher }) => match msg {
                 ClientMsg::Plugins(req) => {
                     let reply = self.backend.plugins(ip, *publisher, req);
@@ -1386,7 +1463,7 @@ impl<B: Backend> Hub<B> {
     }
 
     fn join(&mut self, conn: u64, mut hello: Hello, c: Pending) {
-        let admission = match self.backend.admit(&hello.file, &hello.token) {
+        let admission = match self.backend.admit_as(&hello.file, &hello.token, c.person.as_ref()) {
             Ok(a) => a,
             Err(why) => return refuse(&c.out, &why),
         };
@@ -1436,8 +1513,15 @@ impl<B: Backend> Hub<B> {
                 if let Some(c) = old.and_then(|old| self.conns.remove(&old)) {
                     shutdown(&c.sock);
                 }
-                self.conns
-                    .insert(conn, Conn { out: c.out, sock: c.sock, kind: Kind::Joined { file: file.clone(), id, link: admission.link }, ip: c.ip });
+                self.conns.insert(
+                    conn,
+                    Conn {
+                        out: c.out,
+                        sock: c.sock,
+                        kind: Kind::Joined { file: file.clone(), id, link: admission.link, account: c.person.map(|p| p.account) },
+                        ip: c.ip,
+                    },
+                );
                 self.queue(&file, more);
             }
             Err(ServerMsg::Refused { reason }) => {
@@ -1489,7 +1573,7 @@ impl<B: Backend> Hub<B> {
         if m.protocol != PROTOCOL {
             return refuse(&c.out, &unsupported(m.protocol));
         }
-        if let Err(why) = self.backend.manage(&m.key) {
+        if let Err(why) = self.backend.manage_as(&m.key, c.person.as_ref()) {
             log::info!("event=refused ip={} reason=server_key", c.ip);
             return refuse(&c.out, &why);
         }
@@ -1501,7 +1585,7 @@ impl<B: Backend> Hub<B> {
         if o.protocol != PROTOCOL {
             return refuse(&c.out, &unsupported(o.protocol));
         }
-        let (access, link) = match self.backend.admit(&o.file, &o.token) {
+        let (access, link) = match self.backend.admit_as(&o.file, &o.token, c.person.as_ref()) {
             Ok(a) => (a.access, a.link),
             Err(why) => return refuse(&c.out, &why),
         };
@@ -1557,6 +1641,20 @@ impl<B: Backend> Hub<B> {
         }
     }
 
+    fn open_account(&mut self, conn: u64, o: &OpenAccount, c: Pending) {
+        if o.protocol != PROTOCOL {
+            return refuse(&c.out, &unsupported(o.protocol));
+        }
+        let Some(person) = c.person.clone() else {
+            return refuse(&c.out, "sign in first");
+        };
+        if let Err(why) = self.backend.open_account(&person) {
+            return refuse(&c.out, &why);
+        }
+        let ready = ServerMsg::Account(Box::new(AccountReply::Ready { account: person.account.clone() }));
+        self.take_in(conn, c, Kind::Account { person }, &ready);
+    }
+
     fn admin(&mut self, conn: u64, req: Admin) {
         let rooms = &self.rooms;
         let open = |file: &str| rooms.get(file).map(Room::info);
@@ -1567,7 +1665,27 @@ impl<B: Backend> Hub<B> {
     /// Answer a managing or hosting request, and disconnect whoever it affects.
     fn handled(&mut self, conn: u64, handled: Handled) {
         self.answer(conn, &ServerMsg::Admin(Box::new(handled.reply)));
-        if let Some((file, link)) = handled.revoked {
+        self.disconnect(handled.revoked, handled.removed, handled.blocked, &[]);
+    }
+
+    /// Disconnect whoever joined with a revoked link, everyone in a removed file, a blocked
+    /// address's connections, and people taken out of files (`(file, account)`).
+    fn disconnect(&mut self, revoked: Option<(String, String)>, removed: Option<String>, blocked: Option<IpAddr>, left: &[(String, String)]) {
+        if !left.is_empty() {
+            let gone: Vec<u64> = self
+                .conns
+                .iter()
+                .filter(|(_, c)| matches!(&c.kind, Kind::Joined { file, account: Some(a), .. } if left.iter().any(|(f, x)| f == file && x == a)))
+                .map(|(k, _)| *k)
+                .collect();
+            for conn in &gone {
+                if let Some(c) = self.conns.get(conn) {
+                    let _ = c.out.tx.try_send(Out::Close(CloseCode::Away, STOPPED.into()));
+                }
+                self.gone(*conn);
+            }
+        }
+        if let Some((file, link)) = revoked {
             let with = |joined: bool| -> Vec<u64> {
                 let uses = |c: &Conn| match &c.kind {
                     Kind::Joined { file: f, link: Some(l), .. } => joined && *f == file && *l == link,
@@ -1587,7 +1705,7 @@ impl<B: Backend> Hub<B> {
             }
             self.kick(&libraries, "the link you joined with was revoked");
         }
-        if let Some(file) = handled.removed {
+        if let Some(file) = removed {
             let users: Vec<u64> = self
                 .conns
                 .iter()
@@ -1599,7 +1717,7 @@ impl<B: Backend> Hub<B> {
             self.barred.remove(&file);
             self.kick(&users, "this file was removed from the server");
         }
-        if let Some(ip) = handled.blocked {
+        if let Some(ip) = blocked {
             let users: Vec<u64> = self.conns.iter().filter(|(_, c)| c.ip == ip).map(|(k, _)| *k).collect();
             self.kick(&users, "this server no longer accepts connections from your address");
         }

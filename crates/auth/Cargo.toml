@@ -12,6 +12,18 @@ workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# The built-in providers (`providers`; the server turns it on): logging, ID token signatures
+# (ring, already built for the TLS the server speaks) and base64url.
+log = { workspace = true, optional = true }
+ring = { version = "0.17", optional = true }
+base64 = { workspace = true, optional = true }
+
+[features]
+default = []
+# OpenID Connect and external providers, and the registry that builds them from the settings.
+providers = ["dep:log", "dep:ring", "dep:base64"]
 
 [dev-dependencies]
 toml = "1"
+ring = "0.17"
+base64 = { workspace = true }

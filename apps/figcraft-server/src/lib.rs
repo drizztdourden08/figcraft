@@ -5,20 +5,29 @@
 //! edit or only view, and serves their live sessions through the same hub the desktop app hosts
 //! with ([`figcraft_collab_net::hub`]). Files persist as a snapshot plus an append-only log of what
 //! changed ([`disk`]), compacted into a new snapshot from time to time, so a restart loses nothing
-//! that was confirmed and clients resume where they were. There are no user accounts yet: share
-//! links are the access, and the server key manages files.
+//! that was confirmed and clients resume where they were. Share links are the access and the server
+//! key manages files, unless `[auth]` turns on accounts: then people sign in through identity
+//! providers ([`accounts`]) and have a role in each file ([`store::members`]).
 
 pub mod abuse;
+pub mod accounts;
 pub mod cli;
 pub mod codes;
 pub mod config;
 pub mod directory;
 pub mod disk;
+pub mod fetch;
 pub mod store;
 
 use std::net::{SocketAddr, TcpListener};
 
+use std::sync::Arc;
+
+use figcraft_auth::registry::Registry;
 use figcraft_collab_net::hub::Hosting;
+
+use crate::accounts::Accounts;
+use crate::fetch::Https;
 
 use crate::config::Config;
 use crate::store::Store;
@@ -58,8 +67,15 @@ impl Running {
 
 /// Start serving `cfg.data` on `cfg.listen`. Files that can't be read are skipped and logged.
 pub fn start(cfg: &Config) -> Result<Running, String> {
+    start_with(cfg, &Registry::builtin())
+}
+
+/// [`start`], with identity provider kinds of your own beside the built-in ones.
+pub fn start_with(cfg: &Config, registry: &Registry) -> Result<Running, String> {
     cfg.check()?;
-    let store = Store::open(&cfg.data, cfg.store())?;
+    let mut store = Store::open(&cfg.data, cfg.store())?;
+    let accounts = Arc::new(Accounts::open(&cfg.data, &cfg.auth, cfg.e2e.mode()?, registry, Arc::new(Https::new()))?);
+    store.set_accounts(accounts.clone());
     for p in store.problems() {
         log::warn!("{p}");
     }
@@ -72,7 +88,11 @@ pub fn start(cfg: &Config) -> Result<Running, String> {
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     cli::write_running(&cfg.data, addr)?;
     let public = cli::public_endpoint(cfg, addr)?;
-    let hosting = Hosting::serve(listener, store, cfg.net()).map_err(|e| format!("can't start serving: {e}"))?;
+    let auth = accounts.mode();
+    let hosting = Hosting::serve_gated(listener, store, cfg.net(), accounts).map_err(|e| format!("can't start serving: {e}"))?;
+    if auth.accounts() {
+        log::info!("accounts: {} (people sign in to get in)", auth.id());
+    }
     log::info!(
         "figcraft-server {}: {files} file{} in {}; listening on {addr}; links name {}",
         env!("CARGO_PKG_VERSION"),
@@ -86,6 +106,8 @@ pub fn start(cfg: &Config) -> Result<Running, String> {
     Ok(Running { hosting })
 }
 
+#[cfg(test)]
+mod accounts_tests;
 #[cfg(test)]
 mod background_tests;
 #[cfg(test)]
