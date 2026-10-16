@@ -23,7 +23,7 @@ const PEOPLE: &str = "admin.people";
 const FILES: &str = "admin.files";
 const MEMBERS: &str = "admin.fileMembers";
 const STATUS: &str = "admin.status";
-const CHANGES: [&str; 7] = [
+const CHANGES: [&str; 10] = [
     "admin.endSessions",
     "admin.removePerson",
     "admin.setFileRole",
@@ -31,8 +31,12 @@ const CHANGES: [&str; 7] = [
     "admin.createUser",
     "admin.resetPassword",
     "admin.removeUser",
+    "admin.allowEmail",
+    "admin.disallowEmail",
+    "admin.setAdmin",
 ];
 const USERS: &str = "admin.users";
+const ALLOWED: &str = "admin.allowed";
 
 /// A person the server wouldn't remove (account, name): the last owner of these files (id, name).
 pub type LastOwner = (String, String, Vec<(String, String)>);
@@ -64,6 +68,10 @@ pub struct AdminWindow {
     pub users: Option<Value>,
     pub new_user: (String, String, String),
     pub made: Option<(String, String)>,
+    /// Who may sign in (`admin.allowed`), and an email being added (as an admin or not).
+    pub allowed: Option<Value>,
+    pub allow_email: String,
+    pub allow_admin: bool,
 }
 
 impl AdminWindow {
@@ -124,6 +132,9 @@ pub fn tools(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     }
     // Usernames only where people sign in with a username and password.
     let info = app.ui.account.servers.get(server).and_then(|st| st.info.clone()).unwrap_or_default();
+    // Who keeps a picture there.
+    let ctx = ui.ctx().clone();
+    crate::account_ui::team(app, &ctx, server);
     let basic = info["access"].as_str().is_some_and(|a| a.contains("basic"));
     section(
         ui,
@@ -171,11 +182,12 @@ fn invite(app: &mut FigApp, ui: &mut Ui, t: &Tokens, info: &Value, basic: bool) 
         widgets::label(
             ui,
             &trf(
-                "People sign in with {providers}. The emails and domains allowed are in the server's settings (allow_emails, allow_domains); with both empty, anyone the provider vouches for gets in.",
+                "Add someone's email to let them sign in with {providers}. Entries from the server's settings file can't be removed here.",
                 &[("providers", &others.join(", "))],
             ),
             t.text_secondary,
         );
+        allow_list(app, ui, t);
     }
     if basic {
         if !others.is_empty() {
@@ -184,6 +196,78 @@ fn invite(app: &mut FigApp, ui: &mut Ui, t: &Tokens, info: &Value, basic: bool) 
         ui.label(RichText::new(tr("Create usernames")).font(semibold(12.0)).color(t.text));
         widgets::label(ui, tr("Make a username for someone: the server makes a first password, shown once, for you to give them."), t.text_secondary);
         users(app, ui, t);
+    }
+}
+
+/// The emails (and domains) that may sign in (`admin.allowed`): remove one added here, add one
+/// (`admin.allowEmail`, as an admin or not); those from the server's settings stay.
+fn allow_list(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
+    let ctx = ui.ctx().clone();
+    let Some(w) = app.ui.admin.as_ref() else { return };
+    let allowed = w.allowed.clone();
+    if allowed.is_none() && !app.session.waiting_for(ALLOWED) {
+        ask(app, &ctx, ALLOWED, json!({}), Box::new(|app, _, v| with(app, |w| w.allowed = Some(v))));
+    }
+    let Some(a) = allowed else {
+        ui.add(egui::Spinner::new().size(12.0));
+        return;
+    };
+    let busy = busy(app);
+    let reload = |app: &mut FigApp| with(app, |w| w.allowed = None);
+    if a["open"] == true {
+        widgets::label(ui, tr("Right now anyone the provider vouches for can sign in."), t.text_secondary);
+    }
+    for e in a["emails"].as_array().cloned().unwrap_or_default() {
+        let email = e["email"].as_str().unwrap_or_default().to_string();
+        ui.horizontal(|ui| {
+            ui.scope(|ui| {
+                ui.set_width(300.0);
+                ui.horizontal(|ui| {
+                    widgets::label(ui, &email, t.text);
+                    if e["admin"] == true {
+                        ui.label(RichText::new(tr("Admin")).font(semibold(10.0)).color(crate::theme::ACCENT));
+                    }
+                });
+            });
+            if e["settings"] == true {
+                widgets::label(ui, tr("in the server's settings"), t.text_tertiary);
+            } else if widgets::button(ui, tr("Remove"), false, !busy).on_hover_text(tr("They can't sign in any more; their files stay")).clicked() {
+                ask(app, &ctx, "admin.disallowEmail", json!({"email": email}), Box::new(move |app, _, _| reload(app)));
+            }
+        });
+    }
+    let domains: Vec<&str> = a["domains"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    if !domains.is_empty() {
+        widgets::label(ui, &trf("Anyone at {domains} (in the server's settings)", &[("domains", &domains.join(", "))]), t.text_secondary);
+    }
+    let Some(w) = app.ui.admin.as_mut() else { return };
+    let mut add = None;
+    ui.horizontal(|ui| {
+        let r = widgets::text_input(ui, egui::Id::new("admin_allow_email"), &mut w.allow_email, 220.0, tr("Email"));
+        a11y::text(&r, tr("Email to allow"), &w.allow_email);
+        if widgets::checkbox(ui, w.allow_admin, tr("As an admin")) {
+            w.allow_admin = !w.allow_admin;
+        }
+        let filled = w.allow_email.contains('@');
+        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if (widgets::button(ui, tr("Allow"), true, filled && !busy).clicked() || enter) && filled {
+            add = Some(json!({"email": w.allow_email.trim(), "admin": w.allow_admin}));
+        }
+    });
+    if let Some(params) = add {
+        w.allow_email.clear();
+        w.allow_admin = false;
+        let said = trf("{email} can sign in now", &[("email", &params["email"].as_str().unwrap_or_default())]);
+        ask(
+            app,
+            &ctx,
+            "admin.allowEmail",
+            params,
+            Box::new(move |app, _, _| {
+                app.toast(said);
+                reload(app);
+            }),
+        );
     }
 }
 
@@ -373,6 +457,23 @@ fn people(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
                 let detail = if email.is_empty() { owns } else { format!("{email} · {owns}") };
                 widgets::label(ui, &detail, t.text_secondary);
             });
+            let admin = p["admin"] == true;
+            if !you
+                && widgets::button(ui, if admin { tr("Remove admin") } else { tr("Make admin") }, false, !busy)
+                    .on_hover_text(tr("Admins manage the server and open every file"))
+                    .clicked()
+            {
+                ask(
+                    app,
+                    &ctx,
+                    "admin.setAdmin",
+                    json!({"account": account, "admin": !admin}),
+                    Box::new(|app, ctx, _| {
+                        with(app, |w| w.people = None);
+                        load(app, ctx, PEOPLE);
+                    }),
+                );
+            }
             if !you && widgets::button(ui, tr("Remove…"), false, !busy).clicked() {
                 with(app, |w| {
                     w.confirm = Some((account.clone(), name.clone()));

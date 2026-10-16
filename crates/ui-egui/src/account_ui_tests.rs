@@ -7,7 +7,9 @@
 use std::sync::{Arc, Mutex};
 
 use figcraft_engine::figcraft_auth::{AuthMode, ProviderInfo, ServerAbout};
-use figcraft_engine::figcraft_collab::message::{AccountReply, AccountReq, Admin, AdminReply, ClientMsg, FileEntry, FileInfo, Member, MyFile, Role};
+use figcraft_engine::figcraft_collab::message::{
+    AccountReply, AccountReq, Admin, AdminReply, ClientMsg, FileEntry, FileInfo, Member, MyFile, Role, TeamMember,
+};
 use figcraft_engine::live::{
     Event as LiveEvent, Flow, HostOptions, LiveLink, Me, NetReply, NetRequest, Presence, ServerInfo, SessionInfo, SignIn, SignInReply,
 };
@@ -83,6 +85,13 @@ impl LiveLink for Link {
                 ],
                 invited: Vec::new(),
             })),
+            NetRequest::Account { req: AccountReq::Team, .. } => NetReply::Account(Ok(AccountReply::Team {
+                file_access: "everyone".into(),
+                people: vec![
+                    TeamMember { account: "a1".into(), name: "Ann".into(), admin: true, avatar: false, email: Some("ann@example.com".into()) },
+                    TeamMember { account: "b2".into(), name: "bob@example.com".into(), admin: false, avatar: false, email: None },
+                ],
+            })),
             NetRequest::Account { .. } => NetReply::Account(Ok(AccountReply::Done)),
             NetRequest::Admin { req: Admin::People, .. } => NetReply::Admin(Ok(AdminReply::People(Vec::new()))),
             other => other.failure()("not in this test".into()),
@@ -149,14 +158,14 @@ fn a_servers_page_signs_in_lists_your_files_and_their_people() {
     // Signed in with a token, not a password: no Account tab.
     assert!(!has_text(&shapes, "Account"));
     assert!(!format!("{:?}", crate::account_ui::inspect(&h.app)).contains(TOKEN));
-    // The People tab: everyone in your files, by name, without invites.
+    // The People tab: everyone on the server by name (never an email), without invites.
     click(&mut h, "People");
     let shapes = h.frames(6);
-    for t in ["Ann (you)", "Bob", "In 1 of your files"] {
-        assert!(has_text(&shapes, t), "the people show {t:?}");
+    for t in ["Ann (you)", "Bob", "Everyone here is in every file on this server."] {
+        assert!(shapes.iter().any(|_| true) && crate::live_tests::texts(&shapes).iter().any(|x| x.0.contains(t)), "the people show {t:?}");
     }
-    assert!(!has_text(&shapes, "Invite"));
-    assert!(wire.lock().unwrap().asked.iter().any(|r| matches!(r, NetRequest::Account { req: AccountReq::Members { file }, .. } if file == "f1")));
+    assert!(!has_text(&shapes, "Invite") && !has_text(&shapes, "bob@example.com"));
+    assert!(wire.lock().unwrap().asked.iter().any(|r| matches!(r, NetRequest::Account { req: AccountReq::Team, .. })));
     // Settings: this server for new files.
     let shapes = click(&mut h, "Settings");
     assert!(has_text(&shapes, "Use this server for new files") && has_text(&shapes, "Open this server's home when FigCraft starts"));

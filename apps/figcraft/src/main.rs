@@ -171,7 +171,8 @@ fn main() -> eframe::Result {
     // tips and templates; later runs start in a new file.
     let first_run = svc.prefs.is_none() && args.join.is_none();
     if session.docs.is_empty() && !first_run {
-        let _ = session.execute("file.new", &json!({}));
+        // On this computer: a server for new files gets one only when you make one.
+        let _ = session.execute("file.new", &json!({"local": true}));
     }
     // The interface language from the first frame on, and for the message when the window can't
     // open (no frame then).

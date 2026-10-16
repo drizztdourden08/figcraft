@@ -1001,30 +1001,31 @@ impl FigApp {
     /// computer before is written again; a new file goes on the server for new files when there
     /// is one you are signed in to; else Save locally asks where.
     pub fn save(&mut self) {
-        // A branch tab saves its main file.
-        let tab = figcraft_engine::branches::file_tab(&self.session);
-        let on_server = self.session.live().account_file().is_some();
-        let has_path = self.session.docs.get(tab).is_some_and(|d| d.path.is_some());
-        let to_default = self.session.live().status == figcraft_engine::live::Status::Off
-            && self.session.default_server().is_some_and(|s| self.session.signed_in(&s).is_some());
-        if !(on_server || has_path || to_default) {
-            return self.save_as_dialog();
+        // The engine decides: a file on a server is kept there, a new one goes on the server for
+        // new files, a saved one is written again; one that needs a path asks for it (Save
+        // locally's dialog, through its UI request).
+        let r = self.session.execute("file.save", &json!({}));
+        self.handle_ui_requests();
+        let v = match r {
+            Ok(v) => v,
+            Err(figcraft_engine::EngineError::Disabled(..)) => return,
+            Err(e) => return self.failed("file.save", &e),
+        };
+        if v["where"] != "server" {
+            return self.toast(i18n::tr("Saved"));
         }
-        let Some(v) = self.run("file.save", json!({})) else { return };
-        match v["server"].as_str() {
-            Some(server) => {
-                let name = account_ui::server_name(self, server);
-                let said = if v["publishing"] == true {
-                    i18n::trf("Putting it on {server}…", &[("server", &name)])
-                } else if v["synced"] == true {
-                    i18n::trf("Saved to {server}", &[("server", &name)])
-                } else {
-                    i18n::trf("Not on {server} yet: it is saved there once the connection is back", &[("server", &name)])
-                };
-                self.toast(said);
-            }
-            None => self.toast(i18n::tr("Saved")),
-        }
+        let name = v["serverName"].as_str().map_or_else(|| account_ui::server_name(self, v["server"].as_str().unwrap_or_default()), str::to_string);
+        let live = self.session.live().status == figcraft_engine::live::Status::Live;
+        let said = if v["publishing"] == true {
+            i18n::trf("Putting it on {server}…", &[("server", &name)])
+        } else if v["synced"] == true {
+            i18n::trf("Saved to {server}", &[("server", &name)])
+        } else if live {
+            i18n::trf("Saving to {server}…", &[("server", &name)])
+        } else {
+            i18n::trf("Not on {server} yet: it is saved there once the connection is back", &[("server", &name)])
+        };
+        self.toast(said);
     }
 
     pub fn open_dialog(&mut self) {
