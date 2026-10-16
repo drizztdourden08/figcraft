@@ -14,6 +14,7 @@ use figcraft_engine::live::{Event, Role, SessionInfo, Status};
 use crate::inbox::Inbox;
 use crate::invite::Invite;
 use crate::limits::NetLimits;
+use crate::sealing::SealingKeys;
 
 /// What the host tells everyone when it stops (the WebSocket close reason).
 pub const ENDED: &str = "The host ended the session";
@@ -49,6 +50,9 @@ pub struct GuestConfig {
     /// Your session token on this server (signed in there): sent before each hello, so the server
     /// knows who you are (a server with accounts lets members in by it).
     pub session: Option<String>,
+    /// A sealed file's signing key and editors (see [`SealingKeys`]; empty: unsigned batches,
+    /// signatures checked only for integrity).
+    pub sealing: SealingKeys,
 }
 
 impl GuestConfig {
@@ -64,6 +68,7 @@ impl GuestConfig {
             attempts: 12,
             resume: None,
             session: None,
+            sealing: SealingKeys::default(),
         }
     }
 
@@ -181,7 +186,7 @@ pub(crate) fn outgoing(cfg: &GuestConfig, resume: &Resuming, msg: ClientMsg) -> 
         return Ok(Some(msg));
     }
     let me = resume.lock().ok().and_then(|r| r.map(|r| r.client_id));
-    crate::sealing::outgoing(&cfg.invite, me, msg)
+    crate::sealing::outgoing(&cfg.invite, &cfg.sealing, me, msg)
 }
 
 /// What a connection knows of the session (to tell the UI who's here).
@@ -205,7 +210,7 @@ pub(crate) enum Taken {
 /// in answer must go out on this connection.
 pub(crate) fn take(m: ServerMsg, cfg: &GuestConfig, inbox: &Inbox, seen: &mut Seen, resume: &Resuming, welcomed: &dyn Fn()) -> Taken {
     // A sealed file's messages, opened (or what can't be).
-    let m = match crate::sealing::incoming(&cfg.invite, m) {
+    let m = match crate::sealing::incoming(&cfg.invite, &cfg.sealing, m) {
         Ok(Some(m)) => m,
         Ok(None) => return Taken::Continue,
         Err(why) => return Taken::End(Outcome::Failed(why)),

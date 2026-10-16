@@ -325,6 +325,50 @@ pub enum SealedChange {
     Remove {
         entry: SealedEntry,
     },
+    /// The author device's signature of the batch it ends (appended in step 10, after every other
+    /// change: a batch has at most one, last). Changes nothing in the file: the server checks only
+    /// where it is and passes it on with the batch (live, in catch-ups and in its log), and the
+    /// apps check it (`figcraft_collab_seal::verify_batch`). Never in a snapshot.
+    Signature(BatchSignature),
+}
+
+/// An editor device's Ed25519 signature of one sealed batch, made by
+/// `figcraft_collab_seal::sign_batch` over `"figcraft batch v1" ‖ file id (u32 LE length ‖
+/// UTF-8) ‖ epoch (u32 LE) ‖ base_seq (u64 LE) ‖ batch_id (u64 LE) ‖ device (32) ‖ the batch's
+/// other changes (postcard)`. The server holds neither the file key nor a list of the editors'
+/// devices it could trust (it may be the one forging): whether `device` may edit is for the apps
+/// to say.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BatchSignature {
+    /// The signing device's Ed25519 public key (what an editors' list knows it by).
+    #[serde(with = "bin")]
+    pub device: [u8; 32],
+    /// The file key epoch the batch was sealed with.
+    pub epoch: u32,
+    /// The server state the batch was made on (as its `SealedChanges` said).
+    pub base_seq: u64,
+    #[serde(with = "bin")]
+    pub signature: [u8; 64],
+}
+
+impl std::fmt::Debug for BatchSignature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let device: String = self.device.iter().take(4).map(|b| format!("{b:02x}")).collect();
+        write!(f, "BatchSignature(device {device}…, epoch {}, base {})", self.epoch, self.base_seq)
+    }
+}
+
+/// A batch's changes and its [`SealedChange::Signature`], when it ends with one. `Err`: a
+/// signature that isn't last, or more than one (no honest app makes that).
+pub fn split_signature(changes: &[SealedChange]) -> Result<(&[SealedChange], Option<&BatchSignature>), Error> {
+    let (body, sig) = match changes.split_last() {
+        Some((SealedChange::Signature(s), body)) => (body, Some(s)),
+        _ => (changes, None),
+    };
+    if body.iter().any(|c| matches!(c, SealedChange::Signature(_))) {
+        return Err(Error::Invalid("a batch's signature must be its last change, and only one".into()));
+    }
+    Ok((body, sig))
 }
 
 impl SealedChange {
@@ -336,6 +380,7 @@ impl SealedChange {
             | SealedChange::SetKind { id, .. }
             | SealedChange::SetTree { id, .. }
             | SealedChange::Delete { id } => Some(*id),
+            SealedChange::Signature(_) => None,
             _ => None,
         }
     }
@@ -353,6 +398,7 @@ impl SealedChange {
             SealedChange::Delete { .. } => 16,
             SealedChange::Put { entry: e, value } => entry(e).saturating_add(value.len()),
             SealedChange::Remove { entry: e } => entry(e),
+            SealedChange::Signature(_) => 128,
         }
     }
 }

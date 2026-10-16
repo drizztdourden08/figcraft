@@ -38,6 +38,10 @@ pub enum Notice {
     Rejected { batch_id: u64, kind: BatchKind, reason: String },
     /// The session restarted while this client was away: its unconfirmed batches are gone.
     Lost { batches: usize },
+    /// A sealed file's batch (sequence number `seq`, from client `author`) broke the sealed value
+    /// rules ([`crate::rules`]): `defaulted` values took their defaults and `skipped` changes
+    /// couldn't apply, the same in every app.
+    Checked { seq: u64, author: u32, skipped: usize, defaulted: usize },
 }
 
 impl Notice {
@@ -49,6 +53,10 @@ impl Notice {
             Notice::Rejected { reason, .. } => format!("Your change couldn't be applied: {reason}"),
             Notice::Lost { batches } => {
                 format!("The live session restarted: {batches} unsent change{} couldn't be kept", if *batches == 1 { "" } else { "s" })
+            }
+            Notice::Checked { skipped, defaulted, .. } => {
+                let n = skipped + defaulted;
+                format!("A change to this encrypted file had {n} invalid value{} (left out the same way for everyone)", if n == 1 { "" } else { "s" })
             }
         }
     }

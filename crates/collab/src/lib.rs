@@ -32,6 +32,7 @@ pub mod merge;
 pub mod message;
 mod opaque;
 pub mod replica;
+pub mod rules;
 pub mod sealed;
 pub mod server;
 pub mod sim;
@@ -154,6 +155,8 @@ mod opaque_tests;
 mod owned_tests;
 #[cfg(test)]
 mod reconnect_tests;
+#[cfg(test)]
+mod rules_tests;
 #[cfg(test)]
 mod server_tests;
 #[cfg(test)]

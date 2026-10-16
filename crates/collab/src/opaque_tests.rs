@@ -5,8 +5,11 @@ use figcraft_doc::NodeId;
 
 use crate::change::{DocProp, Json, Prop};
 use crate::message::{CatchUpOf, ClientMsg, Hello, PROTOCOL, ServerMsg, Signal};
-use crate::sealed::{EntryKey, Sealed, SealedChange, SealedEntry};
-use crate::server::{NEEDS_SEALED, PLAIN_FILE, SEALED_FILE};
+use crate::message::{client_version, sealed_rules};
+use crate::rules::SEALED_RULES;
+use crate::sealed::{BatchSignature, EntryKey, Sealed, SealedChange, SealedEntry};
+use crate::server::{NEEDS_SEALED, OTHER_RULES, PLAIN_FILE, SEALED_FILE};
+use crate::sim::Rng;
 use crate::{Change, Limits, OpaqueReplica, OpaqueServer, Outgoing, Synced};
 
 /// A stand-in for a sealed value (the server only checks its shape): `n` marks it.
@@ -33,7 +36,7 @@ fn hello(sealed: bool) -> Hello {
         token: String::new(),
         name: "Ada".into(),
         color: "#FF8800".into(),
-        client_version: if sealed { "1 signals sealed".into() } else { "1 signals".into() },
+        client_version: if sealed { "1 signals sealed rules1".into() } else { "1 signals".into() },
         resume: None,
     }
 }
@@ -264,4 +267,134 @@ fn sealed_file_names_round_trip_as_text() {
     assert_eq!(crate::sealed::parse_sealed_name(&text), Some(n));
     assert_eq!(crate::sealed::parse_sealed_name("Plain name"), None);
     assert_eq!(crate::sealed::parse_sealed_name("sealed:not base64!"), None);
+}
+
+#[test]
+fn a_sealed_file_takes_only_clients_with_its_value_rules() {
+    let mut s = server();
+    for version in ["1 signals sealed", "1 signals sealed rules0", "1 signals sealed rules2", "1 signals sealed rulesx"] {
+        let h = Hello { client_version: version.into(), ..hello(true) };
+        assert_eq!(s.join(h).unwrap_err(), ServerMsg::Refused { reason: OTHER_RULES.into() }, "{version}");
+    }
+    assert!(s.join(hello(true)).is_ok());
+    // This build announces its rules; a plain file doesn't care.
+    assert_eq!(sealed_rules(&client_version()), Some(SEALED_RULES));
+    assert_eq!(sealed_rules("0.5.0 signals hosting sealed"), None);
+}
+
+fn signature(n: u8) -> SealedChange {
+    SealedChange::Signature(BatchSignature { device: [n; 32], epoch: 1, base_seq: 0, signature: [n; 64] })
+}
+
+#[test]
+fn a_batch_signature_is_last_and_passed_on_but_never_kept_in_the_file() {
+    let mut s = server();
+    let c = join(&mut s);
+    let rect = id(c, 1);
+    // Last, once: taken and passed on as it came (the apps check it).
+    let batch = vec![create(rect, "rectangle", Some(FRAME), "a1"), signature(1)];
+    let out = s.receive(c, ClientMsg::SealedChanges { base_seq: 0, batch_id: 1, changes: batch.clone() });
+    let Some(Outgoing::All(ServerMsg::SealedChanges(acc))) = out.into_iter().next() else { panic!("not accepted") };
+    assert_eq!(acc.changes, batch);
+    // Anywhere else, or twice: refused.
+    let mut next = 9;
+    for bad in [vec![signature(2), tree(rect, Prop::Position, "a2")], vec![tree(rect, Prop::Position, "a2"), signature(2), signature(3)]] {
+        let r = send(&mut s, c, next, bad);
+        next += 1;
+        assert!(r.as_ref().is_err_and(|e| e.contains("signature")), "{r:?}");
+    }
+    // A batch of a signature only changes nothing (and is fine).
+    assert!(send(&mut s, c, next, vec![signature(4)]).is_ok());
+    // In the log (a reconnecting client's catch-up) as sent; never in a snapshot or a fix.
+    let state = s.state().unwrap();
+    assert!(state.log.iter().any(|a| a.changes == batch));
+    assert!(!state.snapshot.iter().any(|c| matches!(c, SealedChange::Signature(_))));
+    assert!(s.synced().fixes(&batch).iter().all(|c| !matches!(c, SealedChange::Signature(_))));
+    let restored = OpaqueServer::restore(state, "", Limits::default()).unwrap();
+    assert_eq!(restored.synced().snapshot(), s.synced().snapshot());
+}
+
+/// A random sealed change over the ids around: any shape the wire can carry.
+fn random_sealed(rng: &mut Rng, ids: &[NodeId]) -> SealedChange {
+    let tags = ["page", "frame", "rectangle", "text", "group", "blob", ""];
+    let id = rng.pick(ids).copied().unwrap_or(NodeId(rng.next_u64()));
+    let prop = *rng.pick(Prop::FIELDS).unwrap_or(&Prop::Name);
+    let tree_prop = *rng.pick(&[Prop::Parent, Prop::Position, Prop::Name]).unwrap_or(&Prop::Parent);
+    let parent = if rng.chance(0.2) { None } else { rng.pick(ids).copied() };
+    let positions = ["a0", "a1", "Zz", "", "a0V", "!!"];
+    let position = rng.pick(&positions).copied().unwrap_or("a0").to_string();
+    let entry = |rng: &mut Rng| match rng.below(4) {
+        0 => SealedEntry { key: EntryKey::Style(format!("s{}", rng.below(3))), name: rng.chance(0.8).then(|| blob(1)) },
+        1 => SealedEntry { key: EntryKey::Comment((rng.next_u64() % 4) | (u64::from(rng.next_u64() as u32 % 3) << 32)), name: None },
+        2 => SealedEntry { key: EntryKey::Image("i".into()), name: Some(blob(2)) },
+        _ => SealedEntry { key: EntryKey::DevSnapshot(id), name: rng.chance(0.2).then(|| blob(3)) },
+    };
+    let tag = rng.pick(&tags).copied().unwrap_or("frame").to_string();
+    let doc_props = [DocProp::Name, DocProp::Styles, DocProp::StyleOrder, DocProp::Comments, DocProp::VariableOrder];
+    match rng.below(10) {
+        0 | 1 => SealedChange::Create {
+            id: NodeId((rng.next_u64() % 8) | ((rng.next_u64() % 3) << 32)),
+            kind_tag: tag,
+            kind: blob(1),
+            parent,
+            position,
+            props: vec![(prop, blob(2))],
+        },
+        2 => SealedChange::Set { id, prop, value: blob(3) },
+        3 => SealedChange::SetKind { id, kind_tag: tag, value: blob(4) },
+        4 => {
+            let value = match tree_prop {
+                Prop::Parent => Json::of(&parent).unwrap(),
+                _ => Json::of(&position).unwrap(),
+            };
+            SealedChange::SetTree { id, prop: tree_prop, value }
+        }
+        5 => SealedChange::Delete { id },
+        6 => SealedChange::SetDoc { prop: *rng.pick(&doc_props).unwrap_or(&DocProp::Name), value: blob(5) },
+        7 => SealedChange::Put { entry: entry(rng), value: blob(6) },
+        8 => SealedChange::Remove { entry: entry(rng) },
+        _ => signature(rng.below(255) as u8),
+    }
+}
+
+#[test]
+fn random_sealed_batches_never_panic_the_server() {
+    let mut rng = Rng::new(7);
+    for round in 0..300 {
+        let mut s = OpaqueServer::with_state(OpaqueReplica::from_snapshot(&base()).unwrap(), "", Limits { max_nodes: 40, ..Limits::default() });
+        let clients: Vec<u32> = (0..3).map(|_| join(&mut s)).collect();
+        for b in 0..40u64 {
+            let mut ids: Vec<NodeId> = vec![PAGE, FRAME, NodeId(99)];
+            ids.extend((0..8).map(|n| id(clients[0], n)));
+            let batch: Vec<SealedChange> = (0..1 + rng.below(6)).map(|_| random_sealed(&mut rng, &ids)).collect();
+            let from = clients[rng.below(clients.len())];
+            let base_seq = if rng.chance(0.1) { rng.next_u64() } else { s.seq() };
+            let _ = s.receive(from, ClientMsg::SealedChanges { base_seq, batch_id: b + 1, changes: batch });
+        }
+        // Whatever it took, its state still snapshots, restores and rebuilds the same.
+        let snap = s.synced().snapshot();
+        let rebuilt = OpaqueReplica::from_snapshot(&snap).unwrap_or_else(|e| panic!("round {round}: {e}"));
+        assert_eq!(rebuilt.snapshot(), snap, "round {round}");
+        assert!(OpaqueServer::restore(s.state().unwrap(), "", Limits::default()).is_ok(), "round {round}");
+    }
+}
+
+#[test]
+fn a_node_whose_kind_changed_is_snapshot_with_the_kind_it_was_made_with() {
+    let mut r = OpaqueReplica::from_snapshot(&base()).unwrap();
+    let rect = NodeId(3);
+    r.apply(&[create(rect, "rectangle", Some(FRAME), "a1")]).unwrap();
+    r.apply(&[SealedChange::SetKind { id: rect, kind_tag: "frame".into(), value: blob(7) }]).unwrap();
+    r.apply(&[create(NodeId(4), "rectangle", Some(rect), "a0")]).unwrap();
+    r.apply(&[SealedChange::SetKind { id: rect, kind_tag: "group".into(), value: blob(8) }]).unwrap();
+    let snap = r.snapshot();
+    // Made a rectangle (its properties start from a rectangle's defaults in every app), then the
+    // group it is now, before its layers.
+    let at = snap.iter().position(|c| matches!(c, SealedChange::Create { id, .. } if *id == rect)).unwrap();
+    assert!(matches!(&snap[at], SealedChange::Create { kind_tag, kind, .. } if kind_tag == "rectangle" && *kind == blob(1)));
+    assert_eq!(snap[at + 1], SealedChange::SetKind { id: rect, kind_tag: "group".into(), value: blob(8) });
+    assert!(matches!(&snap[at + 2], SealedChange::Create { id, .. } if *id == NodeId(4)));
+    let again = OpaqueReplica::from_snapshot(&snap).unwrap();
+    assert_eq!(again.snapshot(), snap);
+    assert_eq!(again.kind_tag(rect), Some("group"));
 }

@@ -18,7 +18,14 @@ opens around the sync client, and the publisher's app keeps the key with its pre
 is built**: sealed files with accounts (see *Sealed files with accounts*): device keys in the OS
 keychain, devices registered per account, each sealed file's key wrapped to every member device in
 the server's `keyring.json`, members and your other devices joining with links that carry no key,
-new epochs when someone is taken out or a device revoked, and recovery keys. Sections say what is built as the implementation lands. Builds on [`collab-protocol.md`](collab-protocol.md)
+new epochs when someone is taken out or a device revoked, and recovery keys. **Step 10 is built**
+(hardening, see *Same checks everywhere*, *Editor signatures*, *Safety numbers* and *Edges*): every
+app checks a sealed file's values with the same versioned rules and resets what breaks them
+instead of failing the session, the server refuses apps with other rules, batches can carry their
+device's signature and apps check it against the editors they know (`EditorKeys`; the app doesn't
+sign or require signatures yet), `account.safetyNumber`, sealed team libraries, and agents joining
+sealed files by link. Sections say what is built as the implementation lands. Builds on
+[`collab-protocol.md`](collab-protocol.md)
 (live sessions) and [`server.md`](server.md) (running `figcraft-server`).
 
 Goal: a `figcraft-server` can (1) let people in by **who they are** instead of only by share links,
@@ -246,22 +253,138 @@ someone removed from a file can still compute the ids of names they guess, never
   design. The copy is `nonce (24) ‖ ciphertext ‖ tag`, XChaCha20-Poly1305 with
   HKDF(recovery key, `"figcraft recovery"`) and associated data `"figcraft recovery v1" ‖ context`.
 
-### Same checks everywhere
+### Same checks everywhere (built, step 10)
 
 The server can't check values on a sealed file, so every app checks every batch it opens with the
-same rules (`Replica::apply` in a lenient mode): a change that doesn't decrypt or breaks a value
-rule is skipped, identically on every app, so all copies stay the same even if a buggy or hostile
-editor sends garbage. The rule set is versioned with the protocol; apps with another version are
-refused at join.
+same rules, and all copies stay the same even if a buggy or hostile editor sends garbage. The
+rules are `figcraft_collab::rules` (`Replica::apply` in `Mode::Sealed`, which the sync client uses
+when it joined with `Client::join_sealed`; the engine does for every session whose link carries a
+key). **Rules version 1** (`rules1`), one change at a time, in batch order:
+
+1. A node property that doesn't read as its type, or breaks a value rule (the ones a plain file's
+   server checks: width and height finite, 0 to 10⁹; transform coefficients finite, within ±10⁹;
+   opacity finite, 0 to 1), takes **a new rectangle's value**, whatever the node's kind (opacity 1,
+   size 0, no transform, a rectangle's fills…).
+2. A node kind that doesn't read becomes the plain kind of its type name (a polygon of 3 sides, an
+   empty text, a union…; the type name was already checked against the plain tag the server saw).
+3. A document property that doesn't read takes a new document's value; an entry (style, variable,
+   comment, image…) whose value doesn't read is removed.
+4. Anything else that can't apply (a node that doesn't exist or already does, a layer inside one
+   that can't hold layers, a page with a parent, a bad position key…) is skipped. The server
+   already refuses those batches by their visible structure.
+
+Nothing fails the session; a batch is no longer all-or-nothing. The sync client counts what it
+reset or skipped and says so (`Notice::Checked`: how many values, never which or what).
+
+**Why reset, not skip.** The draft said a bad change would be skipped (the old value kept). That
+can't keep copies the same: the server keeps only the latest sealed value of each property, so an
+app that joins later (from the server's snapshot) sees the bad value without the history and has
+no old value to keep. Resetting to a fixed value gives the same result either way, and the
+fallback is a rectangle's rather than the node's own kind's because a kind can change after a bad
+value was written (a later joiner sees the value with the current kind). For the same reason the
+sealed server's snapshot now creates a node whose kind changed with the kind it was created with,
+then sets the current one (`OpaqueReplica`): a new node's unwritten properties start from its
+kind's defaults, and a late joiner must start from the same ones as the apps that saw it created
+(this was a step 7 bug that an honest kind change, such as flattening a rectangle, could hit). The
+property test `every_app_comes_to_the_same_document_whatever_a_hostile_editor_sends`
+(`crates/collab-seal`) checks byte-identical documents across apps that saw every batch and one
+that joins at the end, with hostile values in a third of the batches.
+
+**Known difference.** An entry whose value doesn't read is removed; if it is put again later it
+goes to the end of its list in the apps that saw it removed, where an app that joins later finds it
+where it first was: the same entries, in another order, until the list's order is next set.
+
+**Versioned.** Apps announce their rules version in `Hello::client_version` (the word `rules1`,
+`message::sealed_rules`); a sealed file refuses a hello without the server's version
+(`server::OTHER_RULES`: "this FigCraft checks them differently (update FigCraft…)"), so apps from
+before step 10 (which fail the session on a bad value instead) and apps with later rules can't
+share a file with different results. Plain files don't look at the word. Changing the rules means
+a new `SEALED_RULES` and, as with the protocol, updating servers and apps together.
+
+### Editor signatures (built, step 10; the app doesn't sign or require them yet)
+
+Viewers hold the file key too, so a viewer working with a compromised server could seal changes
+and have the server pass them on as an editor's. Editors therefore sign their batches:
+
+- **Signing.** With a device key (`GuestConfig::sealing.signer`), the sealing layer appends the
+  device's Ed25519 signature to every batch it sends: `SealedChange::Signature(BatchSignature
+  {device, epoch, base_seq, signature})`, the last change of the batch (appended to the
+  `SealedChange` enum, so nothing before it moved), over `"figcraft batch v1" ‖ file id (u32 LE
+  length ‖ UTF-8) ‖ epoch (u32 LE) ‖ base_seq (u64 LE) ‖ batch_id (u64 LE) ‖ device (32) ‖ the
+  batch's other changes (postcard)` (`figcraft_collab_seal::sign_batch`, `batch_message`). Being a
+  change of the batch, it travels everywhere the batch does: live, in a reconnect's catch-up, in
+  the server's log and journal. The server checks only that it is last and alone, and never keeps
+  it in the file (it isn't in snapshots or fixes).
+- **Checking.** Every batch that arrives is checked before it opens (`check_batch` against
+  `GuestConfig::sealing.editors`, an `EditorKeys`): a signature that doesn't hold (changed bytes,
+  another file or batch), an unsigned batch where editors must sign (`EditorKeys::required`), or a
+  device that isn't an editor's **ends the session** with the reason. Ending rather than skipping:
+  two apps' lists of editors can differ for a moment (a device added a second ago), and skipping on
+  one and not the other would leave their copies different.
+- **What is enforced today, and what plugs in.** `EditorKeys` is the interface: `is_editor(device)`
+  and `required()`. Built: `AnyEditor` (the default: no list, as on links-mode files where whoever
+  holds an edit link edits: signatures that are there must hold, unsigned batches are taken) and
+  `KnownEditors` (a fixed list, `required`: what the tests use). The app passes neither a signer nor
+  a list yet (`GuestConfig::sealing` is empty), so it sends unsigned batches, takes unsigned ones,
+  and **nothing is enforced against a viewer today**. What's left to wire: the step 9 device key as
+  `signer` (the engine holds it in `KeyState`; the transport needs it handed over with the join,
+  where `NetLink` builds a join's config), and the editors' list, which needs the server to list
+  the devices of a file's owners and editors (a new `AccountReq`; today `Devices` lists only your
+  own and `PendingKeys` only devices missing a key). Requiring signatures (`required`) should wait
+  until every app in a file signs.
+- **Servers.** Only a server from step 10 on reads a batch that ends with a signature (older ones,
+  step 9's included, can't decode the change and drop the connection); those servers also refuse
+  apps without `rules1`. Wiring the signer therefore wants servers updated first.
+
+### Safety numbers (built, step 10)
+
+`figcraft_collab_seal::safety_number(&[DevicePublic])`: 12 decimal digits in three groups of four
+(`3271 4339 5047`), from SHA-256 of `"figcraft safety number v1"`, the number of keys (u32 LE)
+and each device's public keys (agreement ‖ signing), sorted, duplicates once. Two people compare
+the number for one person's devices out of band (in person, on a call): if a server slipped in a
+device of its own, the numbers differ.
+
+`account.safetyNumber {server?}` → `{server, safetyNumber, devices}`: the number of the devices the
+server lists for you (`AccountReq::Devices`, the recovery device included), the same on each of
+your devices. **Not built**: another person's number (`account?`, refused for now: the server
+doesn't list someone else's devices) and key-change warnings (a member's devices changed since you
+last saw them), which both need that listing.
+
+### Edges (built, step 10)
+
+- **Sealed team libraries.** `library.publishToServer` and `library.add` / updates of a sealed
+  file go through the link's key (`#k=`): the archive is sealed for `Slot::Meta { what: "library"
+  }` on its way to the server and opened on its way back (`sealing::library_out`, `library_in`, in
+  `manage::library`); the server keeps the sealed bytes as they come (step 7), and an archive that
+  doesn't open, or comes unencrypted for a link with a key, is refused (`LIBRARY_WONT_OPEN`).
+- **Agents and the command line.** The MCP server (`crates/mcp`, what `figcraft-cli mcp` runs)
+  joins with the engine's own transport, so `collab.join {link}` with a sealed link (`#k=` and all)
+  works there as in the app: `sealed_team_libraries_and_agents_work_by_the_link`
+  (`apps/figcraft-server`) has an agent join, read and edit a sealed file. `figcraft-cli`'s other
+  subcommands don't join sessions.
 
 ### What sealing doesn't protect against
 
-- A hostile server can drop, delay or roll back edits, refuse service, or hand out a fake device
-  key when someone is added (key-change warnings and safety numbers come in the hardening step).
-- A viewer working with a compromised server could forge edits until editors sign their batches
-  (hardening step), because viewers hold the file key.
+- A hostile server can drop, delay, reorder or roll back edits, replay an editor's signed batch
+  later, refuse service, or hand out a fake device key when someone is added (or add one to your
+  account). Safety numbers let people catch that by comparing out of band, but only for your own
+  devices so far (`account.safetyNumber`); nobody is warned when a key changes.
+- **Forged edits.** Viewers hold the file key, so a viewer working with a compromised server can
+  seal changes. Editor signatures stop forged *batches* (live and in catch-ups) once apps sign and
+  check against the editors' devices, which isn't wired yet (see *Editor signatures*): **today
+  apps take unsigned batches and nothing stops such a viewer.** Even then, **a snapshot isn't signed**: an app that
+  joins (or rejoins after a long time away) opens the server's merged copy, and a compromised
+  server working with a viewer can put forged values there. Signing each sealed value instead of
+  each batch would close that; it isn't built.
+- A hostile **editor** (who may edit anyway) can write anything the file can hold; the value rules
+  only keep every copy the same and within what the plain server would take, and entries they
+  break can end up in another order between apps (see *Same checks everywhere*). An editor (or a
+  server) can also end everyone's session with a batch whose signature doesn't hold, once
+  signatures are required.
 - Anyone holding a sealed share link can read the file (that's what the link is); owners can turn
-  links off per file.
+  links off per file. A view link's holder can't edit through an honest server, but holds the key.
+- What the server sees on a sealed file (*What the server keeps doing*): the tree, kind tags,
+  which properties change and when, sizes, who is connected.
 - Compromised devices; the local-network sessions an app hosts (unchanged, a trusted network).
 
 ## Protocol additions
@@ -278,6 +401,7 @@ keep talking to each other on everything they knew.
 | C → S | `OpenAccount` then `Account(AccountReq)` | Files, publish, members, invites, devices, keyrings, recovery (step 9: see *Sealed files with accounts*) |
 | S → C | `Account(AccountReply)` | |
 | C ↔ S | `SealedChanges`, `SealedWelcome`, `SealedReject`, `SealedPresence`, `SealedSignal` | The sealed counterparts of the session messages |
+| C ↔ S | `SealedChange::Signature` (the last change of a sealed batch) | An editor device's signature of the batch (step 10) |
 | C → S | `Admin::PublishSealed`, `AccountReq::PublishSealed`, `…::RenameSealed` | Publish or rename a sealed file |
 
 ### Sealed sessions (built, step 7)
@@ -385,9 +509,9 @@ that saw every batch. `Reject` fixes are the current sealed values of what the b
   key the name is "Encrypted file". `collab.manageFile {action: "rename"}` seals the new name
   (`RenameSealed`); `createLink` adds the key to the new link. `collab.peers` says `sealed: true`
   for a sealed session.
-- **Left for later.** A hostile editor's value that opens but breaks a value rule still fails the
-  sync client's strict check (the lenient value checks are part of hardening, step 10), as do
-  sealed team libraries. (Keys for members and your other devices: step 9, below.)
+- **Left for later.** (Keys for members and your other devices: step 9, below. A hostile editor's
+  value that breaks a value rule no longer fails the session, and sealed team libraries work: step
+  10.)
 
 ### Sealed files with accounts (built, step 9)
 
@@ -472,8 +596,8 @@ not another.
 holds ends that session (`NEW_EPOCH`, "This file's key changed…: getting the new key") instead of
 being skipped (an app skipping what everyone else opens would drift apart); the app fetches the
 keyring and joins again by itself. If the server has no such epoch, the change was damaged (a
-hostile editor): the session stays failed with `NO_SUCH_EPOCH` until hardening (signed batches,
-step 10). Someone taken out is disconnected by the server and can't join again; the keys they kept
+hostile editor): the session stays failed with `NO_SUCH_EPOCH` (signed batches, step 10, tell such
+an editor apart once the app requires signatures). Someone taken out is disconnected by the server and can't join again; the keys they kept
 open nothing written after.
 
 **Recovery.** `account.recoveryKey {server?, replace?}` makes a **recovery device**: keys of its
@@ -500,6 +624,7 @@ key).
 | `account.recoveryKey {server?, replace?}` | `{server, created: true, device, recoveryKey, wrapped}` or `{server, created: false, device, made}` |
 | `account.recover {server?, recoveryKey}` | `{server, device, recovered, files: [file]}` |
 | `account.syncKeys {server? \| all?}` | `{server, wrapped, rotated, refreshed, joined, errors}` (`all`: `{servers: […]}`) |
+| `account.safetyNumber {server?}` (step 10) | `{server, safetyNumber, devices}` |
 
 **What the UI should show.** In the account panel: your devices (`account.devices`, this one
 marked, the recovery device as "Recovery key"), each with Revoke; a warning when `keyStore` is
@@ -513,7 +638,7 @@ syncing (it is silent; its errors are logged).
 
 **Limits.** A revoked device's sessions aren't ended by the server (sessions are per person, not
 per device): sign it out too. A hostile server can still hand out a fake device key when someone
-is added (key-change warnings are hardening). Until a member's app has synced, the writes of
+is added (safety numbers, step 10, let people check; key-change warnings aren't built). Until a member's app has synced, the writes of
 members who haven't picked up a new epoch are sealed with the old one (readable by the person
 taken out, should they get the server's data).
 
@@ -550,5 +675,7 @@ members and keyrings and builds the providers from its config.
 8. **Built**: sealing in the app; sealed links.
 9. **Built**: sealed files with accounts: keyrings, invites, devices, recovery (device approval
    with a 6-digit comparison not yet).
-10. Edges (sealed team libraries, CLI and MCP) and hardening (editor signatures, key-change
-    warnings).
+10. **Built**: edges (sealed team libraries, CLI and MCP) and hardening (the same versioned value
+    rules in every app, editor signatures behind `EditorKeys`, safety numbers). Not yet: the app
+    signing its batches and requiring editors' signatures (it needs a way to list the editors'
+    devices, and every server to read signed batches), key-change warnings.

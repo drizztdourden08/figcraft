@@ -1224,7 +1224,10 @@ impl Session {
     /// shared, a guest opens the host's file as a new tab (or gets it again in that tab after a
     /// reconnect).
     fn live_welcome(&mut self, id: SessionId, welcome: ServerMsg) {
-        let client = match Client::join(welcome) {
+        // A sealed file's batches weren't checked by its server: every app checks them with the
+        // same rules (`figcraft_collab::rules`) instead of failing the session.
+        let sealed = self.live.sessions.get(&id).and_then(|l| l.info.as_ref()).is_some_and(|i| sealed_link(&i.link));
+        let client = match if sealed { Client::join_sealed(welcome) } else { Client::join(welcome) } {
             Ok(c) => c,
             Err(e) => return self.live_fail(id, format!("Couldn't open the shared file: {e}")),
         };

@@ -9,8 +9,10 @@ use crate::message::{
     PluginReply, PluginReq, Presence, Processed, ReportInfo, Resume, Role, ServerMsg, ServerStatus, Signal, Usage, WIRE_VERSION, decode, decode_json,
     encode, encode_json,
 };
+use crate::message::{AcceptedOf, CatchUpOf};
+use crate::sealed::{BatchSignature, EntryKey, MIN_PADDED, SEALED_HEADER, SEALED_TAG, Sealed, SealedChange, SealedEntry};
 use crate::sim::Rng;
-use crate::{Error, Replica, diff};
+use crate::{DocProp, Error, Replica, diff};
 
 /// A typical edit: one layer dragged (its transform).
 fn moved_layer() -> ClientMsg {
@@ -85,6 +87,9 @@ fn samples() -> (Vec<ClientMsg>, Vec<ServerMsg>) {
         ClientMsg::Admin(Admin::AddFileMember { file: "f".into(), email: "ann@example.com".into(), role: Role::Viewer }),
         ClientMsg::Admin(Admin::ServerStatus),
         ClientMsg::Report { reason: "Spam ☕".into() },
+        ClientMsg::SealedChanges { base_seq: 4, batch_id: 9, changes: sealed_changes() },
+        ClientMsg::SealedPresence(blob(7)),
+        ClientMsg::SealedSignal(blob(8)),
     ];
     let snapshot = Replica::new(Document::new("Snap")).snapshot().unwrap();
     let file = FileInfo { id: "f".into(), name: "Café".into(), created: 1, updated: 2, seq: 3, bytes: 4, people: 5 };
@@ -211,8 +216,59 @@ fn samples() -> (Vec<ClientMsg>, Vec<ServerMsg>) {
             files: 3,
             free_bytes: Some(4),
         }))),
+        ServerMsg::SealedWelcome {
+            session: 77,
+            client_id: 4,
+            seq: 10,
+            catch_up: CatchUpOf::Snapshot(sealed_changes()),
+            processed: Processed::default(),
+            peers: vec![],
+            access: Access::Edit,
+        },
+        ServerMsg::SealedWelcome {
+            session: 77,
+            client_id: 4,
+            seq: 12,
+            catch_up: CatchUpOf::Delta(vec![AcceptedOf { seq: 12, author: 5, batch_id: 1, changes: sealed_changes() }]),
+            processed: Processed::default(),
+            peers: vec![],
+            access: Access::View,
+        },
+        ServerMsg::SealedChanges(AcceptedOf { seq: 13, author: 5, batch_id: 2, changes: sealed_changes() }),
+        ServerMsg::SealedReject { batch_id: 3, reason: "no".into(), fixes: sealed_changes() },
+        ServerMsg::SealedPresence { client_id: 5, blob: blob(9) },
+        ServerMsg::SealedSignal { client_id: 5, blob: blob(10) },
     ];
     (client, server)
+}
+
+/// A stand-in sealed value (decoders check only its shape).
+fn blob(n: u8) -> Sealed {
+    Sealed::from_bytes(vec![n; SEALED_HEADER + MIN_PADDED + SEALED_TAG]).unwrap()
+}
+
+/// One of every sealed change, ending with a batch signature.
+fn sealed_changes() -> Vec<SealedChange> {
+    let style = SealedEntry { key: EntryKey::Style("aGFzaGVk".into()), name: Some(blob(3)) };
+    vec![
+        SealedChange::Create {
+            id: NodeId(2),
+            kind_tag: "frame".into(),
+            kind: blob(1),
+            parent: Some(NodeId(1)),
+            position: "a0".into(),
+            props: vec![(Prop::Name, blob(2))],
+        },
+        SealedChange::Set { id: NodeId(2), prop: Prop::Opacity, value: blob(4) },
+        SealedChange::SetKind { id: NodeId(2), kind_tag: "group".into(), value: blob(5) },
+        SealedChange::SetTree { id: NodeId(2), prop: Prop::Position, value: Json::of("a1").unwrap() },
+        SealedChange::Delete { id: NodeId(3) },
+        SealedChange::SetDoc { prop: DocProp::Name, value: blob(6) },
+        SealedChange::Put { entry: style.clone(), value: blob(7) },
+        SealedChange::Remove { entry: SealedEntry { key: EntryKey::Comment(5), name: None } },
+        SealedChange::Remove { entry: style },
+        SealedChange::Signature(BatchSignature { device: [7; 32], epoch: 1, base_seq: 4, signature: [9; 64] }),
+    ]
 }
 
 #[test]

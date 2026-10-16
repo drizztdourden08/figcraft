@@ -7,7 +7,7 @@ use figcraft_doc::{Document, Node, NodeId, NodeKind};
 
 use crate::change::{Change, Json, Prop, Target};
 use crate::frac::{self, FIRST_KEY};
-use crate::{Error, docprops};
+use crate::{Error, docprops, rules};
 
 /// Fractional position keys by node.
 pub type Positions = imbl::OrdMap<NodeId, String>;
@@ -33,6 +33,11 @@ pub enum Mode {
     /// Skip changes that can't be applied (a client replaying its own unconfirmed edits on top of
     /// newer server state).
     Lenient,
+    /// A sealed file's batches, as every app applies them: each change on its own under the
+    /// value rules of [`crate::rules`] (version [`SEALED_RULES`](crate::rules::SEALED_RULES)): a
+    /// value that doesn't read or breaks a rule takes its default, a change that can't apply is
+    /// skipped; nothing fails. The same batches give the same document in every app.
+    Sealed,
 }
 
 /// What [`Replica::apply`] did.
@@ -42,8 +47,10 @@ pub struct Applied {
     pub touched: BTreeSet<NodeId>,
     /// Nodes deleted (subtrees included).
     pub deleted: Vec<NodeId>,
-    /// Changes skipped in [`Mode::Lenient`].
+    /// Changes skipped in [`Mode::Lenient`] and [`Mode::Sealed`].
     pub skipped: usize,
+    /// Values that didn't read or broke a value rule and took their default ([`Mode::Sealed`]).
+    pub defaulted: usize,
 }
 
 impl Replica {
@@ -72,8 +79,14 @@ impl Replica {
 
     /// Rebuild a replica from a [`snapshot`](Self::snapshot).
     pub fn from_snapshot(changes: &[Change]) -> Result<Replica, Error> {
+        Replica::from_snapshot_in(changes, Mode::Strict)
+    }
+
+    /// Rebuild a replica from a snapshot in `mode` (a sealed file's: [`Mode::Sealed`], the same
+    /// rules its batches are applied with). It must hold a page.
+    pub fn from_snapshot_in(changes: &[Change], mode: Mode) -> Result<Replica, Error> {
         let mut r = Replica { doc: Document::without_pages(""), positions: Positions::new() };
-        r.apply(changes, Mode::Strict)?;
+        r.apply(changes, mode)?;
         if r.doc.pages.is_empty() {
             return Err(Error::Invalid("a snapshot needs a page".into()));
         }
@@ -151,8 +164,9 @@ impl Replica {
         self.doc.take_dirty();
         let mut out = Applied::default();
         let (mut relist, mut relist_all) = (BTreeSet::new(), false);
+        let sealed = mode == Mode::Sealed;
         for c in changes {
-            match self.apply_one(c, &mut out) {
+            match self.apply_one(c, sealed, &mut out) {
                 Ok(Relist::No) => {}
                 Ok(Relist::Page(p)) => {
                     relist.insert(p);
@@ -172,21 +186,32 @@ impl Replica {
         Ok(out)
     }
 
-    /// Apply one change. Returns what of the page list needs rebuilding.
-    fn apply_one(&mut self, c: &Change, out: &mut Applied) -> Result<Relist, Error> {
+    /// Apply one change (`sealed`: under the rules of [`Mode::Sealed`]). Returns what of the page
+    /// list needs rebuilding.
+    fn apply_one(&mut self, c: &Change, sealed: bool, out: &mut Applied) -> Result<Relist, Error> {
         match c {
             Change::Create { id, kind, parent, position, props } => {
                 frac::validate(position).map_err(|e| Error::Invalid(e.to_string()))?;
                 if self.doc.contains(*id) {
                     return Err(Error::Invalid(format!("node {id} already exists")));
                 }
-                let kind: NodeKind = kind.read("kind")?;
+                let kind: NodeKind = if sealed {
+                    let (kind, defaulted) = rules::read_kind(kind)?;
+                    out.defaulted += usize::from(defaulted);
+                    kind
+                } else {
+                    kind.read("kind")?
+                };
                 let mut node = Node::new(*id, kind, "", 0.0, 0.0);
                 for (p, v) in props {
-                    if *p == Prop::Kind {
-                        return Err(Error::Invalid("a created node's kind is its own field".into()));
+                    if *p == Prop::Kind || (sealed && matches!(p, Prop::Parent | Prop::Position)) {
+                        return Err(Error::Invalid("a created node's kind and place are its own fields".into()));
                     }
-                    p.set(&mut node, v)?;
+                    if sealed {
+                        out.defaulted += usize::from(rules::set_checked(&mut node, *p, v));
+                    } else {
+                        p.set(&mut node, v)?;
+                    }
                 }
                 let is_page = node.is_page();
                 match (is_page, parent) {
@@ -194,7 +219,11 @@ impl Replica {
                         self.doc.insert_page(node).map_err(doc_err)?;
                     }
                     (false, Some(p)) => {
-                        let at = self.slot(&self.doc.get(*p).map_err(doc_err)?.children, *id, position);
+                        let host = self.doc.get(*p).map_err(doc_err)?;
+                        if sealed && !host.kind.is_container() {
+                            return Err(Error::Invalid(format!("{p} can't contain layers")));
+                        }
+                        let at = self.slot(&host.children, *id, position);
                         self.doc.insert(node, *p, Some(at)).map_err(doc_err)?;
                     }
                     _ => return Err(Error::Invalid("pages, and only pages, have no parent".into())),
@@ -208,7 +237,11 @@ impl Replica {
                 match (node.is_page(), parent) {
                     (true, None) => Ok(Relist::No),
                     (false, Some(p)) => {
-                        let at = self.slot(&self.doc.get(p).map_err(doc_err)?.children, *id, self.key(*id));
+                        let host = self.doc.get(p).map_err(doc_err)?;
+                        if sealed && !host.kind.is_container() {
+                            return Err(Error::Invalid(format!("{p} can't contain layers")));
+                        }
+                        let at = self.slot(&host.children, *id, self.key(*id));
                         self.doc.place(*id, p, at).map_err(doc_err)?;
                         Ok(Relist::No)
                     }
@@ -231,17 +264,30 @@ impl Replica {
                 }
             }
             Change::Set { id, prop: Prop::Kind, value } => {
-                let kind: NodeKind = value.read("kind")?;
+                let kind: NodeKind = if sealed {
+                    let (kind, defaulted) = rules::read_kind(value)?;
+                    out.defaulted += usize::from(defaulted);
+                    kind
+                } else {
+                    value.read("kind")?
+                };
                 let node = self.doc.get_mut(*id).map_err(doc_err)?;
                 if node.is_page() != matches!(kind, NodeKind::Page { .. }) {
                     return Err(Error::Invalid("a node can't become or stop being a page".into()));
+                }
+                if sealed && !node.children.is_empty() && !kind.is_container() {
+                    return Err(Error::Invalid(format!("{id} can't contain layers")));
                 }
                 node.kind = kind;
                 Ok(Relist::No)
             }
             Change::Set { id, prop, value } => {
                 let node = self.doc.get_mut(*id).map_err(doc_err)?;
-                prop.set(node, value)?;
+                if sealed {
+                    out.defaulted += usize::from(rules::set_checked(node, *prop, value));
+                } else {
+                    prop.set(node, value)?;
+                }
                 Ok(Relist::No)
             }
             Change::Delete { id } => {
@@ -256,7 +302,23 @@ impl Replica {
                 Ok(if page { Relist::Page(*id) } else { Relist::No })
             }
             Change::SetDoc { .. } | Change::Put { .. } | Change::Remove { .. } => {
-                Ok(if docprops::apply(&mut self.doc, c)? { Relist::All } else { Relist::No })
+                let relist = match docprops::apply(&mut self.doc, c) {
+                    Ok(r) => r,
+                    Err(e) if !sealed => return Err(e),
+                    // A new document's value, or no entry (rule 3 of `rules`).
+                    Err(e) => {
+                        let fallback = match c {
+                            Change::SetDoc { prop, .. } => {
+                                Change::SetDoc { prop: *prop, value: docprops::get(&Document::without_pages(""), *prop).map_err(|_| e)? }
+                            }
+                            Change::Put { entry, .. } => Change::Remove { entry: entry.clone() },
+                            _ => return Err(e),
+                        };
+                        out.defaulted += 1;
+                        docprops::apply(&mut self.doc, &fallback)?
+                    }
+                };
+                Ok(if relist { Relist::All } else { Relist::No })
             }
         }
     }

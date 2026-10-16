@@ -19,14 +19,45 @@
 //! sealed messages are dropped; with one, a plain welcome or plain changes end it (a server
 //! that hands out a sealed file's contents unencrypted isn't trusted with them), and plain
 //! presence and chat are dropped.
+//!
+//! **Editor signatures** (step 10, [`SealingKeys`]): with a device key, every batch sent ends with
+//! the device's signature ([`sign_batch`]); every batch that arrives (live or in a catch-up) has
+//! its signature checked against the editors this app knows ([`check_batch`]) before it opens. A
+//! signature that doesn't hold, an unsigned batch where editors must sign, or a device that isn't
+//! an editor's ends the session (the apps' lists of editors may differ for a moment, so skipping
+//! such a batch could leave copies different). The opened changes then go to the sync client,
+//! which checks their values with the sealed rules (`Client::join_sealed`).
+
+use std::sync::Arc;
 
 use figcraft_collab::Change;
-use figcraft_collab::message::{AcceptedOf, CatchUpOf, ClientMsg, ServerMsg, Signal};
-use figcraft_collab::sealed::SealedChange;
-use figcraft_collab_seal::{FileKey, Keyring, SealError, open_change, open_presence, open_signal, seal_change, seal_presence, seal_signal};
+use figcraft_collab::message::{AcceptedOf, CatchUpOf, ClientMsg, LibraryReply, LibraryReq, ServerMsg, Signal};
+use figcraft_collab::sealed::{Sealed, SealedChange};
+use figcraft_collab_seal::{
+    AnyEditor, DeviceKeys, EditorKeys, FileKey, Keyring, SealError, Slot, check_batch, open, open_change, open_presence, open_signal, seal,
+    seal_change, seal_presence, seal_signal, sign_batch,
+};
 pub use figcraft_engine::devices::NEW_EPOCH;
 
 use crate::invite::Invite;
+
+/// The keys a sealed session signs its batches with and checks others' against (from
+/// [`GuestConfig::sealing`](crate::join::GuestConfig::sealing)). Without a signer batches go
+/// unsigned; without editors any signature that holds is taken, and unsigned batches too
+/// ([`AnyEditor`]).
+#[derive(Clone, Default)]
+pub struct SealingKeys {
+    /// This device's keys: every batch sent is signed with them.
+    pub signer: Option<Arc<DeviceKeys>>,
+    /// Who may edit the file, by device: what the batches that arrive are checked against.
+    pub editors: Option<Arc<dyn EditorKeys>>,
+}
+
+impl std::fmt::Debug for SealingKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealingKeys").field("signer", &self.signer.is_some()).field("editors", &self.editors.is_some()).finish()
+    }
+}
 
 /// A sealed file joined without its key (a link without `#k=…`, or a join code).
 pub const NEEDS_KEY: &str =
@@ -45,15 +76,16 @@ pub(crate) struct Seal<'a> {
     file: &'a str,
     key: FileKey,
     ring: Keyring,
+    keys: &'a SealingKeys,
 }
 
 impl<'a> Seal<'a> {
     /// The session behind `invite` is sealed (its link has a key). Read again for every message:
     /// the app may add a newer epoch while the session runs.
-    pub(crate) fn of(invite: &'a Invite) -> Option<Seal<'a>> {
+    pub(crate) fn of(invite: &'a Invite, keys: &'a SealingKeys) -> Option<Seal<'a>> {
         let ring = invite.key.as_ref()?.ring();
         let key = ring.current()?.clone();
-        Some(Seal { file: &invite.file, key, ring })
+        Some(Seal { file: &invite.file, key, ring, keys })
     }
 
     /// The changes that open. One sealed with an epoch newer than every key held means the file's
@@ -72,8 +104,14 @@ impl<'a> Seal<'a> {
         Ok(out)
     }
 
+    /// Check a batch's signature, then open it. `Err`: the session can't go on.
     fn open_accepted(&self, a: AcceptedOf<SealedChange>) -> Result<AcceptedOf<Change>, String> {
-        Ok(AcceptedOf { seq: a.seq, author: a.author, batch_id: a.batch_id, changes: self.open_all(&a.changes)? })
+        let editors: &dyn EditorKeys = self.keys.editors.as_deref().unwrap_or(&AnyEditor);
+        let body = check_batch(editors, self.file, a.batch_id, &a.changes).map_err(|e| {
+            log::warn!("live session: sealed batch {} from client {} refused: {e:?}", a.seq, a.author);
+            e.to_string()
+        })?;
+        Ok(AcceptedOf { seq: a.seq, author: a.author, batch_id: a.batch_id, changes: self.open_all(body)? })
     }
 
     /// Seal what the sync client (or the engine) sends; `me`: this client's id, once welcomed.
@@ -83,7 +121,11 @@ impl<'a> Seal<'a> {
         let failed = |e: figcraft_collab_seal::SealError| format!("Couldn't encrypt a change for the server: {e}");
         Ok(Some(match msg {
             ClientMsg::Changes { base_seq, batch_id, changes } => {
-                let changes = changes.iter().map(|c| seal_change(&self.key, self.file, c)).collect::<Result<Vec<_>, _>>().map_err(failed)?;
+                let mut changes = changes.iter().map(|c| seal_change(&self.key, self.file, c)).collect::<Result<Vec<_>, _>>().map_err(failed)?;
+                if let Some(device) = &self.keys.signer {
+                    let signature = sign_batch(device, self.file, self.key.epoch(), base_seq, batch_id, &changes).map_err(failed)?;
+                    changes.push(signature);
+                }
                 ClientMsg::SealedChanges { base_seq, batch_id, changes }
             }
             ClientMsg::Presence(p) => match me {
@@ -138,6 +180,41 @@ impl<'a> Seal<'a> {
     }
 }
 
+/// The slot a sealed file's team library archive is sealed for.
+fn library_slot() -> Slot {
+    Slot::Meta { what: "library".into() }
+}
+
+/// The team library of a sealed file doesn't open with the link's key.
+pub const LIBRARY_WONT_OPEN: &str = "This file's team library is end-to-end encrypted and doesn't open with the link's key (or the server sent it unencrypted): ask for the link again";
+
+/// A library request about the file behind `invite`: a sealed file's archive is sealed for its
+/// [`Slot::Meta`] `"library"` on the way out, with the newest key held (the server keeps it as it
+/// comes and checks nothing in it; the apps check what they open).
+pub(crate) fn library_out(invite: &Invite, req: LibraryReq) -> Result<LibraryReq, String> {
+    let ring = invite.key.as_ref().map(|k| k.ring());
+    match (req, ring.as_ref().and_then(Keyring::current)) {
+        (LibraryReq::Publish { archive }, Some(key)) => {
+            let sealed = seal(key, &invite.file, &library_slot(), &archive).map_err(|e| format!("Couldn't encrypt the team library: {e}"))?;
+            Ok(LibraryReq::Publish { archive: sealed.into_bytes() })
+        }
+        (req, _) => Ok(req),
+    }
+}
+
+/// The server's answer to a library request about the file behind `invite`: a sealed file's
+/// archive opened with any epoch held (one that doesn't open, or came unencrypted, is refused).
+pub(crate) fn library_in(invite: &Invite, reply: LibraryReply) -> Result<LibraryReply, String> {
+    match (reply, invite.key.as_ref()) {
+        (LibraryReply::Library { version, archive }, Some(keys)) => {
+            let sealed = Sealed::from_bytes(archive).map_err(|_| LIBRARY_WONT_OPEN.to_string())?;
+            let archive = open(&keys.ring(), &invite.file, &library_slot(), &sealed).map_err(|_| LIBRARY_WONT_OPEN.to_string())?;
+            Ok(LibraryReply::Library { version, archive })
+        }
+        (reply, _) => Ok(reply),
+    }
+}
+
 /// What the server sent, for a session joined without a key: a sealed file can't be opened.
 pub(crate) fn unsealed(msg: ServerMsg) -> Result<Option<ServerMsg>, String> {
     match msg {
@@ -147,18 +224,19 @@ pub(crate) fn unsealed(msg: ServerMsg) -> Result<Option<ServerMsg>, String> {
     }
 }
 
-/// What the server sent to the session behind `invite`, opened (see the module docs).
-pub(crate) fn incoming(invite: &Invite, msg: ServerMsg) -> Result<Option<ServerMsg>, String> {
-    match Seal::of(invite) {
+/// What the server sent to the session behind `invite`, opened and checked with `keys` (see the
+/// module docs).
+pub(crate) fn incoming(invite: &Invite, keys: &SealingKeys, msg: ServerMsg) -> Result<Option<ServerMsg>, String> {
+    match Seal::of(invite, keys) {
         Some(seal) => seal.open(msg),
         None => unsealed(msg),
     }
 }
 
-/// What the session behind `invite` sends, sealed when its file is (`me`: this client's id, once
-/// welcomed).
-pub(crate) fn outgoing(invite: &Invite, me: Option<u32>, msg: ClientMsg) -> Result<Option<ClientMsg>, String> {
-    match Seal::of(invite) {
+/// What the session behind `invite` sends, sealed (and signed, with a signer in `keys`) when its
+/// file is (`me`: this client's id, once welcomed).
+pub(crate) fn outgoing(invite: &Invite, keys: &SealingKeys, me: Option<u32>, msg: ClientMsg) -> Result<Option<ClientMsg>, String> {
+    match Seal::of(invite, keys) {
         Some(seal) => seal.seal(me, msg),
         None => Ok(Some(msg)),
     }
