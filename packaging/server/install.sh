@@ -96,9 +96,11 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(id -u)" -eq 0 ] || die "run it as root (sudo ./install.sh ...)"
+# Read the distribution in a subshell: /etc/os-release sets VERSION, which would replace the
+# release asked for with --version (or the empty default) by the distribution's own version.
 # shellcheck source=/dev/null
-. /etc/os-release
-case " ${ID:-} ${ID_LIKE:-} " in
+DISTRO="$(. /etc/os-release && printf ' %s %s ' "${ID:-}" "${ID_LIKE:-}")"
+case "$DISTRO" in
   *" debian "* | *" ubuntu "*) ;;
   *) die "this script is for Debian and Ubuntu (see docs/server.md for other systems)" ;;
 esac
