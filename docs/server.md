@@ -536,6 +536,72 @@ to that authority's certificate (a PEM file) before starting the app: it is trus
 to the built-in list. There is no way to skip the check: a certificate that has expired, is for
 another name or comes from an unknown authority is refused, and the app says which.
 
+## Hosting the browser app
+
+A server can also host FigCraft for the browser on its own address: people open
+`https://figcraft.example.com/` and get the app, set up for that server and locked to it (its
+Servers list holds that server only, next to the files on their computer; they can't add others).
+The page and the server share one origin, so nothing crosses sites.
+
+1. **Build the app for your server** (on any machine with Rust, `trunk` and the
+   `wasm32-unknown-unknown` target; see [`packaging/web/README.md`](../packaging/web/README.md)):
+
+   ```sh
+   packaging/web/package.sh --server wss://figcraft.example.com/ --site ./figcraft-site
+   ```
+
+   The server's address is baked into the build (`FIGCRAFT_DEFAULT_SERVER`); the folder holds
+   the static files (`index.html`, the hashed `.js` and `.wasm`). Rebuild it when you change the
+   address or update FigCraft.
+2. **Put the files in the web root** (`/var/www/figcraft`), readable by Caddy:
+
+   ```sh
+   sudo install -d -m 755 /var/www/figcraft
+   sudo cp -R figcraft-site/. /var/www/figcraft/
+   ```
+
+   (or `sudo ./install.sh --host … --email … --web ./figcraft-site`, which does this and the next
+   step for you).
+3. **Route it in Caddy** ([`packaging/server/Caddyfile.web`](../packaging/server/Caddyfile.web)):
+   WebSocket upgrades and `/healthz` go to the server on `127.0.0.1:47900`, everything else is
+   the app's files, with `application/wasm` for the `.wasm`, compression, and caching for good of
+   the hashed files (`no-cache` on the page):
+
+   ```caddy
+   figcraft.example.com {
+   	@server header Upgrade websocket
+   	handle @server {
+   		reverse_proxy 127.0.0.1:47900
+   	}
+   	handle /healthz {
+   		reverse_proxy 127.0.0.1:47900
+   	}
+   	handle {
+   		root * /var/www/figcraft
+   		encode zstd gzip
+   		file_server
+   	}
+   }
+   ```
+
+   Then `sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy`. The
+   desktop app and the CLI keep using `wss://figcraft.example.com/` as before (they open
+   WebSockets, which still reach the server). The app needs no isolation headers
+   (`Cross-Origin-Opener-Policy`/`-Embedder-Policy`: it doesn't use `SharedArrayBuffer`).
+4. **Check**: `curl -sI https://figcraft.example.com/` answers `200` with `text/html`, and the
+   `.wasm` file named in the page answers with `Content-Type: application/wasm`.
+
+**Signing in from the hosted app.** Usernames and passwords (`kind = "password"`) work as in the
+desktop app (the page talks `wss://`). An identity provider (`kind = "oidc"`) needs to send the
+page back to its own address after signing in, which the provider must allow: list the address in
+the provider's `web_redirect_uris`, and with Google add a *Web application* client for it
+(`web_client_id`, `web_client_secret_file`); see
+[server-accounts.md ▸ Google](server-accounts.md#google). Without that, the hosted app offers that
+provider only through the device flow, if it has one.
+
+**What the hosted app doesn't do yet**: it keeps nothing between visits (sign in again after a
+reload), and publishing a file from the browser and team libraries still need the desktop app.
+
 ## Running a public server
 
 A server **open to the public** (`open_publish = true`) lets anyone publish a file without the

@@ -478,3 +478,78 @@ fn registry_checks_settings_without_the_network() {
         assert!(e.contains(why), "{cfg:?}: {e}");
     }
 }
+
+#[test]
+fn oidc_web_pages_sign_in_with_the_web_client() {
+    let key = Key::es();
+    let fake = Arc::new(Fake::default());
+    issuer(&fake, &[("k1", &key)]);
+    let web_claims =
+        json!({"iss": ISSUER, "aud": "web-1", "sub": "u-2", "email": "bo@example.com", "email_verified": true, "iat": now(), "exp": now() + 600});
+    fake.post(&format!("{ISSUER}/token"), Ok(json!({"id_token": key.sign("k1", &web_claims)})));
+    let cfg = ProviderConfig {
+        web_redirect_uris: vec!["https://app.example/".into()],
+        web_client_id: "web-1".into(),
+        web_client_secret: "web-secret".into(),
+        ..oidc_cfg()
+    };
+    let p = build(&cfg, &fake);
+    let flows = p.info().flows;
+    assert!(matches!(&flows[0], Flow::Browser { client_id, .. } if client_id == "client-1"), "the desktop app keeps its client");
+    assert!(
+        flows.iter().any(|f| matches!(f, Flow::Redirect { client_id, redirect_uris, authorize_url, .. }
+            if client_id == "web-1" && redirect_uris == &["https://app.example/".to_string()] && authorize_url.ends_with("/authorize"))),
+        "{flows:?}"
+    );
+    // Listed exactly: the page signs in with the web client.
+    assert!(p.web_redirect("https://app.example/"));
+    for other in ["https://app.example", "https://app.example/x", "https://APP.example/", "https://app.example/?a=1", "http://app.example/"] {
+        assert!(!p.web_redirect(other), "{other}");
+    }
+    let who = p.exchange_code("c", "v", "https://app.example/").unwrap();
+    assert_eq!(who.subject, "u-2");
+    let sent = fake.sent.lock().unwrap().join(" ");
+    assert!(sent.contains("client_id=web-1") && sent.contains("client_secret=web-secret") && !sent.contains("s3cret"), "{sent}");
+    // A page that isn't listed never reaches the issuer.
+    let before = fake.sent.lock().unwrap().len();
+    assert!(matches!(p.exchange_code("c", "v", "https://evil.example/"), Err(AuthError::Refused(_))));
+    assert_eq!(fake.sent.lock().unwrap().len(), before);
+    // A token for the web client is also taken as the provider's (an ID token from elsewhere).
+    assert_eq!(p.verify_token(&key.sign("k1", &web_claims)).unwrap().subject, "u-2");
+    // The desktop client's token isn't taken for the web exchange.
+    let fake = Arc::new(Fake::default());
+    issuer(&fake, &[("k1", &key)]);
+    fake.post(&format!("{ISSUER}/token"), Ok(json!({"id_token": key.sign("k1", &claims("u-1"))})));
+    let p = build(&cfg, &fake);
+    assert!(p.exchange_code("c", "v", "https://app.example/").is_err());
+    assert!(p.exchange_code("c", "v", "http://127.0.0.1:5000/").is_ok(), "it is the desktop client's");
+}
+
+#[test]
+fn oidc_web_settings_are_checked() {
+    let fake = Arc::new(Fake::default());
+    let bad = |cfg: ProviderConfig| Registry::builtin().build(&cfg, fake.clone()).err().unwrap_or_default();
+    let with = |uris: &[&str]| ProviderConfig { web_redirect_uris: uris.iter().map(|u| u.to_string()).collect(), ..oidc_cfg() };
+    assert!(bad(with(&["http://app.example/"])).contains("https://"));
+    assert!(bad(with(&["https://app.example/#x"])).contains("fragment"));
+    assert!(bad(with(&["https:///"])).contains("https://"));
+    assert!(bad(ProviderConfig { web_client_id: "w".into(), ..oidc_cfg() }).contains("web_redirect_uris"));
+    assert!(bad(ProviderConfig { web_client_secret: "x".into(), ..with(&["https://app.example/"]) }).contains("web_client_id"));
+    assert!(
+        bad(ProviderConfig {
+            web_client_id: "w".into(),
+            web_client_secret: "a".into(),
+            web_client_secret_file: "b".into(),
+            ..with(&["https://app.example/"])
+        })
+        .contains("not both")
+    );
+    let many: Vec<String> = (0..=crate::oidc::MAX_WEB_REDIRECTS).map(|i| format!("https://a{i}.example/")).collect();
+    assert!(bad(ProviderConfig { web_redirect_uris: many, ..oidc_cfg() }).contains("at most"));
+    // Without a web client of its own, the pages use the provider's client; this machine is fine
+    // for trying it out.
+    let p = Registry::builtin().build(&with(&["http://localhost:8767/"]), fake.clone()).unwrap();
+    assert!(p.web_redirect("http://localhost:8767/"));
+    assert!(crate::oidc::valid_web_redirect("https://figcraft.example.com/signin"));
+    assert!(!crate::oidc::valid_web_redirect("https://exa mple.com/"));
+}

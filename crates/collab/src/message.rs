@@ -1225,6 +1225,11 @@ pub enum ClientMsg {
     /// [`ServerMsg::About`]): its name and everything it accepts. Servers older than it refuse it:
     /// ask [`ClientMsg::Info`] then.
     About,
+    // ---- The hosted browser build (m9/hosted-web): appended. ----
+    /// [`ClientMsg::About`] with every flow, also [`Flow::Redirect`](figcraft_auth::Flow::Redirect)
+    /// (apps from before it can't read that flow, so `About` leaves it out). Answered with
+    /// [`ServerMsg::About`]. Servers older than it refuse it: ask `About` then.
+    AboutAll,
 }
 
 /// Server → client.

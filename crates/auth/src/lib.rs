@@ -33,7 +33,7 @@ pub mod wire;
 
 pub use config::{AuthConfig, E2eConfig, ProviderConfig};
 pub use policy::Policy;
-pub use provider::{AuthError, DeviceStart, Fetch, FetchError, Identity, IdentityProvider};
+pub use provider::{AuthError, DeviceStart, Fetch, FetchError, Identity, IdentityProvider, loopback_redirect};
 pub use wire::{AuthMode, DeviceCode, E2eMode, Flow, Me, ProviderInfo, ServerAbout, ServerInfo, SignIn, SignInReply};
 
 /// Someone a connection was signed in as: what a host's backend admits by.

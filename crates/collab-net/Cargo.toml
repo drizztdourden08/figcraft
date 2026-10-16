@@ -19,6 +19,11 @@ figcraft-collab-seal = { workspace = true }
 log = { workspace = true }
 # `std::time::Instant` natively, the browser's clock in the web build.
 web-time = "1"
+# PKCE challenges when signing in through a browser (the desktop app's loopback page, the browser
+# build's redirect).
+getrandom = "0.4"
+sha2 = { workspace = true }
+base64 = { workspace = true }
 
 # Native transport: blocking tungstenite with a reader and a writer thread per connection.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -29,10 +34,6 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 webpki-roots = "1"
-getrandom = "0.4"
-# PKCE challenges when signing in through a browser.
-sha2 = { workspace = true }
-base64 = { workspace = true }
 
 # This install's device secret (sealed files with accounts) in the OS keychain (`keychain.rs`):
 # the Credential Manager, the macOS keychain, the Secret Service over D-Bus in pure Rust (zbus; no
@@ -51,7 +52,9 @@ zeroize = "1"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Location", "WebSocket", "BinaryType", "MessageEvent", "CloseEvent"] }
+web-sys = { version = "0.3", features = ["Window", "Location", "WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "Storage", "History"] }
+# getrandom reads `crypto.getRandomValues`.
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 # Opening invite links: the per-user URL handler registration on Windows.
 [target.'cfg(windows)'.dependencies]

@@ -13,7 +13,7 @@ use figcraft_collab::message::{Admin, AdminReply, ClientMsg, FileInfo, Member, O
 use serde_json::{Value, json};
 
 use crate::accounts::{SIGNED_OUT, SignedIn};
-use crate::live::{Access, Event, HostOptions, LiveLink, Me, NetReply, NetRequest, Presence, SessionInfo, SignIn, SignInReply};
+use crate::live::{Access, Event, Flow, HostOptions, LiveLink, Me, NetReply, NetRequest, Presence, ServerAbout, SessionInfo, SignIn, SignInReply};
 use crate::{Prefs, Session};
 
 const SERVER: &str = "wss://acc.example/";
@@ -62,6 +62,13 @@ impl LiveLink for Link {
             return req.failure()("no answer from the server (timed out)".into());
         }
         match req {
+            NetRequest::Info { .. } => NetReply::Info(Ok(about())),
+            NetRequest::SignIn { req: SignIn::Code { redirect_uri, code, .. }, .. } if redirect_uri == PAGE && code == "the-code" => {
+                NetReply::SignIn(Ok(SignInReply::SignedIn(Me { session: "NewSessionNewSession".into(), ..me("Gina") })))
+            }
+            NetRequest::SignIn { req: SignIn::Code { .. }, .. } => {
+                NetReply::SignIn(Ok(SignInReply::Refused { reason: "that sign-in isn't valid".into() }))
+            }
             NetRequest::SignIn { req: SignIn::Session { token }, .. } if token == TOKEN && !w.ended => {
                 NetReply::SignIn(Ok(SignInReply::SignedIn(me("Ann Again"))))
             }
@@ -330,4 +337,52 @@ fn a_join_refused_for_an_ended_sign_in_forgets_it() {
     wire.lock().unwrap().events.push((id, Event::Ended { reason: "The host ended the session".into() }));
     s.live_poll();
     assert!(s.signed_in(OTHER).is_some());
+}
+
+/// The page the browser build comes back to after signing in.
+const PAGE: &str = "https://acc.example/";
+
+/// A server with accounts and one provider offering the desktop and the web sign-in pages.
+fn about() -> ServerAbout {
+    let page = |redirect: bool| {
+        let (authorize_url, scopes, params) = ("https://issuer.example/authorize".to_string(), vec!["openid".to_string()], Vec::new());
+        if redirect {
+            Flow::Redirect { authorize_url, client_id: "web".into(), scopes, params, redirect_uris: vec![PAGE.into()] }
+        } else {
+            Flow::Browser { authorize_url, client_id: "desk".into(), scopes, params }
+        }
+    };
+    let provider = figcraft_auth::ProviderInfo { id: "g".into(), label: "G".into(), flows: vec![page(false), page(true)] };
+    ServerAbout {
+        info: figcraft_auth::ServerInfo { auth: figcraft_auth::AuthMode::Accounts, providers: vec![provider], ..Default::default() },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_code_a_sign_in_page_sent_back_signs_in() {
+    let (mut s, wire) = session();
+    let info = s.execute("account.info", &json!({"server": SERVER})).unwrap();
+    assert_eq!(info["providers"][0]["flows"], json!(["browser", "redirect"]));
+    let p = json!({"server": SERVER, "provider": "g", "code": "the-code", "verifier": "v3rifier", "redirectUri": PAGE});
+    let r = s.execute("account.signIn", &p).unwrap();
+    assert_eq!(r["status"], "signedIn");
+    assert_eq!(r["account"]["name"], "Gina");
+    assert!(!r.to_string().contains("NewSession"), "no session token in results");
+    assert_eq!(s.signed_in(SERVER).unwrap().session, "NewSessionNewSession");
+    let sent = wire.lock().unwrap().asked.iter().any(|q| {
+        matches!(q, NetRequest::SignIn { req: SignIn::Code { verifier, redirect_uri, .. }, .. } if verifier == "v3rifier" && redirect_uri == PAGE)
+    });
+    assert!(sent);
+    // The server's refusal is the error, and the sign-in isn't kept.
+    let mut s2 = session().0;
+    let e = s2
+        .execute("account.signIn", &json!({"server": SERVER, "code": "other", "verifier": "v", "redirectUri": "https://evil.example/"}))
+        .unwrap_err();
+    assert!(e.to_string().contains("isn't valid"), "{e}");
+    assert!(s2.signed_in(SERVER).is_none());
+    // The desktop app doesn't send its page away (that is the browser build's).
+    let e = s.execute("account.signIn", &json!({"server": SERVER, "flow": "redirect"})).unwrap_err();
+    assert!(e.to_string().contains("only in the browser"), "{e}");
+    assert!(s.execute("account.signIn", &json!({"server": SERVER, "flow": "code"})).is_err(), "a code is needed");
 }

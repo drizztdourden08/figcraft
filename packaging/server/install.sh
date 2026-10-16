@@ -25,6 +25,9 @@
 #   --ref REF          the git branch or tag to clone and build (default: vX.Y.Z with --version,
 #                      else the latest release tag; a source tree around this script is built as is)
 #   --backups          also enable the nightly backup timer (stops the server for a few seconds)
+#   --web DIR          also host the browser app from DIR (its built files, e.g. from
+#                      packaging/web/package.sh --server wss://HOST/ --site DIR) at https://HOST/,
+#                      copied to /var/www/figcraft; Caddy then serves both (Caddyfile.web)
 #   --no-firewall      leave ufw alone
 #   --firewall-anyway  enable ufw even though other services listen on this machine
 #   -h, --help         this text
@@ -56,6 +59,8 @@ VERSION=""
 FROM_SOURCE=false
 REF=""
 BACKUPS=false
+WEB_SRC=""
+WEB_ROOT=/var/www/figcraft
 FIREWALL=true
 FIREWALL_ANYWAY=false
 
@@ -106,14 +111,20 @@ while [ $# -gt 0 ]; do
     --from-source) FROM_SOURCE=true; shift ;;
     --ref) REF="${2:-}"; shift 2 ;;
     --backups) BACKUPS=true; shift ;;
+    --web) WEB_SRC="${2:-}"; shift 2 ;;
     --no-firewall) FIREWALL=false; shift ;;
     --firewall-anyway) FIREWALL_ANYWAY=true; shift ;;
-    -h | --help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,33p' "$0"; exit 0 ;;
     *) die "unknown option $1 (see --help)" ;;
   esac
 done
 
 [ "$(id -u)" -eq 0 ] || die "run it as root (sudo ./install.sh ...)"
+if [ -n "$WEB_SRC" ]; then
+  [ -f "$WEB_SRC/index.html" ] || die "--web $WEB_SRC: no index.html there (build it with packaging/web/package.sh --server wss://HOST/ --site DIR)"
+  WEB_SRC="$(cd "$WEB_SRC" && pwd)"
+  [ "$WEB_SRC" != "$WEB_ROOT" ] || die "--web: give the folder the files are in, not $WEB_ROOT itself"
+fi
 # Read the distribution in a subshell: /etc/os-release sets VERSION, which would replace the
 # release asked for with --version (or the empty default) by the distribution's own version.
 # shellcheck source=/dev/null
@@ -268,7 +279,9 @@ fi
 [ -x "$NEW_BIN" ] || die "no figcraft-server binary to install"
 # The units and the Caddyfile beside this script when it has them (a checkout or an archive).
 [ -f "$HERE/figcraft-backup.timer" ] && FILES="$HERE"
-for f in figcraft-server.service Caddyfile figcraft-backup.service figcraft-backup.timer; do
+CADDY_TEMPLATE=Caddyfile
+[ -z "$WEB_SRC" ] || CADDY_TEMPLATE=Caddyfile.web
+for f in figcraft-server.service "$CADDY_TEMPLATE" figcraft-backup.service figcraft-backup.timer; do
   [ -f "$FILES/$f" ] || die "$FILES/$f is missing"
 done
 
@@ -373,11 +386,24 @@ fi
 # Caddyfile with other sites is never replaced: it only gains the import line, once.
 CADDYFILE=/etc/caddy/Caddyfile
 SITE_FILE=/etc/caddy/figcraft-server.caddy
+if [ -n "$WEB_SRC" ]; then
+  # The browser app: a fresh copy, swapped in whole (readable by Caddy, owned by root).
+  rm -rf "$WEB_ROOT.new"
+  install -d -m 755 "$WEB_ROOT.new"
+  cp -R "$WEB_SRC/." "$WEB_ROOT.new/"
+  chown -R root:root "$WEB_ROOT.new"
+  chmod -R u=rwX,go=rX "$WEB_ROOT.new"
+  rm -rf "$WEB_ROOT.old"
+  [ ! -d "$WEB_ROOT" ] || mv "$WEB_ROOT" "$WEB_ROOT.old"
+  mv "$WEB_ROOT.new" "$WEB_ROOT"
+  rm -rf "$WEB_ROOT.old"
+  say "Browser app in $WEB_ROOT"
+fi
 SITE="$(mktemp)"
 MAIN="$(mktemp)"
 {
   printf '%s: written by packaging/server/install.sh (run it again to update).\n' "$MARK"
-  sed -e '/^#/d' -e "s/figcraft\.example\.com/$HOST/" "$FILES/Caddyfile" | sed -e '/./,$!d'
+  sed -e '/^#/d' -e "s/figcraft\.example\.com/$HOST/" -e "s|/var/www/figcraft|$WEB_ROOT|" "$FILES/$CADDY_TEMPLATE" | sed -e '/./,$!d'
 } >"$SITE"
 caddy_main "$CADDYFILE" "$EMAIL" >"$MAIN"
 CADDY_CHANGED=false

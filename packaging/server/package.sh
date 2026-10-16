@@ -39,7 +39,7 @@ mkdir -p "$STAGE"
 cp "$CARGO_TARGET_DIR/release/figcraft-server" "$STAGE/"
 strip "$STAGE/figcraft-server" 2>/dev/null || true
 for f in LICENSE-MIT LICENSE-APACHE NOTICE docs/server.md; do cp "$ROOT/$f" "$STAGE/"; done
-cp "$HERE/figcraft-server.service" "$HERE/figcraft-backup.service" "$HERE/figcraft-backup.timer" "$HERE/Caddyfile" "$HERE/nginx.conf" "$STAGE/"
+cp "$HERE/figcraft-server.service" "$HERE/figcraft-backup.service" "$HERE/figcraft-backup.timer" "$HERE/Caddyfile" "$HERE/Caddyfile.web" "$HERE/nginx.conf" "$STAGE/"
 install -m 755 "$HERE/install.sh" "$STAGE/"
 
 # Smoke test: the binary runs and reports the version being shipped.

@@ -1,0 +1,41 @@
+# Caddy in front of figcraft-server AND the browser app it hosts, on one address (same origin):
+# WebSocket upgrades and /healthz go to the server, everything else is the app's static files.
+# Setup in docs/server.md ("Hosting the browser app"). install.sh --web DIR writes this for you.
+#
+# Build the app for this server and put its files in the web root:
+#   packaging/web/package.sh --server wss://figcraft.example.com/ --site /var/www/figcraft
+# Replace the host name with yours (its DNS must point at this machine), and set
+# trusted_proxy = "127.0.0.1" in server.toml as with the plain Caddyfile.
+
+figcraft.example.com {
+	# The app's connections (and the desktop app's): every WebSocket goes to the server.
+	@server header Upgrade websocket
+	handle @server {
+		reverse_proxy 127.0.0.1:47900
+	}
+	handle /healthz {
+		reverse_proxy 127.0.0.1:47900
+	}
+	# The browser app (packaging/web/README.md: MIME types, caching, compression).
+	handle {
+		root * /var/www/figcraft
+		# The page and the script are compressed on the way. The .wasm is sent from the compressed
+		# copies package.sh --site makes (.gz, and .br with brotli: `precompressed` below): Caddy
+		# doesn't compress application/wasm by itself, and a small machine would spend seconds on
+		# its 20 MiB for every new visitor.
+		encode zstd gzip
+		header X-Content-Type-Options nosniff
+		# Hashed names (figcraft-web-<hash>.js, ..._bg.wasm) never change: cache them for good.
+		@hashed path *.wasm *.js
+		header @hashed Cache-Control "public, max-age=31536000, immutable"
+		# The page itself is asked for again each time, so a new version shows at once.
+		@page path / /index.html
+		header @page Cache-Control "no-cache"
+		# Browsers stream-compile only application/wasm.
+		@wasm path *.wasm
+		header @wasm Content-Type application/wasm
+		file_server {
+			precompressed br gzip
+		}
+	}
+}

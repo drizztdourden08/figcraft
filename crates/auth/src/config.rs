@@ -74,6 +74,18 @@ pub struct ProviderConfig {
     /// `password` (the server's own usernames and passwords): people may make their own account
     /// from the app. Default false: only admins add people (`figcraft-server users add`).
     pub allow_signup: bool,
+    /// `oidc`: the pages a browser build hosted on the web may come back to after signing in
+    /// (`["https://figcraft.example.com/"]`), each matched exactly. Empty (default): only the
+    /// desktop app's loopback redirect (`http://127.0.0.1:<port>/`) is accepted, and the browser
+    /// build offers no sign-in with this provider (apart from `device`).
+    pub web_redirect_uris: Vec<String>,
+    /// `oidc`: the client those pages sign in with, when the issuer wants one of its own for web
+    /// redirects (Google: a "Web application" client next to the "Desktop app" one). Default:
+    /// `client_id`.
+    pub web_client_id: String,
+    /// `oidc`: that client's secret, or (better) a file holding it (with `web_client_id` only).
+    pub web_client_secret: String,
+    pub web_client_secret_file: String,
 }
 
 /// `[e2e]`.

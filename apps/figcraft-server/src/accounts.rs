@@ -606,18 +606,19 @@ impl Gate for Accounts {
                 Err(reason) => (SignInReply::Refused { reason }, None),
             },
             SignIn::Code { provider, code, verifier, redirect_uri } => {
-                let redirect_ok = redirect_uri.starts_with("http://127.0.0.1:")
-                    || redirect_uri.starts_with("http://localhost:")
-                    || redirect_uri.starts_with("http://[::1]:");
+                let p = match self.provider(&provider) {
+                    Ok(p) => p,
+                    Err(reason) => return (SignInReply::Refused { reason }, None),
+                };
+                // The desktop app's loopback page, or a page on the web the provider lists
+                // exactly (`web_redirect_uris`): a code sent anywhere else isn't exchanged.
+                let redirect_ok = figcraft_auth::loopback_redirect(&redirect_uri) || p.web_redirect(&redirect_uri);
                 if !redirect_ok || code.len() > 4096 || verifier.len() > 256 {
                     return (SignInReply::Refused { reason: "that sign-in isn't valid".into() }, None);
                 }
-                match self.provider(&provider) {
-                    Ok(p) => match p.exchange_code(&code, &verifier, &redirect_uri) {
-                        Ok(who) => self.signed_in(who),
-                        Err(e) => Self::refused(e),
-                    },
-                    Err(reason) => (SignInReply::Refused { reason }, None),
+                match p.exchange_code(&code, &verifier, &redirect_uri) {
+                    Ok(who) => self.signed_in(who),
+                    Err(e) => Self::refused(e),
                 }
             }
             SignIn::DeviceStart { provider } => {

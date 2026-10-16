@@ -774,6 +774,7 @@ impl<S: Synced> SessionServer<S> {
             | ClientMsg::Resolve(_)
             | ClientMsg::Info
             | ClientMsg::About
+            | ClientMsg::AboutAll
             | ClientMsg::SignIn(_)
             | ClientMsg::OpenAccount(_)
             | ClientMsg::Account(_)
