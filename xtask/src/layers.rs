@@ -14,6 +14,8 @@ const TABLE: &[(&str, u8)] = &[
     ("pathops", 2),
     ("collab", 2),
     ("auth", 2),
+    // Sealed files: seals and opens collab's changes (pure crypto and data).
+    ("collab-seal", 2),
     ("plugin", 2),
     ("render", 3),
     ("format", 3),
@@ -71,13 +73,14 @@ pub fn check(root: &std::path::Path) -> bool {
 
 fn same_layer_ok(from: &str, to: &str) -> bool {
     // Within L0: color uses geom types; within L2: text/layout/pathops/collab are independent,
-    // except that collab's messages carry auth's sign-in types; within L6 the MCP server joins live
-    // sessions through collab-net.
+    // except that collab's messages carry auth's sign-in types and collab-seal seals collab's
+    // changes; within L6 the MCP server joins live sessions through collab-net.
     matches!(
         (from, to),
         ("figcraft-color", "figcraft-geom")
             | ("figcraft-render", "figcraft-format")
             | ("figcraft-mcp", "figcraft-collab-net")
             | ("figcraft-collab", "figcraft-auth")
+            | ("figcraft-collab-seal", "figcraft-collab")
     )
 }

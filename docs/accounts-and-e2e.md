@@ -5,7 +5,9 @@ are built**: `crates/auth` (the sign-in types, the `IdentityProvider` and `Gate`
 `[auth]` and `[e2e]` settings, and with its `providers` feature the `oidc` and `external` providers
 and their registry), `Info` and `SignIn`, and accounts on `figcraft-server`: people and sessions,
 members and invites per file, roles in sessions, account connections, admins (see
-[`server.md`](server.md#accounts-sign-in)). `[e2e]` accepts only `off` until sealing lands. Sections say what is built as the implementation lands. Builds on [`collab-protocol.md`](collab-protocol.md)
+[`server.md`](server.md#accounts-sign-in)). **Step 6 is built**: `crates/collab-seal` (file keys
+and keyrings, sealing and opening values and changes, entry ids, device keys and HPKE wrapping,
+link keys, recovery keys; not yet used by the server or the app). `[e2e]` accepts only `off` until sealing lands. Sections say what is built as the implementation lands. Builds on [`collab-protocol.md`](collab-protocol.md)
 (live sessions) and [`server.md`](server.md) (running `figcraft-server`).
 
 Goal: a `figcraft-server` can (1) let people in by **who they are** instead of only by share links,
@@ -167,32 +169,57 @@ sealed file the **structure stays visible and the contents are encrypted**:
 | Team libraries | Kept as a sealed blob; checked by the apps after opening |
 | File names | Sealed; the app decrypts the list |
 
-**Visible to the server on a sealed file**: the number of layers and their tree, each layer's kind,
-which property names change and when, value sizes (padded), who is connected and when.
+**Visible to the server on a sealed file**: the number of layers and their tree, each layer's kind
+*tag* (`frame`, `text`, `page`…: the type name only, enough for the page and container rules; the
+kind's data, such as a text's contents, a vector's paths or a page's background, is sealed),
+which property names change and when, value sizes (padded), who is connected and when. The tree
+properties (`parent`, `position`) stay plain; every other node property value is sealed.
 
 ### Keys
 
+Built in `crates/collab-seal` (step 6); the byte formats below are what it implements.
+
 ```
-file key, epoch n (32 random bytes)
-  ├─ HKDF "figcraft value"   → XChaCha20-Poly1305 key for values
-  ├─ HKDF "figcraft entry"   → HMAC-SHA256 key for entry names
-  ├─ HKDF "figcraft presence"→ key for presence and signals
-  └─ HKDF "figcraft meta"    → key for the file name and library archives
+file key, epoch n = epoch (u32) ‖ key (32 random bytes) ‖ names (32 random bytes, same in every epoch)
+  ├─ HKDF(key)   "figcraft value"    → XChaCha20-Poly1305 key for values
+  ├─ HKDF(key)   "figcraft presence" → XChaCha20-Poly1305 key for presence and signals
+  ├─ HKDF(key)   "figcraft meta"     → XChaCha20-Poly1305 key for the file name and library archives
+  └─ HKDF(names) "figcraft entry"    → HMAC-SHA256 key for entry names
 ```
 
-- A **sealed value** is `epoch (u32) ‖ nonce (24) ‖ ciphertext ‖ tag (16)`; its associated data is
-  `file id ‖ epoch ‖ the slot` (node and property, document property, or hashed entry), so the
-  server can't move a value to another slot. Plaintexts are padded to 64 B, 256 B, 1 KiB, then
-  powers of two.
-- **Links mode**: the key is in the link after `#k=` (base64url), which browsers and the app never
-  send to a server.
+HKDF is HKDF-SHA256 with no salt and the label as `info`. The **names secret** is made once with the
+file and carried into every new epoch, so entry ids stay the same across epochs (the server keys
+entries by them; ids that changed on every rotation would orphan every stored entry). The cost:
+someone removed from a file can still compute the ids of names they guess, never read new values.
+
+- A **sealed value** is `epoch (u32 LE) ‖ nonce (24) ‖ ciphertext ‖ tag (16)` (XChaCha20-Poly1305,
+  random nonce). The plaintext is framed as `length (u32 LE) ‖ bytes ‖ zeros` and padded to 64 B,
+  256 B, 1 KiB, then powers of two (up to 64 MiB); the padding must be canonical to open. Its
+  associated data is `"figcraft sealed v1" ‖ file id (u32 LE length ‖ UTF-8) ‖ epoch (u32 LE) ‖
+  slot`, the slot being a tag byte and its fields: node id (u64 LE) and property name, document
+  property name, entry key (kind byte and entry id or number), entry name, presence or signal
+  sender (client id, u32 LE), or meta (`"name"`, `"library"`…). So the server can't move a value
+  to another node, property, entry, sender or file. Values of changes are the JSON of the original
+  value.
+- **Entry ids**: `HMAC-SHA256(entry key, name)` as unpadded base64url (43 characters) for style,
+  collection and variable ids and image hashes; comment and dev snapshot keys are numbers and stay
+  plain. A sealed `Put`/`Remove` also carries the name sealed for its entry, and apps check that it
+  hashes to the id.
+- **Links mode**: the key is in the link after `#k=`: unpadded base64url of `epoch ‖ key ‖ names`
+  (68 bytes, 91 characters), which browsers and the app never send to a server.
 - **Accounts mode**: each app install has a **device key** (X25519 for receiving keys, Ed25519 for
-  signing), kept in the OS keychain. The file key is wrapped to every member device with HPKE
-  (RFC 9180, X25519-HKDF-SHA256 / ChaCha20-Poly1305) and the server stores the wrapped copies
-  (`keyring.json`). Adding someone wraps the current and older epochs for their devices; removing
-  someone or a device starts a new epoch for new writes and the server disconnects them.
-- **Recovery**: a recovery key (24 words) wraps a copy of the person's keyring; a new device is
-  approved from an existing one (a 6-digit comparison) or with the recovery key.
+  signing), kept in the OS keychain (64 bytes: X25519 private key ‖ Ed25519 seed). The file key is
+  wrapped to every member device with HPKE (RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256) /
+  HKDF-SHA256 / ChaCha20-Poly1305, `info` = `"figcraft file key v1"`, associated data = the file
+  id; `enc (32) ‖ ciphertext (84)`) and the server stores the wrapped copies (`keyring.json`).
+  Adding someone wraps the current and older epochs for their devices; removing someone or a
+  device starts a new epoch for new writes and the server disconnects them.
+- **Recovery**: a recovery key wraps a copy of the person's keyring; a new device is approved from
+  an existing one (a 6-digit comparison) or with the recovery key. The recovery key is 32 random
+  bytes written as RFC 4648 base32 in 11 groups of 5 (`XXXXX-XXXXX-…`, 55 characters: the key then
+  2 checksum bytes from SHA-256, so typos are caught) instead of words: no wordlist to license or
+  design. The copy is `nonce (24) ‖ ciphertext ‖ tag`, XChaCha20-Poly1305 with
+  HKDF(recovery key, `"figcraft recovery"`) and associated data `"figcraft recovery v1" ‖ context`.
 
 ### Same checks everywhere
 
