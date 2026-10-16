@@ -22,6 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
 use crate::cmd::CommandSpec;
+use crate::file_keys::sealed_link;
 use crate::live::{Access, Live, NetReply, NetRequest, Published, Share, Shared, SharedLink, Status, Via, clean_shared};
 use crate::params::{req_string, string};
 use crate::{DocState, Result, Session, bad, spec};
@@ -254,6 +255,8 @@ impl Session {
     /// What others join `file` on `server` with changed (`None`: nobody else gets in now): in the
     /// record, and in the sessions open on the file.
     pub(crate) fn online_shared(&mut self, server: &str, file: &str, links: Option<Shared>) {
+        // A sealed file's links carry its key (and have no join codes).
+        let links = links.map(|l| self.links_with_key(server, file, l));
         for l in self.live.sessions_mut().filter(|l| l.server_file().is_some_and(|(s, f)| f == file && same_server(&s, server))) {
             if let Some(sh) = l.share.as_mut() {
                 sh.links.clone_from(&links);
@@ -376,6 +379,10 @@ impl Session {
     /// gone.
     fn online_answer(&mut self, server: &str, file: &str, answer: Option<OwnedFile>) {
         let Some(i) = self.online_index(server, file) else { return };
+        // A sealed file's name comes sealed: opened with its key (a name that can't be opened
+        // leaves the one recorded here).
+        let edit = self.prefs.online_files.get(i).map(|f| f.edit.clone()).unwrap_or_default();
+        let shown = answer.as_ref().map(|o| self.listed_name(server, file, &o.name, Some(&edit)));
         let Some(f) = self.prefs.online_files.get_mut(i) else { return };
         let before = (f.name.clone(), f.shared.is_some());
         // Links revoked from elsewhere no longer let anyone in.
@@ -386,7 +393,10 @@ impl Session {
             Some(o) => {
                 f.state = FileState::Online;
                 f.expires = o.expires;
-                let name = clean_name(&o.name);
+                let name = match shown {
+                    Some((name, sealed)) if !(sealed && name == crate::file_keys::ENCRYPTED_NAME) => clean_name(&name),
+                    _ => String::new(),
+                };
                 if !name.is_empty() {
                     f.name = name;
                 }
@@ -429,6 +439,8 @@ impl Session {
                     "session": session.map(|l| l.id),
                     "document": session.and_then(|l| l.doc_uid).and_then(|u| self.docs.iter().position(|d| d.uid == u)),
                     "hasOwnerToken": true,
+                    // End-to-end encrypted (your link to it carries its key).
+                    "sealed": sealed_link(&f.edit),
                 })
             })
             .collect();
@@ -603,7 +615,7 @@ pub(crate) fn set_shared(s: &mut Session, cmd: &str, server: &str, file: &str, o
     }
     let revoke: Vec<String> = shared.iter().flat_map(|l| [Some(&l.edit), l.view.as_ref()]).flatten().map(|l| l.id.clone()).collect();
     let req = NetRequest::Share { server: server.to_string(), file: file.to_string(), owner: owner.to_string(), revoke, create: on };
-    let links = crate::live::share_answer(s, req)?.map(clean_shared);
+    let links = crate::live::share_answer(s, req)?.map(clean_shared).map(|l| s.links_with_key(server, file, l));
     if on && links.is_none() {
         return Err(crate::EngineError::Other("the server made no links".into()));
     }
@@ -616,7 +628,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "collab.files",
             "Your online files",
-            "{refresh? (true: ask each server once what became of its files; default false: no network)} → {files: [{server, host, file (its id), name, created, opened (seconds since 1970), shared (others get in with a code now), code, viewCode (the join codes, while shared), state: unknown | online | gone (the server no longer has it: removed or expired), expires, session, document (the session and open document it is in now, or null), hasOwnerToken: true}], problems: [{server, host, state: offline | unsupported (a server older than this request), reason}], max}: the files you published or shared without a server key, most recently opened first, as recorded on this computer with the preferences. Owner tokens and your own links are never in the result",
+            "{refresh? (true: ask each server once what became of its files; default false: no network)} → {files: [{server, host, file (its id), name, created, opened (seconds since 1970), shared (others get in with a code now), code, viewCode (the join codes, while shared), state: unknown | online | gone (the server no longer has it: removed or expired), expires, session, document (the session and open document it is in now, or null), hasOwnerToken: true, sealed (end-to-end encrypted: its name is opened with the key kept on this computer)}], problems: [{server, host, state: offline | unsupported (a server older than this request), reason}], max}: the files you published or shared without a server key, most recently opened first, as recorded on this computer with the preferences. Owner tokens and your own links are never in the result",
             false,
             files
         ),

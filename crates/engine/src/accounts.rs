@@ -359,14 +359,17 @@ fn role_id(r: Role) -> &'static str {
     r.id()
 }
 
-fn my_file_json(f: &MyFile) -> Value {
-    json!({"file": f.info.id, "name": f.info.name, "role": role_id(f.role), "people": f.info.people, "updated": f.info.updated})
+/// One of your files on `server`: a sealed file's name opened with its key kept here, else
+/// "Encrypted file" (`sealed: true` either way).
+fn my_file_json(s: &Session, server: &str, f: &MyFile) -> Value {
+    let (name, sealed) = s.listed_name(server, &f.info.id, &f.info.name, None);
+    json!({"file": f.info.id, "name": name, "sealed": sealed, "role": role_id(f.role), "people": f.info.people, "updated": f.info.updated})
 }
 
 fn files(s: &mut Session, p: &Value) -> Result<Value> {
     let server = s.account_server("account.files", p)?;
     match s.account_request("account.files", &server, AccountReq::Files)? {
-        AccountReply::Files(list) => Ok(json!({"server": server, "files": list.iter().map(my_file_json).collect::<Vec<_>>()})),
+        AccountReply::Files(list) => Ok(json!({"server": server, "files": list.iter().map(|f| my_file_json(s, &server, f)).collect::<Vec<_>>()})),
         _ => Err(EngineError::Other("the server answered something else".into())),
     }
 }
@@ -469,7 +472,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "account.files",
             "Your files on server",
-            "{server?} → {server, files: [{file, name, role: owner | editor | viewer, people, updated}]}: the files you're in on a server with accounts (join one with `collab.join {link: \"figcraft://join?server=…&file=…\"}`)",
+            "{server?} → {server, files: [{file, name, sealed (end-to-end encrypted: its name opened with the key kept on this computer, else \"Encrypted file\"), role: owner | editor | viewer, people, updated}]}: the files you're in on a server with accounts (join one with `collab.join {link: \"figcraft://join?server=…&file=…\"}`)",
             false,
             files
         ),

@@ -112,6 +112,8 @@ mod accounts_tests;
 #[cfg(test)]
 mod admin_tests;
 #[cfg(test)]
+mod app_sealed_tests;
+#[cfg(test)]
 mod background_tests;
 #[cfg(test)]
 mod cli_tests;

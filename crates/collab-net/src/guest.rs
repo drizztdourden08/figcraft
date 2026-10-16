@@ -6,7 +6,9 @@
 //! refusal or the host ending the session is final.
 //!
 //! Publishing ([`Guest::publish`]) first uploads the document to a server over a managing
-//! connection, then joins the new file with its edit link on the same thread.
+//! connection, then joins the new file with its edit link on the same thread. A sealed
+//! (end-to-end encrypted) publish makes a new file key, seals the document and its name for a file
+//! id of its own choosing ([`upload_sealed`]), and its links carry the key after `#k=`.
 
 use std::io;
 use std::net::TcpStream;
@@ -15,10 +17,12 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel}
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use figcraft_auth::E2eMode;
 use figcraft_collab::Replica;
 use figcraft_collab::message::{self, AccountReply, AccountReq, Admin, AdminReply, ClientMsg, HostInfo, Presence, ServerMsg};
+use figcraft_collab_seal::{FileKey, Slot, link_fragment, seal, seal_change};
 use figcraft_doc::Document;
-use figcraft_engine::live::{Event, Published, Status};
+use figcraft_engine::live::{Event, Published, Shared, Status};
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, Role as WsRole, WebSocket};
 use tungstenite::{Bytes, Message};
@@ -26,10 +30,11 @@ use tungstenite::{Bytes, Message};
 use crate::inbox::Inbox;
 use crate::invite::{Endpoint, Invite};
 pub use crate::join::GuestConfig;
-use crate::join::{Next, Outcome, Resuming, Seen, Taken, after, closed, hello, resolved, sign_in, take, unresolved};
+use crate::join::{Next, Outcome, Resuming, Seen, Taken, after, closed, hello, outgoing, resolved, sign_in, take, unresolved};
 use crate::manage;
 use crate::net::{Duplex, NetLimits, config, open, shutdown};
 use crate::throttle::{PRESENCE_INTERVAL, Throttle, earliest};
+use crate::token;
 
 /// What [`Guest::publish`] uploads, and where.
 pub struct Publish {
@@ -43,7 +48,14 @@ pub struct Publish {
     pub share: bool,
     /// Your session token there: published as yours on a server with accounts (no key).
     pub session: Option<String>,
+    /// Sealed (end-to-end encrypted): `Some(true)` sealed, `Some(false)` plain, `None` as the
+    /// server prefers (sealed when its `e2e` mode is `required`). See [`sealed_or_not`].
+    pub sealed: Option<bool>,
 }
+
+/// What a server whose `[e2e] mode` is off (or that is older than sealed files) says to a sealed
+/// publish, before anything is sent.
+pub const NO_SEALED_FILES: &str = "this server doesn't keep end-to-end encrypted files (its operator turned them off, or it is older than this app): publish without encryption, or use another server";
 
 /// A joined (or joining) session. Dropping it leaves.
 pub struct Guest {
@@ -109,7 +121,7 @@ impl Guest {
                 }
                 let owner = published.owner.as_deref().unwrap_or_default();
                 let made = manage::share(&job.server, job.key.as_deref(), &published.file, owner, &[], true, &cfg.limits, cfg.connect_timeout);
-                made.and_then(|s| s.ok_or_else(|| "the server didn't make the links".to_string()))
+                made.and_then(|s| s.ok_or_else(|| "the server didn't make the links".to_string())).map(|s| keyed(s, cfg.invite.key.as_ref()))
             });
             if let Some(h) = hosting {
                 inbox.push(Event::Hosting(h));
@@ -193,7 +205,7 @@ pub(crate) fn upload_owned(
             Some(AccountReply::Failed { reason }) => return Err(reason),
             _ => return Err("the server didn't say where the file is".into()),
         };
-    let member = Invite { server: server.clone(), file: file.id.clone(), token: String::new() };
+    let member = Invite { server: server.clone(), file: file.id.clone(), token: String::new(), key: None };
     let published =
         Published { server: server.display(), file: file.id, name: file.name, edit: member.link(), view: member.link(), owner: None, expires: None };
     Ok((member, published))
@@ -225,15 +237,146 @@ pub(crate) fn upload_file(
         Some(AdminReply::Failed { reason }) => return Err(reason),
         _ => return Err("the server didn't say where the file is".into()),
     };
-    let link = |token: String| Invite { server: server.clone(), file: file.id.clone(), token };
+    let link = |token: String| Invite { server: server.clone(), file: file.id.clone(), token, key: None };
     let (edit, view) = (link(edit.token), link(view.token));
     let published =
         Published { server: server.display(), file: file.id.clone(), name: file.name, edit: edit.link(), view: view.link(), owner, expires };
     Ok((edit, published, hosting))
 }
 
+/// Links others join a sealed file with carry its key; a join code can't, so they have none.
+pub(crate) fn keyed(mut shared: Shared, key: Option<&FileKey>) -> Shared {
+    let Some(key) = key else { return shared };
+    let fragment = format!("#{}", link_fragment(key));
+    for l in std::iter::once(&mut shared.edit).chain(shared.view.as_mut()) {
+        if !l.link.contains('#') {
+            l.link.push_str(&fragment);
+        }
+        l.code = None;
+    }
+    shared
+}
+
+/// Whether a publish to `server` is sealed: as asked (a sealed one only where the server keeps
+/// them), or without a choice as the server prefers. The server is asked first, so a document
+/// meant to be sealed never reaches a server that would refuse it; one that can't be asked takes
+/// plain files only when there is no choice (its own answer to the publish says why).
+pub(crate) fn sealed_or_not(server: &Endpoint, want: Option<bool>, limits: &NetLimits, timeout: Duration) -> Result<bool, String> {
+    if want == Some(false) {
+        return Ok(false);
+    }
+    match (want, manage::info(server, limits, timeout)) {
+        (Some(true), Ok(info)) if info.e2e == E2eMode::Off => Err(NO_SEALED_FILES.into()),
+        (Some(true), Ok(_)) => Ok(true),
+        (Some(true), Err(e)) => Err(e),
+        (_, Ok(info)) => Ok(info.e2e == E2eMode::Required),
+        (_, Err(_)) => Ok(false),
+    }
+}
+
+/// How many file ids a sealed publish tries when the server says one is taken.
+const ID_TRIES: usize = 4;
+
+/// Keep `doc` on `server` as a new sealed file named `name`: a new file key, a random file id the
+/// document and its name are sealed for (another when the server says that one is taken). As
+/// yours when signed in with `session` (and no `key`), else with the server's `key` or as anyone
+/// may on a server open to the public. Its edit link (with the key), where it is with its links
+/// (`#k=…` in each: what opens it), and what the server says about its hosting (without a key).
+pub(crate) fn upload_sealed(
+    server: &Endpoint,
+    key: Option<&str>,
+    session: Option<&str>,
+    name: &str,
+    doc: &Document,
+    limits: &NetLimits,
+    timeout: Duration,
+) -> Result<(Invite, Published, Option<HostInfo>), String> {
+    let file_key = FileKey::generate().map_err(|e| e.to_string())?;
+    let plain = Replica::new(doc.clone()).snapshot().map_err(|e| e.to_string())?;
+    let sealing = |e: figcraft_collab_seal::SealError| format!("couldn't encrypt the file: {e}");
+    let mut last = String::from("the server didn't say where the file is");
+    for _ in 0..ID_TRIES {
+        let id = token::file_id()?;
+        let snapshot = plain.iter().map(|c| seal_change(&file_key, &id, c)).collect::<Result<Vec<_>, _>>().map_err(sealing)?;
+        let sealed_name = seal(&file_key, &id, &Slot::Meta { what: "name".into() }, name.as_bytes()).map_err(sealing)?;
+        let link = |token: String| Invite { server: server.clone(), file: id.clone(), token, key: Some(file_key.clone()) };
+        let refused = match (session, key) {
+            // Signed in, without the server's key: as yours (a server with accounts).
+            (Some(session), None) => {
+                let publish = AccountReq::PublishSealed { file: id.clone(), name: sealed_name, snapshot };
+                match manage::account(server, session, vec![publish], limits, timeout)?.into_iter().next() {
+                    Some(AccountReply::Published { file }) => {
+                        let member = link(String::new());
+                        let published = Published {
+                            server: server.display(),
+                            file: file.id,
+                            name: name.to_string(),
+                            edit: member.link(),
+                            view: member.link(),
+                            owner: None,
+                            expires: None,
+                        };
+                        return Ok((member, published, None));
+                    }
+                    Some(AccountReply::Failed { reason }) => reason,
+                    _ => return Err("the server didn't say where the file is".into()),
+                }
+            }
+            _ => {
+                let publish = vec![Admin::PublishSealed { file: id.clone(), name: sealed_name, snapshot }];
+                let (replies, hosting) = match key {
+                    Some(key) => (manage::request(server, key, publish, limits, timeout)?, None),
+                    None => {
+                        let (info, replies) = manage::hosting(server, "", "", publish, limits, timeout)?;
+                        (replies, Some(info))
+                    }
+                };
+                let (file, edit, view, owner, expires) = match replies.into_iter().next() {
+                    Some(AdminReply::Published { file, edit, view }) => (file, edit, view, None, None),
+                    Some(AdminReply::Hosted { file, edit, view, owner, expires }) => (file, edit, view, Some(owner), expires),
+                    Some(AdminReply::Failed { reason }) => {
+                        last = reason;
+                        if last.contains("taken") {
+                            continue;
+                        }
+                        break;
+                    }
+                    _ => return Err("the server didn't say where the file is".into()),
+                };
+                let (edit, view) = (link(edit.token), link(view.token));
+                let published = Published {
+                    server: server.display(),
+                    file: file.id,
+                    name: name.to_string(),
+                    edit: edit.link(),
+                    view: view.link(),
+                    owner,
+                    expires,
+                };
+                return Ok((edit, published, hosting));
+            }
+        };
+        // Another id when that one is taken (two apps picked the same 64 random bits).
+        last = refused;
+        if !last.contains("taken") {
+            break;
+        }
+    }
+    Err(last)
+}
+
 /// Upload the document; the join settings for the new file, its links and the server's hosting.
 fn upload(job: &Publish, mut cfg: GuestConfig) -> Result<(GuestConfig, Published, Option<HostInfo>), String> {
+    if sealed_or_not(&job.server, job.sealed, &cfg.limits, cfg.connect_timeout)? {
+        let session = job.session.as_deref().filter(|_| job.key.is_none());
+        let (invite, published, hosting) =
+            upload_sealed(&job.server, job.key.as_deref(), session, &job.name, &job.doc, &cfg.limits, cfg.connect_timeout)?;
+        cfg.invite = invite;
+        if let Some(s) = session {
+            cfg.session = Some(s.to_string());
+        }
+        return Ok((cfg, published, hosting));
+    }
     // Signed in, without the key: as yours (a server with accounts).
     if let (Some(session), None) = (&job.session, &job.key) {
         let (member, published) = upload_owned(&job.server, session, &job.name, &job.doc, &cfg.limits, cfg.connect_timeout)?;
@@ -348,13 +491,31 @@ fn session(
                 Ok(Cmd::Welcomed(_) | Cmd::Lost(..)) => {}
                 Err(RecvTimeoutError::Timeout) => {}
             }
+            // A sealed file's: sealed on their way out.
+            let mut unsealable = None;
+            let now_send: Vec<ClientMsg> = now_send
+                .into_iter()
+                .filter_map(|m| match outgoing(cfg, resume, m) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        unsealable.get_or_insert(e);
+                        None
+                    }
+                })
+                .collect();
+            if let Some(why) = unsealable {
+                break Outcome::Failed(why);
+            }
             if !now_send.iter().all(|m| send(&mut writer, m, &mut last_sent)) {
                 break Outcome::Retry("the connection dropped".into());
             }
             let now = Instant::now();
-            let out = out.or_else(|| throttle.take_due(now));
+            let out = match out.or_else(|| throttle.take_due(now)).map(|p| outgoing(cfg, resume, ClientMsg::Presence(p))).transpose() {
+                Ok(p) => p.flatten(),
+                Err(why) => break Outcome::Failed(why),
+            };
             let ok = match out {
-                Some(p) => send(&mut writer, &ClientMsg::Presence(p), &mut last_sent),
+                Some(p) => send(&mut writer, &p, &mut last_sent),
                 None if now >= last_sent + cfg.limits.keepalive => send(&mut writer, &ClientMsg::Ping, &mut last_sent),
                 None => true,
             };

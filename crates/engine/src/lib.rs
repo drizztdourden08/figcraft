@@ -26,6 +26,7 @@ pub mod devcompare;
 pub mod devinspect;
 pub mod distance;
 pub mod drop;
+pub mod file_keys;
 pub mod guard;
 pub mod guides;
 pub mod inspect;
@@ -645,6 +646,10 @@ pub struct Prefs {
     /// The servers you are signed in to, with your session tokens there (see `accounts`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub accounts: Vec<accounts::SignedIn>,
+    /// The keys of the sealed (end-to-end encrypted) files you published, by server and file id
+    /// (passwords: see [`file_keys`]), newest first, at most [`file_keys::MAX_FILE_KEYS`].
+    #[serde(skip_serializing_if = "Vec::is_empty", deserialize_with = "file_keys::read")]
+    pub file_keys: Vec<file_keys::KeptKey>,
     /// The Getting started tips on the home screen were closed (Help ▸ Getting started shows them
     /// again).
     pub getting_started_dismissed: bool,
@@ -682,6 +687,7 @@ impl Default for Prefs {
             recent_files: Vec::new(),
             online_files: Vec::new(),
             accounts: Vec::new(),
+            file_keys: Vec::new(),
             getting_started_dismissed: false,
             home_views: BTreeMap::new(),
             home_sort: "modified".into(),
@@ -1535,6 +1541,8 @@ mod fig_export_assets_tests;
 mod fig_export_tests;
 #[cfg(test)]
 mod fig_import_tests;
+#[cfg(test)]
+mod file_keys_tests;
 #[cfg(test)]
 mod frame_guides_tests;
 #[cfg(test)]

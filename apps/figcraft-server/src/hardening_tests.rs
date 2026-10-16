@@ -152,7 +152,7 @@ fn a_client_that_never_reads_can_queue_only_so_much() {
         let mut store = Store::open(dir.path(), cfg.store()).unwrap();
         let (file, _, view) = store.publish("Library", &snapshot("Library")).unwrap();
         store.publish_library(&file.id, &archive(0, 1_500_000)).unwrap();
-        Invite { server: Endpoint::plain("x"), file: file.id, token: view.token }
+        Invite { server: Endpoint::plain("x"), file: file.id, token: view.token, key: None }
     };
     let mut server = crate::start(&cfg).unwrap();
     let mut raw = Raw::connect(server.addr());
@@ -297,7 +297,7 @@ fn usage_reports_dont_rewrite_a_file_per_request() {
         let mut store = Store::open(dir.path(), cfg.store()).unwrap();
         let (file, _, view) = store.publish("Library", &snapshot("Library")).unwrap();
         store.publish_library(&file.id, &archive(0, 0)).unwrap();
-        Invite { server: Endpoint::plain("x"), file: file.id, token: view.token }
+        Invite { server: Endpoint::plain("x"), file: file.id, token: view.token, key: None }
     };
     let usage_file = dir.path().join("files").join(&view.file).join("usage.json");
     let mut server = crate::start(&cfg).unwrap();
@@ -480,7 +480,7 @@ fn revoking_or_removing_cuts_library_connections_too() {
     };
     let mut server = crate::start(&cfg).unwrap();
     let addr = server.addr();
-    let invite = Invite { server: Endpoint::plain("x"), file: file.clone(), token: view.token.clone() };
+    let invite = Invite { server: Endpoint::plain("x"), file: file.clone(), token: view.token.clone(), key: None };
     let mut lib = Raw::connect(addr);
     lib.send(&open_library(&invite));
     lib.next();

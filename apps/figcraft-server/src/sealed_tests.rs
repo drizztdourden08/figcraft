@@ -111,8 +111,8 @@ fn sealed_batch(key: &FileKey, msg: ClientMsg) -> ClientMsg {
 }
 
 fn hello(token: &str) -> Hello {
-    let ClientMsg::Hello(mut h) = Client::hello(FILE, token, "Ada", "#FF8800") else { panic!() };
-    h.client_version.push_str(" sealed");
+    let ClientMsg::Hello(h) = Client::hello(FILE, token, "Ada", "#FF8800") else { panic!() };
+    assert!(message::reads_sealed(&h.client_version), "this build announces sealed files");
     h
 }
 
@@ -308,7 +308,8 @@ fn canary_a_sealed_session_leaves_nothing_readable_on_the_server() {
     let AdminReply::Published { edit, .. } = *r else { panic!("{r:?}") };
     // An app that doesn't know sealed files is told so.
     let mut old = Raw::connect(addr);
-    let ClientMsg::Hello(plain) = Client::hello(FILE, &edit.token, "Old", "#000000") else { panic!() };
+    let ClientMsg::Hello(mut plain) = Client::hello(FILE, &edit.token, "Old", "#000000") else { panic!() };
+    plain.client_version = plain.client_version.replace(" sealed", "");
     old.send(&ClientMsg::Hello(plain));
     assert_eq!(old.next(), ServerMsg::Refused { reason: NEEDS_SEALED.into() });
     // Two sealing clients.

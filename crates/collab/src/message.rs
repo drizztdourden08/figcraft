@@ -35,9 +35,11 @@ pub fn reads_sealed(client_version: &str) -> bool {
     client_version.split_whitespace().any(|w| w == SEALED)
 }
 
-/// The `client_version` this build announces: its version, then what it reads beyond the protocol.
+/// The `client_version` this build announces: its version, then what it reads beyond the protocol
+/// (sealed files: the app's transport seals and opens around the sync client, see
+/// `figcraft-collab-net`).
 pub fn client_version() -> String {
-    format!("{} {SIGNALS} {HOSTING}", env!("CARGO_PKG_VERSION"))
+    format!("{} {SIGNALS} {HOSTING} {SEALED}", env!("CARGO_PKG_VERSION"))
 }
 
 /// A [`Hello::client_version`] that announces [`SIGNALS`].

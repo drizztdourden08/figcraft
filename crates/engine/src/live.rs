@@ -58,6 +58,7 @@ pub use figcraft_collab::message::{Peer, Presence};
 
 use crate::cmd::CommandSpec;
 use crate::collab::EngineRecompute;
+use crate::file_keys::sealed_link;
 use crate::params::{get, num, req_string, string};
 use crate::tools::ToolId;
 use crate::{DocState, EngineError, Result, Session, TextEdit, ViewState, bad, spec};
@@ -473,6 +474,10 @@ pub struct PublishOptions {
     /// Your session token on that server, when you are signed in there: the file is published as
     /// yours (you are its owner) on a server with accounts.
     pub session: Option<String>,
+    /// Seal the file (end-to-end encrypted: the server can't read it; its links carry the key
+    /// after `#k=`): `Some(true)` sealed (refused by a server that doesn't keep sealed files),
+    /// `Some(false)` plain, `None` as the server prefers (sealed when it keeps only sealed files).
+    pub sealed: Option<bool>,
 }
 
 /// The networking behind live sessions, installed by the app ([`Lives::install`]). It carries
@@ -1087,6 +1092,8 @@ impl Session {
                 }
                 let server = live.server.clone();
                 live.published = Some(p.clone());
+                // A sealed file's key, so you can open it again (its links carry it).
+                self.keep_file_key(&server, &p.file, &p.edit);
                 self.online_published(&server, &p);
             }
             Event::Shared(Ok(links)) => {
@@ -1565,6 +1572,7 @@ impl Session {
                     "role": o.role(),
                     "fileName": info.map(|i| i.file_name.as_str()),
                     "link": info.map(|i| i.link.as_str()),
+                    "sealed": info.is_some_and(|i| sealed_link(&i.link)),
                     "peers": o.peers.len(),
                 })
             })
@@ -1587,6 +1595,8 @@ impl Session {
             "address": info.map(|i| i.address.as_str()),
             "network": info.map(|i| i.network),
             "access": l.client.as_ref().map(Client::access).or(info.map(|i| i.access)),
+            // End-to-end encrypted: the session's link carries the file's key.
+            "sealed": info.is_some_and(|i| sealed_link(&i.link)) || l.published.as_ref().is_some_and(|p| sealed_link(&p.edit)),
             "readOnly": l.doc_uid.is_some_and(|u| self.live_read_only(u).is_some()),
             "published": l.published,
             "code": l.share.as_ref().and_then(Share::code),
@@ -1691,8 +1701,13 @@ fn start_publish(s: &mut Session, cmd: &str, server: &str, p: &Value, share: boo
     let me = display_name(&s.prefs);
     // Signed in there: published as yours (on a server with accounts), and joined as you.
     let session = s.signed_in(server).map(|a| a.session.clone());
+    let sealed = match get(p, "sealed") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_bool().ok_or_else(|| bad(cmd, "`sealed` must be true or false"))?),
+    };
     s.share_sign_ins();
-    let opts = PublishOptions { server: server.trim().to_string(), key, name: name.unwrap_or_else(|| doc.name.clone()), me, doc, share, session };
+    let opts =
+        PublishOptions { server: server.trim().to_string(), key, name: name.unwrap_or_else(|| doc.name.clone()), me, doc, share, session, sealed };
     let (id, ()) = s.live.start(cmd, |l, id| l.publish(id, opts).map_err(|e| bad(cmd, e)))?;
     // This tab becomes the server file's synced document once it is there.
     s.live.open(Live { id, status: Status::Connecting, doc_uid: Some(uid), tab: Some(uid), server: server.trim().to_string(), ..Live::default() });
@@ -1838,12 +1853,16 @@ fn manage_file(s: &mut Session, p: &Value) -> Result<Value> {
         "rename" => {
             let name = req_string(CMD, p, "name")?;
             renamed = Some(name.clone());
-            Admin::Rename { file: file.clone(), name }
+            // A sealed file's name is sealed too (with its key kept here).
+            match s.seal_name(&server, &file, &name) {
+                Some(sealed) => Admin::RenameSealed { file: file.clone(), name: sealed.map_err(EngineError::Other)? },
+                None => Admin::Rename { file: file.clone(), name },
+            }
         }
         "remove" => Admin::Remove { file: file.clone() },
         _ => return Err(bad(CMD, "`action` must be links, createLink, revoke, share, unshare, rename or remove")),
     };
-    let changes = matches!(req, Admin::Rename { .. } | Admin::Remove { .. });
+    let changes = matches!(req, Admin::Rename { .. } | Admin::RenameSealed { .. } | Admin::Remove { .. });
     let reply = hosting_request(s, CMD, &server, &file, &owner, Some(req))?.1;
     // The record follows what the server did.
     if changes && reply == Some(AdminReply::Done) {
@@ -1857,7 +1876,11 @@ fn manage_file(s: &mut Session, p: &Value) -> Result<Value> {
             "id": l.id, "access": l.access.id(), "label": l.label, "created": l.created
         })).collect::<Vec<_>>()})),
         // The link layer gives the new link whole in place of its token.
-        Some(AdminReply::Link(l)) => Ok(json!({"id": l.link.id, "access": l.link.access.id(), "link": l.token})),
+        // A sealed file's carries its key.
+        Some(AdminReply::Link(l)) => {
+            let link = s.file_key(&server, &file).filter(|_| !l.token.contains('#')).map_or_else(|| l.token.clone(), |k| format!("{}#{k}", l.token));
+            Ok(json!({"id": l.link.id, "access": l.link.access.id(), "link": link}))
+        }
         Some(AdminReply::Done) => Ok(json!({"done": true})),
         _ => Err(bad(CMD, "the server answered something else")),
     }
@@ -1909,7 +1932,9 @@ pub(crate) fn start_join(
     let (name, tab) = (display_name(&s.prefs), s.tab());
     // Where you are signed in, joining signs in first.
     s.share_sign_ins();
-    let (id, ()) = s.live.start(cmd, |l, id| l.join_resuming(id, link, &name, resume).map_err(|e| bad(cmd, e)))?;
+    // A sealed file of yours opens with the key kept for it (a member's link has none).
+    let link = s.link_with_key(link);
+    let (id, ()) = s.live.start(cmd, |l, id| l.join_resuming(id, &link, &name, resume).map_err(|e| bad(cmd, e)))?;
     let server = share.as_ref().map(|s| s.server.clone()).unwrap_or_default();
     // The session's file opens in a tab of its own; until then the join shows on this one.
     s.live.open(Live { id, status: Status::Connecting, tab, server, published, share, ..Live::default() });
@@ -2050,7 +2075,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "collab.share",
             "Share with a join code",
-            "{via?: \"online\" (default: the open file is kept on the server in Preferences, `pref.publishServer`, and the server hands out the codes) | \"local\" (this app hosts it for people on the same network; no server), access?: \"edit\" (default) | \"view\" (online only: which code `code` is), server? (online: another server's address, with ?key=… when it needs its key), name? (online: the file's name there), port?, bind?: \"lan\" (default) | \"local\" (this machine only) | an IP address (local)} → the open file's session as `collab.peers` gives it: `code` is what others type to join (`collab.join {code}`, the Join field), `link` an invite link. Local: at once, the code carries the host's IPv4 address, port and secret (K7M2Q-…, 20 symbols). Online: status \"connecting\" first; once live `code` is the server's (K7M-2QX-9TD) and `share` is {via, access, shared, editCode, viewCode, editLink, viewLink}: links made for others (the file's own links in `published` stay yours); `code` stays null when the server is older than join codes (give `share.editLink` / `share.viewLink` instead). Called again while shared: only switches which code `code` is (`access`). Called after `collab.stop` on a file that is still on the server: new links and codes for that same file (nothing is published twice). `collab.stop` stops sharing",
+            "{via?: \"online\" (default: the open file is kept on the server in Preferences, `pref.publishServer`, and the server hands out the codes) | \"local\" (this app hosts it for people on the same network; no server), access?: \"edit\" (default) | \"view\" (online only: which code `code` is), server? (online: another server's address, with ?key=… when it needs its key), name? (online: the file's name there), sealed? (online: end-to-end encrypted, as `collab.publish`; such a file is shared by links only, which carry its key), port?, bind?: \"lan\" (default) | \"local\" (this machine only) | an IP address (local)} → the open file's session as `collab.peers` gives it: `code` is what others type to join (`collab.join {code}`, the Join field), `link` an invite link. Local: at once, the code carries the host's IPv4 address, port and secret (K7M2Q-…, 20 symbols). Online: status \"connecting\" first; once live `code` is the server's (K7M-2QX-9TD) and `share` is {via, access, shared, editCode, viewCode, editLink, viewLink}: links made for others (the file's own links in `published` stay yours); `code` stays null when the server is older than join codes (give `share.editLink` / `share.viewLink` instead). Called again while shared: only switches which code `code` is (`access`). Called after `collab.stop` on a file that is still on the server: new links and codes for that same file (nothing is published twice). `collab.stop` stops sharing",
             false,
             share
         ),
@@ -2078,7 +2103,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "collab.publish",
             "Publish to server",
-            "{server: ws://host:port/?key=… or wss://host/path/?key=… (the server's address with its key; `figcraft-server key` prints it; without a key on a server open to the public), key? (when the address has none), name? (default: the file's name)} → status \"connecting\": the open file is uploaded as a new file and this tab syncs through the server; `collab.peers` then has `published: {server, file, name, edit, view, owner (published without a key: the owner token, shown once), expires (seconds since 1970, or null)}` and `hosting` (the server's operator, terms and idle expiry)",
+            "{server: ws://host:port/?key=… or wss://host/path/?key=… (the server's address with its key; `figcraft-server key` prints it; without a key on a server open to the public), key? (when the address has none), name? (default: the file's name), sealed? (true: end-to-end encrypted, so the server can't read it: its links carry the key after #k=, and it has no join codes; refused by a server that doesn't keep encrypted files. false: plain. Default: sealed when the server keeps only encrypted files)} → status \"connecting\": the open file is uploaded as a new file and this tab syncs through the server; `collab.peers` then has `published: {server, file, name, edit, view, owner (published without a key: the owner token, shown once), expires (seconds since 1970, or null)}` and `hosting` (the server's operator, terms and idle expiry)",
             false,
             publish
         ),
@@ -2106,7 +2131,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "collab.peers",
             "People in this file",
-            "{} → the open file's session (each open file has its own or none): {available, canHost (false in the browser: it can only join), session (its id; null: this file isn't in a session), status: off|connecting|live|reconnecting|failed, reason?, role, me, name, color, fileName, pages, link, url, address, network, access: edit|view (view: a server's view link; edits are refused), readOnly (the open file can't be edited now: view only, or being published), published (a file you published: {server, file, name, edit, view}), code (the join code to give others, when the file was shared with `collab.share`; null otherwise or while it is on its way), share ({via: online|local, access, shared (false: a file of yours on a server that nobody else gets into now), editCode, viewCode, editLink, viewLink (what others join with; null when not shared)} or null), follow, syncing, document (index of the synced open document), editing (the text layer you type in: {node, layer, caret, selection}), peers: [{id, name, color, editing (theirs, same shape, or null), presence: {cursor: [page, x, y], selection, viewport: [page, x, y, w, h], editing_text}}], sessions: [{session, document (index of its open document; null for a join on its way), status, reason, role, fileName, link, peers (how many others)}] (every session of the app)}",
+            "{} → the open file's session (each open file has its own or none): {available, canHost (false in the browser: it can only join), session (its id; null: this file isn't in a session), status: off|connecting|live|reconnecting|failed, reason?, role, me, name, color, fileName, pages, link, url, address, network, access: edit|view (view: a server's view link; edits are refused), readOnly (the open file can't be edited now: view only, or being published), sealed (the file is end-to-end encrypted: its links carry the key after #k=), published (a file you published: {server, file, name, edit, view}), code (the join code to give others, when the file was shared with `collab.share`; null otherwise or while it is on its way), share ({via: online|local, access, shared (false: a file of yours on a server that nobody else gets into now), editCode, viewCode, editLink, viewLink (what others join with; null when not shared)} or null), follow, syncing, document (index of the synced open document), editing (the text layer you type in: {node, layer, caret, selection}), peers: [{id, name, color, editing (theirs, same shape, or null), presence: {cursor: [page, x, y], selection, viewport: [page, x, y, w, h], editing_text}}], sessions: [{session, document (index of its open document; null for a join on its way), status, reason, role, fileName, link, sealed, peers (how many others)}] (every session of the app)}",
             false,
             |s, _| Ok(s.live_summary())
         ),

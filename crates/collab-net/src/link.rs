@@ -188,9 +188,9 @@ impl LiveLink for NetLink {
         // Without a key: as anyone may, when the server is open to the public (it says if not).
         let key = o.key.or_else(|| query.into_iter().find(|(k, _)| k == "key").map(|(_, v)| v)).filter(|k| !k.trim().is_empty());
         // Until the upload is done the invite names only the server.
-        let cfg = self.guest_config(Invite { server: server.clone(), file: String::new(), token: String::new() }, None, &o.me);
+        let cfg = self.guest_config(Invite { server: server.clone(), file: String::new(), token: String::new(), key: None }, None, &o.me);
         let inbox = self.sessions.inbox();
-        let job = Publish { server, key, name: o.name, doc: o.doc, share: o.share, session: o.session };
+        let job = Publish { server, key, name: o.name, doc: o.doc, share: o.share, session: o.session, sealed: o.sealed };
         let guest = Guest::publish(job, cfg, inbox.clone()).map_err(|e| format!("can't start the connection: {e}"))?;
         self.started(session, Active::Guest(guest), inbox);
         Ok(())
@@ -354,7 +354,7 @@ fn hosting(server: &str, file: &str, owner: &str, req: Option<Admin>, limits: &N
     let (info, replies) = manage::hosting(&endpoint, file, owner, req.into_iter().collect(), limits, CONNECT)?;
     let reply = replies.into_iter().next().map(|r| match r {
         AdminReply::Link(mut l) => {
-            l.token = Invite { server: endpoint.clone(), file: l.link.file.clone(), token: l.token }.link();
+            l.token = Invite { server: endpoint.clone(), file: l.link.file.clone(), token: l.token, key: None }.link();
             AdminReply::Link(l)
         }
         other => other,

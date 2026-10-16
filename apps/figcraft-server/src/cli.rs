@@ -448,7 +448,7 @@ fn new_link(cfg: &Config, l: &NewLink) -> Result<String, String> {
         Ok(a) if store::lock(&cfg.data)?.is_none() => a,
         _ => cfg.addr()?,
     };
-    let invite = Invite { server: public_endpoint(cfg, listen)?, file: l.link.file.clone(), token: l.token.clone() };
+    let invite = Invite { server: public_endpoint(cfg, listen)?, file: l.link.file.clone(), token: l.token.clone(), key: None };
     let mut out = String::new();
     let what = if l.link.access == Access::View { "view" } else { "edit" };
     let _ = writeln!(out, "New {what} link {} for file {}:", l.link.id, l.link.file);
