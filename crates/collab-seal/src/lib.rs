@@ -20,7 +20,6 @@
 //!
 //! Every parser takes untrusted bytes and fails with a [`SealError`]; nothing here panics.
 
-mod bin;
 mod change;
 mod device;
 mod keys;
@@ -39,7 +38,7 @@ pub use device::{DeviceKeys, DevicePublic, Wrapped, unwrap, verify, wrap};
 pub use figcraft_collab::sealed::{
     EntryKey, MAX_PLAINTEXT, Sealed, SealedChange, SealedEntry, is_container_tag, is_page_tag, kind_tag, node_kind_tag, padded_len,
 };
-pub use keys::{FileKey, Keyring, entry_id, link_fragment, parse_link_fragment};
+pub use keys::{FileKey, Keyring, MAX_LINK_EPOCHS, entry_id, link_fragment, parse_link_fragment, parse_ring_fragment, ring_fragment};
 pub use recovery::RecoveryKey;
 pub use seal::{Slot, open, seal};
 

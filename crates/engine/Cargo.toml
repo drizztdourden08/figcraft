@@ -17,6 +17,8 @@ figcraft-collab = { workspace = true }
 figcraft-auth = { workspace = true }
 # Opening the names of sealed files in listings with the keys kept with the preferences.
 figcraft-collab-seal = { workspace = true }
+# Wiping device secrets from memory (`devices`).
+zeroize = "1"
 figcraft-layout = { workspace = true }
 figcraft-text = { workspace = true }
 figcraft-pathops = { workspace = true }

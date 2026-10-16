@@ -124,6 +124,61 @@ pub fn parse_sealed_name(text: &str) -> Option<Sealed> {
     Sealed::from_bytes(bytes).ok()
 }
 
+/// The bytes of a [`Wrapped`] file key's ciphertext: a 68-byte file key and its 16-byte tag.
+pub const WRAPPED_CIPHERTEXT: usize = 84;
+
+/// A device's public keys, registered with a server under its owner's account
+/// (`docs/accounts-and-e2e.md` › *Keys*): the data only (`figcraft-collab-seal` makes and uses
+/// them).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DevicePublic {
+    /// X25519 public key: file keys are wrapped to it.
+    #[serde(with = "bin")]
+    pub agreement: [u8; 32],
+    /// Ed25519 public key: checks the device's signatures.
+    #[serde(with = "bin")]
+    pub signing: [u8; 32],
+}
+
+/// A file key wrapped to one device: RFC 9180 HPKE base mode, DHKEM(X25519, HKDF-SHA256),
+/// HKDF-SHA256, ChaCha20-Poly1305, `info` = `"figcraft file key v1"`, associated data = the file
+/// id; the plaintext is the 68-byte file key, so the ciphertext is [`WRAPPED_CIPHERTEXT`] bytes.
+/// Wrapping and unwrapping live in `figcraft-collab-seal`; servers keep these as they come
+/// (`keyring.json`) and can't open them.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Wrapped {
+    /// The encapsulated (ephemeral X25519 public) key.
+    #[serde(with = "bin")]
+    pub enc: [u8; 32],
+    #[serde(with = "bin")]
+    pub ciphertext: Vec<u8>,
+}
+
+impl Wrapped {
+    /// `enc (32) ‖ ciphertext (84)`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + self.ciphertext.len());
+        out.extend_from_slice(&self.enc);
+        out.extend_from_slice(&self.ciphertext);
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Wrapped, Error> {
+        let malformed = || Error::Decode("malformed wrapped key".into());
+        if bytes.len() != 32 + WRAPPED_CIPHERTEXT {
+            return Err(malformed());
+        }
+        let enc: [u8; 32] = bytes.get(..32).and_then(|b| b.try_into().ok()).ok_or_else(malformed)?;
+        let ciphertext = bytes.get(32..).ok_or_else(malformed)?.to_vec();
+        Ok(Wrapped { enc, ciphertext })
+    }
+
+    /// Its shape is a wrapped file key's (whether it opens is for the device it was wrapped to).
+    pub fn well_formed(&self) -> bool {
+        self.ciphertext.len() == WRAPPED_CIPHERTEXT
+    }
+}
+
 /// A document-level entry as the server of a sealed file sees it: the kind of entry, and its key
 /// with names (style, collection and variable ids, image hashes) replaced by their entry ids
 /// (`figcraft_collab_seal::entry_id`). Comment and dev snapshot keys are numbers and stay as they

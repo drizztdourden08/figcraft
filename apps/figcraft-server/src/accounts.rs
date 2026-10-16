@@ -1,6 +1,7 @@
 //! People who sign in (`[auth]`, `docs/accounts-and-e2e.md`): the providers built from the
 //! settings, who has signed in (`accounts/people.json`) and their sessions
-//! (`accounts/sessions.json`, tokens kept only as hashes). This is the server's [`Gate`]: sign-in
+//! (`accounts/sessions.json`, tokens kept only as hashes), and their devices and recovery copies
+//! for sealed files (`accounts/devices.json`, `accounts/recovery.json`; see `devices`). This is the server's [`Gate`]: sign-in
 //! steps run in the connection's own thread, so a slow provider holds up only that connection.
 //!
 //! The store looks people up here too (who an invited email belongs to); everything sits behind
@@ -71,7 +72,13 @@ struct State {
     people: Vec<Account>,
     sessions: Vec<Session>,
     device: HashMap<String, Device>,
+    /// Registered devices and recovery copies (sealed files).
+    devices: Vec<devices::DeviceRec>,
+    recovery: Vec<devices::RecoveryRec>,
 }
+
+#[path = "devices.rs"]
+pub mod devices;
 
 /// The accounts side of a server.
 pub struct Accounts {
@@ -115,6 +122,8 @@ impl Accounts {
         let dir = data.join(DIR);
         let people: Vec<Account> = read(&dir.join(PEOPLE))?;
         let sessions: Vec<Session> = read(&dir.join(SESSIONS))?;
+        let devices: Vec<devices::DeviceRec> = read(&dir.join(devices::DEVICES))?;
+        let recovery: Vec<devices::RecoveryRec> = read(&dir.join(devices::RECOVERY))?;
         Ok(Accounts {
             mode: cfg.mode()?,
             e2e,
@@ -122,7 +131,7 @@ impl Accounts {
             session_secs: cfg.session_secs(),
             providers,
             dir,
-            state: Mutex::new(State { people, sessions, device: HashMap::new() }),
+            state: Mutex::new(State { people, sessions, device: HashMap::new(), devices, recovery }),
         })
     }
 
@@ -135,7 +144,7 @@ impl Accounts {
             session_secs: 0,
             providers: Vec::new(),
             dir: data.join(DIR),
-            state: Mutex::new(State { people: Vec::new(), sessions: Vec::new(), device: HashMap::new() }),
+            state: Mutex::new(State { people: Vec::new(), sessions: Vec::new(), device: HashMap::new(), devices: Vec::new(), recovery: Vec::new() }),
         }
     }
 
@@ -315,6 +324,7 @@ impl Accounts {
         if s.sessions.len() != before {
             self.save_sessions(&s)?;
         }
+        self.forget_devices(&mut s, account)?;
         log::info!("event=person_removed account={account}");
         Ok(Some(gone))
     }

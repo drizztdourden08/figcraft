@@ -15,6 +15,8 @@
 //! <data>/files/<id>/library-<version>.bin  its team library, when one was published (a `.figcraft`
 //!                                archive; `library.bin` from servers before versioned names)
 //! <data>/files/<id>/usage.json   how other files use that library, as their apps report it
+//! <data>/files/<id>/keyring.json a sealed file's key wrapped to each member device, by epoch
+//!                                (servers with accounts; see `keyrings`): ciphertext only
 //! <data>/plugins/                the plugin directory (see `directory`)
 //! <data>/blocked.json            addresses the operator blocked
 //! <data>/reports.json            reports people sent about files
@@ -333,6 +335,9 @@ pub struct Store {
 
 #[path = "members.rs"]
 pub mod members;
+
+#[path = "keyrings.rs"]
+pub mod keyrings;
 
 /// Seconds since 1970.
 pub fn now() -> u64 {
@@ -1516,6 +1521,15 @@ pub fn library_name(version: u64) -> String {
 fn library_file(dir: &Path, version: u64) -> PathBuf {
     let path = dir.join(library_name(version));
     if path.exists() { path } else { dir.join(LIBRARY) }
+}
+
+/// A JSON file read back (its type's default when there is none yet).
+fn read_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T, String> {
+    match fs::read(path) {
+        Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("{} is damaged: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(e) => Err(format!("can't read {}: {e}", path.display())),
+    }
 }
 
 fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {

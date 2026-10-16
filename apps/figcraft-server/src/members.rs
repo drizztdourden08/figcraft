@@ -229,7 +229,9 @@ impl Store {
             return Err("a file keeps at least one owner: make someone else owner first, or remove the file".into());
         }
         p.members.remove(i);
-        self.save_meta(file)
+        self.save_meta(file)?;
+        // Their copies of a sealed file's key go; new writes need a new epoch.
+        self.keys_forget(file, account, None)
     }
 
     fn uninvite(&mut self, file: &str, who: &Person, mail: &str) -> Result<(), String> {
@@ -314,6 +316,14 @@ impl Store {
                 Ok(code) => AccountReply::Code { code }.into(),
                 Err(e) => failed(e),
             },
+            req @ (AccountReq::RegisterDevice { .. }
+            | AccountReq::Devices
+            | AccountReq::RevokeDevice { .. }
+            | AccountReq::Keyring { .. }
+            | AccountReq::PutKeys { .. }
+            | AccountReq::PendingKeys
+            | AccountReq::PutRecovery { .. }
+            | AccountReq::GetRecovery) => self.key_request(who, req),
         }
     }
 
@@ -378,8 +388,9 @@ impl Store {
             if let Some(mail) = &mail {
                 p.invited.retain(|v| v.email != *mail);
             }
+            let was_member = p.members.len() != before.0;
             if (p.members.len(), p.invited.len()) != before
-                && let Err(e) = self.save_meta(&id)
+                && let Err(e) = self.save_meta(&id).and_then(|()| if was_member { self.keys_forget(&id, account, None) } else { Ok(()) })
             {
                 // Nothing is half done for the person: they are still on the server, and asking
                 // again finishes the files left.

@@ -88,6 +88,12 @@ impl<S: Socket> Driver<S> {
     }
 
     /// The session is over (left, refused, ended or given up): nothing more will happen.
+    /// A sealed file's keys, shared with the connection (the app adds newer epochs to them).
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn keys(&self) -> Option<&crate::invite::Keys> {
+        self.cfg.invite.key.as_ref()
+    }
+
     pub(crate) fn done(&self) -> bool {
         self.done
     }

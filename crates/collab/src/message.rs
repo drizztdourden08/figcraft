@@ -9,7 +9,7 @@ use figcraft_auth::{ServerInfo, SignIn, SignInReply};
 
 use crate::Error;
 use crate::change::Change;
-use crate::sealed::{Sealed, SealedChange};
+use crate::sealed::{DevicePublic, Sealed, SealedChange, Wrapped};
 
 /// The protocol version a client announces in [`Hello`] (2: the welcome says what you may do, and
 /// connections can manage a server or use a file's team library).
@@ -856,6 +856,96 @@ pub enum AccountReq {
         file: String,
         name: Sealed,
     },
+    /// Register this device's public keys under your account ([`AccountReply::Device`] with its
+    /// id; the same keys again give the same id). `recovery`: the device a recovery key stands
+    /// for ([`AccountReq::PutRecovery`]), not an app install.
+    RegisterDevice {
+        name: String,
+        public: DevicePublic,
+        recovery: bool,
+    },
+    /// Your registered devices ([`AccountReply::Devices`]).
+    Devices,
+    /// Take one of your devices off your account: its wrapped keys go, and every sealed file you
+    /// are in starts a new epoch when an owner's app is next online.
+    RevokeDevice {
+        device: String,
+    },
+    /// A file's key wrapped to your devices, every epoch ([`AccountReply::Keyring`]).
+    Keyring {
+        file: String,
+    },
+    /// Keep wrapped copies of epoch `epoch` of a sealed file's key: `(device id, wrapped)`, each
+    /// for a device of a member (owners and editors wrap for anyone in the file, everyone for
+    /// their own devices; a device that has a copy keeps it). `rotate`: owners start this epoch
+    /// (refused when it exists: someone else started it first).
+    PutKeys {
+        file: String,
+        epoch: u32,
+        rotate: bool,
+        wrapped: Vec<(String, Wrapped)>,
+    },
+    /// The sealed files where devices you may wrap for lack a key you may hold, and those of your
+    /// files that need a new epoch ([`AccountReply::PendingKeys`]).
+    PendingKeys,
+    /// Keep the recovery copy: your recovery device's secret sealed with your recovery key (the
+    /// server can't open it). Replaces the last one.
+    PutRecovery {
+        device: String,
+        sealed: Vec<u8>,
+    },
+    /// Your recovery copy ([`AccountReply::Recovery`]).
+    GetRecovery,
+}
+
+/// A device registered under an account ([`AccountReq::Devices`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub public: DevicePublic,
+    /// When it was registered, and last used (seconds since 1970).
+    pub created: u64,
+    pub seen: u64,
+    /// The device a recovery key stands for.
+    pub recovery: bool,
+}
+
+/// One wrapped copy of a file's key: its epoch, the device it is wrapped to, the copy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyWrap {
+    pub epoch: u32,
+    pub device: String,
+    pub wrapped: Wrapped,
+}
+
+/// A device that lacks epoch `epoch` of a file's key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyWant {
+    pub epoch: u32,
+    pub device: String,
+    pub public: DevicePublic,
+}
+
+/// A sealed file whose keyring wants work ([`AccountReq::PendingKeys`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingFile {
+    pub file: String,
+    /// The newest epoch with copies (`None`: nobody has given the server a copy yet).
+    pub epoch: Option<u32>,
+    /// Someone was taken out, or a device revoked, since that epoch began: an owner starts the
+    /// next one (the devices in `wanted` with the next epoch are every member device now).
+    pub rotate: bool,
+    pub wanted: Vec<KeyWant>,
+}
+
+/// A recovery copy ([`AccountReq::GetRecovery`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryCopy {
+    /// The recovery device the copy holds the secret of.
+    pub device: String,
+    pub sealed: Vec<u8>,
+    pub created: u64,
 }
 
 /// The answer to an [`AccountReq`] (the first one on a connection answers [`OpenAccount`]).
@@ -883,6 +973,20 @@ pub enum AccountReply {
     Failed {
         reason: String,
     },
+    /// A device registered: its id.
+    Device {
+        id: String,
+    },
+    Devices(Vec<DeviceInfo>),
+    /// A file's keyring as you may see it: `sealed` (false: the file is plain and has none), the
+    /// epochs it has, and the copies wrapped to your devices.
+    Keyring {
+        sealed: bool,
+        epochs: Vec<u32>,
+        wrapped: Vec<KeyWrap>,
+    },
+    PendingKeys(Vec<PendingFile>),
+    Recovery(Option<RecoveryCopy>),
 }
 
 /// Client → server.

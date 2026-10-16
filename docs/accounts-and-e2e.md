@@ -14,7 +14,11 @@ and catching up on sealed files (see *Protocol additions* and [`server.md`](serv
 **Step 8 is built**: sealing in the app (see *Sealing in the app*): `collab.publish {sealed}` and
 `collab.share {sealed}` publish a sealed file (with the server's key, as anyone may on an open
 server, or as yours when signed in), its links carry the key after `#k=`, the transport seals and
-opens around the sync client, and the publisher's app keeps the key with its preferences. Sections say what is built as the implementation lands. Builds on [`collab-protocol.md`](collab-protocol.md)
+opens around the sync client, and the publisher's app keeps the key with its preferences. **Step 9
+is built**: sealed files with accounts (see *Sealed files with accounts*): device keys in the OS
+keychain, devices registered per account, each sealed file's key wrapped to every member device in
+the server's `keyring.json`, members and your other devices joining with links that carry no key,
+new epochs when someone is taken out or a device revoked, and recovery keys. Sections say what is built as the implementation lands. Builds on [`collab-protocol.md`](collab-protocol.md)
 (live sessions) and [`server.md`](server.md) (running `figcraft-server`).
 
 Goal: a `figcraft-server` can (1) let people in by **who they are** instead of only by share links,
@@ -271,7 +275,7 @@ keep talking to each other on everything they knew.
 | S → C | `Info(ServerInfo)` | Auth mode, providers and their flows, e2e mode, protocol |
 | C → S | `SignIn(SignIn)` | `Session`, `Code`, `DeviceStart`, `DevicePoll`, `Token`, `SignOut` |
 | S → C | `SignedIn(Me)` / `Device(DeviceCode)` / `SignInPending` | |
-| C → S | `OpenAccount` then `Account(AccountReq)` | Files, publish, members, invites, devices, keyrings |
+| C → S | `OpenAccount` then `Account(AccountReq)` | Files, publish, members, invites, devices, keyrings, recovery (step 9: see *Sealed files with accounts*) |
 | S → C | `Account(AccountReply)` | |
 | C ↔ S | `SealedChanges`, `SealedWelcome`, `SealedReject`, `SealedPresence`, `SealedSignal` | The sealed counterparts of the session messages |
 | C → S | `Admin::PublishSealed`, `AccountReq::PublishSealed`, `…::RenameSealed` | Publish or rename a sealed file |
@@ -371,7 +375,7 @@ that saw every batch. `Reject` fixes are the current sealed values of what the b
   or open hosting) or `AccountReq::PublishSealed` (signed in), with a new id when the server says
   the id is taken; then it joins the file sealed. `Published`'s links (and the links
   `collab.share` makes) end with `#k=…`.
-- **Keys kept by the publisher (accounts mode, until step 9).** The engine keeps each published
+- **Keys kept by the publisher.** The engine keeps each published
   sealed file's key with the preferences (`Prefs::file_keys`: server, file id, the `k=…` fragment;
   passwords like owner tokens: on this computer only, in no command result other than the share
   links, not in `Debug`). Joining a link without a fragment adds the kept key, so the owner opens
@@ -381,18 +385,144 @@ that saw every batch. `Reject` fixes are the current sealed values of what the b
   key the name is "Encrypted file". `collab.manageFile {action: "rename"}` seals the new name
   (`RenameSealed`); `createLink` adds the key to the new link. `collab.peers` says `sealed: true`
   for a sealed session.
-- **Left for step 9 and later.** Members on a server with accounts get the key only through a link
-  that carries it (the owner's other devices too): per-device keyrings on the server, wrapping keys
-  for invited members, recovery and key rotation are step 9. A hostile editor's value that opens
-  but breaks a value rule still fails the sync client's strict check (the lenient value checks are
-  part of hardening, step 10), as do sealed team libraries.
+- **Left for later.** A hostile editor's value that opens but breaks a value rule still fails the
+  sync client's strict check (the lenient value checks are part of hardening, step 10), as do
+  sealed team libraries. (Keys for members and your other devices: step 9, below.)
+
+### Sealed files with accounts (built, step 9)
+
+On a server with accounts and sealed files, nobody needs a link with `#k=`: the key moves between
+a person's devices and to the members of a file through the server, wrapped so the server can't
+open it.
+
+**Device keys** (`crates/engine/src/devices.rs`). Each install has one `DeviceKeys`, made the first
+time it is needed (registering, joining a sealed file, publishing one). Its 64-byte secret is kept
+in the OS keychain (`crates/collab-net/src/keychain.rs`, the `keyring` crate: the Windows Credential
+Manager, the macOS keychain, the Secret Service on Linux and the BSDs; service `FigCraft`, user
+`device-key`), which the desktop app installs (`session.keys.keychain`). Where there is none (the
+browser build, `figcraft-cli` and the MCP server, another OS, no Secret Service running, a keychain
+that refuses: logged), the secret is kept with the preferences (`device.secret`, base64url):
+**weaker**, as anyone who can read the preferences file has it. `account.devices` says which
+(`keyStore`). The public keys are registered with each server (`RegisterDevice`), which gives the
+device an id there (`d` and 16 hex digits); the preferences keep `device.registered`
+(`[{server, device, public}]`, the X25519 key it was registered with: other keys register again)
+and `device.name` (default "FigCraft on <computer name>").
+
+**Requests**, appended to `AccountReq` and `AccountReply` (everything before them keeps its
+number); the server answers `Failed` to all but `Keyring` when `[e2e] mode` is `"off"`:
+
+| Request | Answer | |
+|---|---|---|
+| `RegisterDevice { name, public: DevicePublic, recovery }` | `Device { id }` | The same public keys again: the same id (the name updated). At most 10 devices per person; keys registered to someone else are refused |
+| `Devices` | `Devices(Vec<DeviceInfo>)` | `{id, name, public, created, seen, recovery}` |
+| `RevokeDevice { device }` | `Done` | Its copies go from every sealed file you are in, and those files want a new epoch |
+| `Keyring { file }` | `Keyring { sealed, epochs, wrapped: Vec<KeyWrap> }` | Members (and admins): whether the file is sealed, every epoch it has, and the copies wrapped to your devices (`{epoch, device, wrapped}`) |
+| `PutKeys { file, epoch, rotate, wrapped: Vec<(device, Wrapped)> }` | `Done` | Copies for member devices: owners and editors wrap for anyone in the file, everyone for their own devices, and only for an epoch one of their devices holds; a device that has a copy keeps it. `rotate`: owners start epoch `epoch` (the newest + 1, or any for a file with no keyring yet), refused when it exists ("another owner started it") |
+| `PendingKeys` | `PendingKeys(Vec<PendingFile>)` | Per sealed file you are in: `{file, epoch (newest, or none), rotate, wanted: [{epoch, device, public}]}`: the member devices that lack a copy you may make of an epoch you hold, and for owners of a file that wants a new epoch (or has no keyring) every member device with the next epoch |
+| `PutRecovery { device, sealed }` / `GetRecovery` | `Done` / `Recovery(Option<RecoveryCopy>)` | Your recovery copy (`{device, sealed, created}`), for your recovery device |
+
+`DevicePublic` and `Wrapped` moved to `figcraft_collab::sealed` (data only, as `Sealed`);
+`figcraft-collab-seal` re-exports them. Removing a member (or someone leaving, or an admin taking a
+person off the server) drops their devices' copies of a sealed file and marks it `rotate`.
+
+**Files on the server** (all JSON, written atomically):
+
+```text
+<data>/accounts/devices.json   [{"id": "d0123456789abcdef", "account": "a…", "name": "FigCraft on LAPTOP-7",
+                                 "public": {"agreement": "<base64url 32 B>", "signing": "<base64url 32 B>"},
+                                 "created": 1760000000, "seen": 1760000000, "recovery": true (only when)}]
+<data>/accounts/recovery.json  [{"account": "a…", "device": "d…", "sealed": "<base64url>", "created": …}]
+<data>/files/<id>/keyring.json {"rotate": true (only when),
+                                "epochs": {"0": {"d0123456789abcdef": {"enc": "<base64url 32 B>",
+                                                                       "ciphertext": "<base64url 84 B>"}}}}
+```
+
+At most 1024 epochs per file and 5000 copies per request (and per `PendingKeys` answer).
+
+**Publishing sealed, signed in.** As in step 8 (`AccountReq::PublishSealed`); once the file is
+there the app syncs keys in the background: the file has no keyring yet, so the server lists every
+member device (yours) and the app wraps the key it just made for them with `PutKeys { rotate: true
+}` (epoch 0).
+
+**Joining with a member's link** (no `#k=`, no token: `account.files`, `collab.openFile`, a link an
+owner sent). Signed in, the app asks `Keyring { file }` first: a plain file joins as before; a
+sealed one opens the copies wrapped to this device (registering it first) and joins with the keys
+added to the link it hands the transport (`#k=…&k=…`, every epoch). A copy that doesn't open, or
+whose key says another epoch, is skipped. Without every epoch of the file (a new device, a member
+just invited), the join doesn't start: the session shows `status: failed`, `reason` `WAITING_FOR_ACCESS`
+("Waiting for access: … its key hasn't been shared with this device yet…") and
+`waitingForAccess: true` (`collab.peers`), and the next key sync (`account.syncKeys`, in the
+background every minute) joins it by itself once an owner's or editor's app has wrapped for it, if
+its tab is in front (or join again). A server older than keyrings: the join goes on as in step 8.
+
+**Syncing keys** (`account.syncKeys {server? | all?}`; after a sealed publish, `collab.invite` and
+`collab.removeMember`, after a removal elsewhere is noticed, and every minute in the background
+for every server you are signed in to): registers this device, asks `PendingKeys`, and for each
+file wraps the epochs this device holds for the devices that want them ("the next owner or editor
+app online wraps the key"). For a file that wants a new epoch an owner's app makes it
+(`FileKey::rotate`: a new key, the same names secret), wraps it for every member device left with
+`PutKeys { rotate: true }`, keeps it, and hands it to its open sessions of the file
+(`LiveLink::rekey`: the transport's keys are shared with the session's invite, `collab_net::invite::Keys`,
+so the next writes are sealed with the newest epoch). It also refreshes the keys of every sealed
+session open on that server and retries the joins waiting for access. A background run that
+starts again with the server's answers makes the same new key (kept until it is on the server),
+not another.
+
+**Others' apps follow a new epoch.** A change sealed with an epoch newer than every key a session
+holds ends that session (`NEW_EPOCH`, "This file's key changed…: getting the new key") instead of
+being skipped (an app skipping what everyone else opens would drift apart); the app fetches the
+keyring and joins again by itself. If the server has no such epoch, the change was damaged (a
+hostile editor): the session stays failed with `NO_SUCH_EPOCH` until hardening (signed batches,
+step 10). Someone taken out is disconnected by the server and can't join again; the keys they kept
+open nothing written after.
+
+**Recovery.** `account.recoveryKey {server?, replace?}` makes a **recovery device**: keys of its
+own, registered as one of your devices with `recovery: true`, so file keys are wrapped to it like to
+any other device (it syncs at once, then whenever an owner or editor syncs). Its secret is sealed
+with a new `RecoveryKey` (associated data `"figcraft recovery v1" ‖ "figcraft recovery device|" ‖
+account id`) and kept on the server (`PutRecovery`). The command's result carries the recovery key
+(`XXXXX-…`, 11 groups of 5) **only when it makes one**: the one exception to "no secret in a
+result", like an owner token shown once; the person writes it down, and neither the app nor the
+server keeps it. Asked again it says `created: false`; `replace: true` makes a new one and revokes
+the old recovery device (its files start a new epoch). `account.recover {server?, recoveryKey}` on
+a new device opens the copy, checks that the recovery device is still registered with those keys,
+registers this device, unwraps every file key wrapped to the recovery device and wraps it for this
+one (`PutKeys`, own device). **Not built**: approving a new device from an existing one with a
+6-digit comparison (the second device waits for an owner or editor app instead, or uses the recovery
+key).
+
+**Commands** (additive; `crates/engine/src/devices.rs`):
+
+| Command | Result |
+|---|---|
+| `account.devices {server?, name?}` | `{server, device, keyStore: keychain \| preferences, devices: [{id, name, created, seen, recovery, thisDevice}]}` |
+| `account.revokeDevice {server?, device}` | `{revoked, thisDevice, rotated: [file]}` |
+| `account.recoveryKey {server?, replace?}` | `{server, created: true, device, recoveryKey, wrapped}` or `{server, created: false, device, made}` |
+| `account.recover {server?, recoveryKey}` | `{server, device, recovered, files: [file]}` |
+| `account.syncKeys {server? \| all?}` | `{server, wrapped, rotated, refreshed, joined, errors}` (`all`: `{servers: […]}`) |
+
+**What the UI should show.** In the account panel: your devices (`account.devices`, this one
+marked, the recovery device as "Recovery key"), each with Revoke; a warning when `keyStore` is
+`preferences` ("this device's key is kept with FigCraft's settings, not the system keychain");
+"Make a recovery key" (`account.recoveryKey`), showing the key once with "write it down: it is the
+only way back in if you lose every device" and a confirmation before closing; "Use a recovery key"
+(`account.recover`) on a device with no access. In the file: while `waitingForAccess`, a waiting
+state instead of the error colour ("Waiting for access: an owner or editor needs to open FigCraft",
+with Try again = `collab.join` again), which turns into the file on its own. Nothing to show for
+syncing (it is silent; its errors are logged).
+
+**Limits.** A revoked device's sessions aren't ended by the server (sessions are per person, not
+per device): sign it out too. A hostile server can still hand out a fake device key when someone
+is added (key-change warnings are hardening). Until a member's app has synced, the writes of
+members who haven't picked up a new epoch are sealed with the old one (readable by the person
+taken out, should they get the server's data).
 
 ## Crates
 
 | Crate | Layer | Holds |
 |---|---|---|
 | `crates/auth` | L2 | `Identity`, flows, `IdentityProvider`, `Fetch`, `Policy`, config types; the `oidc` and `external` providers behind the `providers` feature (the server enables it) |
-| `crates/collab-seal` | L2 | Key derivation, seal and open, entry hashing, padding, key wrapping |
+| `crates/collab-seal` | L2 | Key derivation, seal and open, entry hashing, padding, key wrapping, keyrings in link fragments (`ring_fragment`) |
 
 `crates/collab` gains the new message types and the sealed files' data (`sealed`: `Sealed`,
 `SealedChange`, `EntryKey`…), and its session server became generic over the synced state
@@ -418,6 +548,7 @@ members and keyrings and builds the providers from its config.
 6. `crates/collab-seal`.
 7. **Built**: `OpaqueReplica` and `OpaqueServer` (in `crates/collab`) and sealed files on the server.
 8. **Built**: sealing in the app; sealed links.
-9. Sealed files with accounts: keyrings, invites, devices, recovery.
+9. **Built**: sealed files with accounts: keyrings, invites, devices, recovery (device approval
+   with a 6-digit comparison not yet).
 10. Edges (sealed team libraries, CLI and MCP) and hardening (editor signatures, key-change
     warnings).

@@ -124,6 +124,8 @@ mod directory_tests;
 #[cfg(test)]
 mod hardening_tests;
 #[cfg(test)]
+mod keys_tests;
+#[cfg(test)]
 mod library_tests;
 #[cfg(test)]
 mod oidc_tests;

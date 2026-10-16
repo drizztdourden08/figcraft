@@ -23,6 +23,7 @@ pub mod component_codegen;
 pub mod components;
 pub mod dev_resources;
 pub mod devcompare;
+pub mod devices;
 pub mod devinspect;
 pub mod distance;
 pub mod drop;
@@ -650,6 +651,10 @@ pub struct Prefs {
     /// (passwords: see [`file_keys`]), newest first, at most [`file_keys::MAX_FILE_KEYS`].
     #[serde(skip_serializing_if = "Vec::is_empty", deserialize_with = "file_keys::read")]
     pub file_keys: Vec<file_keys::KeptKey>,
+    /// This install's device for sealed files on servers with accounts: its name, where it is
+    /// registered, and its secret when no keychain keeps it (see [`devices`]).
+    #[serde(skip_serializing_if = "devices::DevicePrefs::is_empty", deserialize_with = "devices::read")]
+    pub device: devices::DevicePrefs,
     /// The Getting started tips on the home screen were closed (Help ▸ Getting started shows them
     /// again).
     pub getting_started_dismissed: bool,
@@ -688,6 +693,7 @@ impl Default for Prefs {
             online_files: Vec::new(),
             accounts: Vec::new(),
             file_keys: Vec::new(),
+            device: devices::DevicePrefs::default(),
             getting_started_dismissed: false,
             home_views: BTreeMap::new(),
             home_sort: "modified".into(),
@@ -751,6 +757,8 @@ pub struct Session {
     pub background: background::Background,
     /// Sign-ins under way (this run).
     pub accounts: accounts::Accounts,
+    /// This device's keys for sealed files, and the keychain they are kept in ([`devices`]).
+    pub keys: devices::KeyState,
 }
 
 impl Default for Session {
@@ -786,6 +794,7 @@ impl Session {
             live: live::Lives::default(),
             background: background::Background::default(),
             accounts: accounts::Accounts::default(),
+            keys: devices::KeyState::default(),
         }
     }
 

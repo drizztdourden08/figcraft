@@ -373,7 +373,10 @@ mode = "optional"   # "off" (default): plain files only; "optional": both; "requ
   than accounts) it says so without sending anything; with `"required"` it seals by default.
 
 *The app seals files and joins them with keys in links (step 8 of
-[`accounts-and-e2e.md`](accounts-and-e2e.md#steps)); keyrings per device with accounts are step 9.*
+[`accounts-and-e2e.md`](accounts-and-e2e.md#steps)); with accounts, each sealed file's key is
+wrapped to every member device in its `keyring.json`, so members and their devices need no key in
+the link (step 9: [devices, keyrings and recovery](accounts-and-e2e.md#sealed-files-with-accounts-built-step-9);
+what it adds to the data directory: [`server-accounts.md`](server-accounts.md#data-and-backups)).*
 
 ## Configuration
 
@@ -427,6 +430,8 @@ behaves as before (blocked addresses, report rates and the limits on
 <data>/files/<id>/library-<version>.bin  its team library, when one was published (a .figcraft
                                archive; library.bin when it was published by an older server)
 <data>/files/<id>/usage.json   which files use that library's components, as their apps report it
+<data>/files/<id>/keyring.json a sealed file's key wrapped to each member device (servers with
+                               accounts: ciphertext only)
 <data>/plugins/index.json      the plugin directory: every version kept (manifest fields, size, SHA-256)
 <data>/plugins/<sha256>.bin    a plugin bundle, named by the SHA-256 of its bytes
 <data>/blocked.json            the addresses the operator blocked

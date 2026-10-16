@@ -500,15 +500,41 @@ Accounts add to the data directory ([`server.md`](server.md#the-data-directory))
                                "invited" (email and role)
 ```
 
+With sealed files (`[e2e] mode = "optional"` or `"required"`) the apps also keep keys here, all of
+it public keys or ciphertext the server can't open
+([`accounts-and-e2e.md`](accounts-and-e2e.md#sealed-files-with-accounts-built-step-9)):
+
+```text
+<data>/accounts/devices.json   each person's devices: an id (d + 16 hex digits), the account, the
+                               name the app gave it ("FigCraft on LAPTOP-7"), its two public keys
+                               (X25519, Ed25519; base64url), when it was registered and last seen,
+                               and "recovery": true for the device a recovery key stands for. At
+                               most 10 per person
+<data>/accounts/recovery.json  each person's recovery copy: their recovery device's secret sealed
+                               with a recovery key only they have (written down; never sent here)
+<data>/files/<id>/keyring.json a sealed file's key, wrapped (HPKE) to each member device, by
+                               epoch, and "rotate": true while it waits for a new epoch (someone
+                               was taken out, or a device revoked, and no owner's app has been
+                               online since)
+```
+
 Session tokens (256 random bits) are kept only as hashes: a copy of the data directory doesn't let
 anyone sign in as someone. Emails and names are personal data: treat the directory accordingly.
+Wrapped keys and recovery copies don't open without a device's private key (kept on that device,
+in its OS keychain) or a person's recovery key: a copy of the data directory still doesn't let
+anyone read a sealed file.
 
 - **Backups**: the nightly backup timer (`figcraft-backup.timer`, [Backups](server.md#backups))
-  copies the whole data directory, so accounts, sessions and memberships are in it. Settings and
+  copies the whole data directory, so accounts, sessions and memberships are in it, and with sealed
+  files the devices, recovery copies and wrapped keys too (still unreadable: see above). Keep them:
+  a backup without `keyring.json` restores sealed files nobody can open until an owner's app wraps
+  the keys again (it does by itself if it still holds them). Settings and
   secret files live in `/etc/figcraft-server/`, outside it: keep a copy of `server.toml` with your
   other configuration, and of the secrets somewhere safe (or make new ones at the provider when you
   restore).
-- **Restoring** an older copy brings back the people, sessions and memberships of that day.
+- **Restoring** an older copy brings back the people, sessions and memberships of that day (and the
+  devices and keyrings: a device registered or an epoch started since is missing until the apps
+  register and wrap again, which they do by themselves).
 - **Ending every session** (after a leak, say): stop the server, delete
   `<data>/accounts/sessions.json`, start it. Everyone signs in again; memberships stay.
 - **Moving to another machine**: stop the server, copy the data directory and

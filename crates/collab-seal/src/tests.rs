@@ -574,3 +574,30 @@ fn junk_input_never_panics() {
         }
     }
 }
+
+#[test]
+fn keyrings_travel_in_link_fragments() {
+    let first = FileKey::generate().unwrap();
+    let second = first.rotate().unwrap();
+    let mut ring = Keyring::from(second.clone());
+    ring.insert(first.clone());
+    let fragment = ring_fragment(&ring);
+    // Oldest first; one epoch reads as a plain link key.
+    assert_eq!(fragment, format!("{}&{}", link_fragment(&first), link_fragment(&second)));
+    assert_eq!(parse_ring_fragment(&fragment).unwrap(), ring);
+    assert_eq!(parse_ring_fragment(&format!("#{fragment}&other=1")).unwrap(), ring);
+    assert_eq!(ring_fragment(&Keyring::from(first.clone())), link_fragment(&first));
+    assert_eq!(parse_link_fragment(&fragment).unwrap(), first, "older readers take the first key");
+    assert_eq!(ring.current(), Some(&second));
+    // Merging keeps what is there and adds the rest.
+    let mut other = Keyring::from(first.clone());
+    other.merge(&ring);
+    assert_eq!(other, ring);
+    assert_eq!(other.len(), 2);
+    // Junk is refused; too many keys too.
+    for bad in ["", "k=", "x=1", "k=AAAA", &format!("{fragment}&k=nope")] {
+        assert!(parse_ring_fragment(bad).is_err(), "{bad}");
+    }
+    let many = vec![link_fragment(&first); MAX_LINK_EPOCHS + 1].join("&");
+    assert!(parse_ring_fragment(&many).is_err());
+}
