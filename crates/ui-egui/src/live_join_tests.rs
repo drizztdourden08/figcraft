@@ -96,7 +96,7 @@ fn the_browser_joins_but_does_not_host() {
     h.click(text_center(&shapes, "Share"));
     let shapes = h.frames(2);
     assert!(has_text(&shapes, "Sharing a file needs the desktop app; here you can join one."));
-    assert!(!has_text(&shapes, "Start sharing") && !has_text(&shapes, "Local network"));
+    assert!(!has_text(&shapes, "Share on the network") && !has_text(&shapes, "Put it on a server"));
     // The join field is right there, with what the browser can reach.
     assert!(has_text(&shapes, "Join with a code") && has_text(&shapes, "Join"));
     assert!(has_text(

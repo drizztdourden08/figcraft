@@ -58,6 +58,10 @@ pub struct SignedIn {
     pub session: String,
     /// When the sign-in ends unless used (seconds since 1970).
     pub expires: u64,
+    /// You signed in with a username and password (a basic account): you can change the password
+    /// here (the home screen's Account tab).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub password: bool,
 }
 
 impl std::fmt::Debug for SignedIn {
@@ -68,7 +72,7 @@ impl std::fmt::Debug for SignedIn {
 
 impl SignedIn {
     pub(crate) fn json(&self) -> Value {
-        json!({"server": self.server, "account": self.account, "name": self.name, "email": self.email, "admin": self.admin, "expires": self.expires})
+        json!({"server": self.server, "account": self.account, "name": self.name, "email": self.email, "admin": self.admin, "expires": self.expires, "password": self.password})
     }
 }
 
@@ -200,12 +204,28 @@ impl Session {
 
     /// Keep a sign-in (replacing the one to the same server).
     pub(crate) fn keep_sign_in(&mut self, server: &str, me: Me) -> Value {
+        // A sign-in made fresh again keeps how it was made.
+        let password = self.signed_in(server).is_some_and(|old| old.password && old.account == me.account);
+        self.keep_sign_in_with(server, me, password)
+    }
+
+    /// Keep a sign-in made with a username and password (`password`), or another way.
+    pub(crate) fn keep_sign_in_with(&mut self, server: &str, me: Me, password: bool) -> Value {
         let key = server_key(server);
         let session = match (me.session.is_empty(), self.signed_in(&key)) {
             (true, Some(old)) => old.session.clone(),
             _ => me.session.clone(),
         };
-        let s = SignedIn { server: key.clone(), account: me.account, name: me.name, email: me.email, admin: me.admin, session, expires: me.expires };
+        let s = SignedIn {
+            server: key.clone(),
+            account: me.account,
+            name: me.name,
+            email: me.email,
+            admin: me.admin,
+            session,
+            expires: me.expires,
+            password,
+        };
         let json = s.json();
         self.prefs.accounts.retain(|a| a.server != key);
         self.prefs.accounts.insert(0, s);
@@ -411,7 +431,7 @@ fn sign_in(s: &mut Session, p: &Value) -> Result<Value> {
             let username = req_string(CMD, p, "username")?;
             let password = req_string(CMD, p, "password")?;
             match s.sign_in_step(&server, SignIn::Password { provider: provider_id, username, password })? {
-                SignInReply::SignedIn(me) => Ok(json!({"status": "signedIn", "account": s.keep_sign_in(&server, me)})),
+                SignInReply::SignedIn(me) => Ok(json!({"status": "signedIn", "account": s.keep_sign_in_with(&server, me, true)})),
                 SignInReply::Refused { reason } => {
                     s.accounts.last = Some(Err(reason.clone()));
                     Err(EngineError::Other(reason))

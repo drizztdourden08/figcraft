@@ -207,24 +207,28 @@ fn document_arrives(h: &mut Harness, script: &Shared) {
 fn not_sharing_the_popover_offers_one_way_to_start_and_one_to_join() {
     let (mut h, script) = harness();
     let shapes = open(&mut h);
-    for t in ["Share this file", "Online", "Local network", "Start sharing", "Join with a code", "Join", "About this server", "Export…"] {
+    for t in [
+        "Share this file",
+        "Put it on a server",
+        "Put on share.example",
+        "On your local network",
+        "Share on the network",
+        "Join with a code",
+        "Join",
+        "About this server",
+        "Export…",
+    ] {
         assert!(has_text(&shapes, t), "the popover shows {t:?}");
     }
-    assert!(has_text(&shapes, "People join from anywhere with a code. The file is kept on share.example while you share it."));
     // No addresses, keys or ports until Advanced is opened.
     for t in ["Server address", "Port", "This computer only", "Publish to another server…", "WebSocket URL", "Not in a live session"] {
         assert!(!has_text(&shapes, t), "not in the main flow: {t:?}");
     }
-    // Online, nothing more to set: other servers are added in Preferences ▸ Servers.
-    assert!(!has_text(&shapes, "Advanced"));
     // The local network: what it means, and its own advanced part.
-    let shapes = click(&mut h, &shapes, "Local network");
     assert!(has_text(&shapes, "People on your network join with a code. Nothing goes through a server."));
     assert!(has_text(&shapes, "Advanced") && !has_text(&shapes, "This computer only"));
     let shapes = click(&mut h, &shapes, "Advanced");
     assert!(has_text(&shapes, "This computer only") && has_text(&shapes, "Port") && !has_text(&shapes, "Publish to another server…"));
-    assert!(!has_text(&shapes, "About this server"));
-    assert_eq!(crate::live::inspect(&h.app)["local"], true);
     let shapes = click(&mut h, &shapes, "Advanced");
     assert!(!has_text(&shapes, "This computer only"), "closed again");
     // Nothing started, nothing asked of the network.
@@ -237,14 +241,14 @@ fn not_sharing_the_popover_offers_one_way_to_start_and_one_to_join() {
 fn sharing_online_shows_the_code_copies_it_and_stops() {
     let (mut h, script) = harness();
     let shapes = open(&mut h);
-    let shapes = click(&mut h, &shapes, "Start sharing");
+    let shapes = click(&mut h, &shapes, "Put on share.example");
     {
         let s = script.lock().unwrap();
         let [p] = s.published.as_slice() else { panic!("published {}", s.published.len()) };
         assert!(p.server == "wss://share.example/" && p.key.is_none() && p.share, "the server in Preferences, shared once there");
     }
     assert!(has_text(&shapes, "Starting to share…") && has_text(&shapes, "Stop sharing"));
-    assert!(!has_text(&shapes, "Start sharing"));
+    assert!(!has_text(&shapes, "Put on share.example"));
     let shapes = on_the_server(&mut h, &script, Some(("K7M2QX9TD", "4FHJ8R2WN")));
     for t in
         ["Live session", "Sharing online · nobody else here yet", "K7M-2QX-9TD", "Copy code", "Copy link", "Can edit", "Can view", "Stop sharing"]
@@ -305,7 +309,7 @@ fn sharing_online_shows_the_code_copies_it_and_stops() {
 fn a_file_that_is_not_shared_can_be_removed_from_the_server_after_asking() {
     let (mut h, script) = harness();
     let shapes = open(&mut h);
-    click(&mut h, &shapes, "Start sharing");
+    click(&mut h, &shapes, "Put on share.example");
     let shapes = on_the_server(&mut h, &script, Some(("K7M2QX9TD", "4FHJ8R2WN")));
     click(&mut h, &shapes, "Stop sharing");
     let shapes = h.frames(3);
@@ -330,8 +334,7 @@ fn a_file_that_is_not_shared_can_be_removed_from_the_server_after_asking() {
 fn sharing_on_the_local_network_shows_its_longer_code() {
     let (mut h, script) = harness();
     let shapes = open(&mut h);
-    let shapes = click(&mut h, &shapes, "Local network");
-    let shapes = click(&mut h, &shapes, "Start sharing");
+    let shapes = click(&mut h, &shapes, "Share on the network");
     let shown = code::grouped(&HOST.code());
     for t in ["Sharing on your network · nobody else here yet", shown.as_str(), "Copy code", "Copy link", "Stop sharing"] {
         assert!(has_text(&shapes, t), "sharing shows {t:?}");
@@ -351,7 +354,7 @@ fn sharing_on_the_local_network_shows_its_longer_code() {
     let shapes = click(&mut h, &shapes, "Advanced");
     let shapes = click(&mut h, &shapes, "This computer only");
     h.app.ui.live.port = "6".into();
-    click(&mut h, &shapes, "Start sharing");
+    click(&mut h, &shapes, "Share on the network");
     let s = script.lock().unwrap();
     assert!(s.hosted[1].bind == figcraft_engine::live::Bind::Local && s.hosted[1].port == Some(6));
 }
@@ -361,7 +364,7 @@ fn without_a_code_the_link_is_shared_instead() {
     // A server from before join codes.
     let (mut h, script) = harness();
     let shapes = open(&mut h);
-    click(&mut h, &shapes, "Start sharing");
+    click(&mut h, &shapes, "Put on share.example");
     let shapes = on_the_server(&mut h, &script, None);
     assert!(has_text(&shapes, "Sharing online · nobody else here yet") && has_text(&shapes, "Invite link") && has_text(&shapes, "Copy"));
     assert!(has_text(
@@ -378,9 +381,8 @@ fn without_a_code_the_link_is_shared_instead() {
     // A host whose address a code can't carry.
     h.app.session.execute("collab.leave", &json!({})).unwrap();
     let shapes = h.frames(2);
-    let shapes = click(&mut h, &shapes, "Local network");
     h.app.ui.live.port = "6".into();
-    let shapes = click(&mut h, &shapes, "Start sharing");
+    let shapes = click(&mut h, &shapes, "Share on the network");
     assert!(has_text(&shapes, "Invite link") && !has_text(&shapes, "Copy code"));
     click(&mut h, &shapes, "Copy");
     assert_eq!(script.lock().unwrap().copied.last().map(String::as_str), Some(PLAIN));
@@ -403,7 +405,7 @@ fn the_join_field_takes_a_code_or_a_link_and_enter_joins() {
     // The server doesn't know the code: the popover says so and offers the field again.
     script.lock().unwrap().events.push(LiveEvent::Status(Status::Failed { reason: "No session with that code".into() }));
     let shapes = h.frames(3);
-    assert!(has_text(&shapes, "No session with that code") && has_text(&shapes, "Join with a code") && has_text(&shapes, "Start sharing"));
+    assert!(has_text(&shapes, "No session with that code") && has_text(&shapes, "Join with a code") && has_text(&shapes, "Put on share.example"));
     // Something that can't be a code: it says why and stays to be fixed (the Join button).
     click(&mut h, &shapes, "Code or invite link");
     type_text(&mut h, "K7M-2QX");
@@ -480,9 +482,9 @@ fn preferences_list_the_servers_and_without_one_the_popover_shares_on_the_networ
     h.app.ui.preferences = false;
     h.frames(2);
     let shapes = open(&mut h);
-    assert!(has_text(&shapes, "Sharing on the local network (add a server in Preferences ▸ Servers to share online)."));
-    assert!(!has_text(&shapes, "Online") && has_text(&shapes, "Start sharing"));
-    click(&mut h, &shapes, "Start sharing");
+    assert!(has_text(&shapes, "Add a server in Preferences ▸ Servers to put files online."));
+    assert!(!has_text(&shapes, "Put on share.example") && has_text(&shapes, "Share on the network"));
+    click(&mut h, &shapes, "Share on the network");
     let s = script.lock().unwrap();
     assert!(s.published.is_empty() && s.hosted.len() == 1, "shared on the local network");
 }
@@ -492,7 +494,7 @@ fn an_open_popover_asks_for_no_frames() {
     let (mut h, script) = harness();
     let shapes = open(&mut h);
     assert!(h.goes_quiet(), "not sharing");
-    click(&mut h, &shapes, "Start sharing");
+    click(&mut h, &shapes, "Put on share.example");
     on_the_server(&mut h, &script, Some(("K7M2QX9TD", "4FHJ8R2WN")));
     assert!(h.goes_quiet(), "sharing, with the code showing");
     let (shapes, delay) = h.frame(vec![]);

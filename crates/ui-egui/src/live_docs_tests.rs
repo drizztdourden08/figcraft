@@ -54,9 +54,7 @@ fn harness() -> (Harness, Queue) {
 
 /// Share the file in front on the local network from its popover (which is open).
 fn start_sharing(h: &mut Harness, shapes: &[egui::Shape]) -> Vec<egui::Shape> {
-    h.click(text_center(shapes, "Local network"));
-    let shapes = h.frames(2);
-    h.click(text_center(&shapes, "Start sharing"));
+    h.click(text_center(shapes, "Share on the network"));
     h.frames(2)
 }
 
@@ -99,7 +97,7 @@ fn the_share_popover_is_the_session_of_the_tab_in_front() {
         (&json!("off"), &Value::Null, &Value::Null, &json!(0), &json!(1))
     );
     let shapes = h.frames(1);
-    for t in ["Share this file", "Start sharing", "Join with a code", "Advanced"] {
+    for t in ["Share this file", "Share on the network", "Join with a code", "Advanced"] {
         assert!(has_text(&shapes, t), "the new file's popover shows {t:?}");
     }
     for t in ["Invite link", "Stop sharing", "Sharing on your network · 1 person joined", "Hana"] {
@@ -117,7 +115,7 @@ fn the_share_popover_is_the_session_of_the_tab_in_front() {
     let shapes = h.frames(1);
     h.click(text_center(&shapes, "Stop sharing"));
     let shapes = h.frames(2);
-    assert!(has_text(&shapes, "Start sharing"));
+    assert!(has_text(&shapes, "Share on the network"));
     assert_eq!((&live(&h)["status"], &live(&h)["sessions"]), (&json!("off"), &json!(1)));
     run(&mut h, "doc.switch", json!({"index": 1}));
     assert_eq!((&live(&h)["status"], &live(&h)["session"]), (&json!("live"), &json!(2)));

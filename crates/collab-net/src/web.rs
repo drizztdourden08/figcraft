@@ -22,8 +22,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use figcraft_collab::message::{self, ClientMsg, Presence};
-use figcraft_engine::live::{Event, Flow, HostOptions, LiveLink, NO_SESSION, NetReply, NetRequest, SessionId, SessionInfo};
+use figcraft_collab::Replica;
+use figcraft_collab::message::{self, AccountReply, AccountReq, ClientMsg, Presence};
+use figcraft_engine::live::{
+    Event, Flow, HostOptions, LiveLink, NO_SESSION, NetReply, NetRequest, PublishOptions, Published, SessionId, SessionInfo, Status,
+};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::closure::Closure;
 use web_sys::{BinaryType, CloseEvent, MessageEvent, WebSocket};
@@ -307,8 +310,26 @@ pub fn redirect_back() -> Option<Result<Back, String>> {
     Some(back)
 }
 
-/// The browser's [`LiveLink`]: joins sessions; hosting needs the desktop app.
+/// A file being put on a server from the page: the upload goes out as a request of its own; once
+/// the server says where the file is, session `session` joins it as you.
+struct Publishing {
+    session: SessionId,
+    /// Where the upload's answer arrives.
+    answer: Inbox,
+    server: Endpoint,
+    /// Your name in the session.
+    me: String,
+}
+
+/// What the page says about a file it can't put on a server.
+const PUBLISH_SIGNED_IN: &str = "in the browser, files go on a server with accounts you are signed in to: sign in on its page first";
+
+/// The browser's [`LiveLink`]: joins sessions, and puts files on a server you are signed in to;
+/// hosting needs the desktop app.
 pub struct NetLink {
+    wake: Waker,
+    /// Files on their way to a server.
+    publishing: Vec<Publishing>,
     /// Each session's number in the thread-local table.
     sessions: Sessions<u64>,
     /// Answers to requests outside a session.
@@ -321,13 +342,63 @@ pub struct NetLink {
 impl NetLink {
     /// `wake` is called whenever something arrives for the UI (egui's `request_repaint`).
     pub fn new(wake: Waker) -> Self {
-        Self { requests: Inbox::new(wake.clone()), sessions: Sessions::new(wake), sign_ins: Vec::new(), limits: NetLimits::default() }
+        Self {
+            requests: Inbox::new(wake.clone()),
+            sessions: Sessions::new(wake.clone()),
+            wake,
+            publishing: Vec::new(),
+            sign_ins: Vec::new(),
+            limits: NetLimits::default(),
+        }
     }
 
     /// Your session token on `server`, if you are signed in there.
     fn session_for(&self, server: &Endpoint) -> Option<String> {
         let url = server.url();
         self.sign_ins.iter().find(|(s, _)| *s == url).map(|(_, t)| t.clone())
+    }
+
+    /// The uploads the servers answered: each file's links, and its session joins it (or why it
+    /// isn't there).
+    fn published(&mut self) -> Vec<(SessionId, Event)> {
+        let mut out = Vec::new();
+        let mut joins = Vec::new();
+        self.publishing.retain(|p| {
+            let Some(reply) = p.answer.drain().into_iter().find_map(|e| match e {
+                Event::Net { reply, .. } => Some(*reply),
+                _ => None,
+            }) else {
+                return true;
+            };
+            match reply {
+                NetReply::Account(Ok(AccountReply::Published { file })) => {
+                    let member = Invite { server: p.server.clone(), file: file.id.clone(), token: String::new(), key: None };
+                    let link = member.link();
+                    let published = Published {
+                        server: p.server.display(),
+                        file: file.id,
+                        name: file.name,
+                        edit: link.clone(),
+                        view: link.clone(),
+                        owner: None,
+                        expires: None,
+                    };
+                    out.push((p.session, Event::Published(published)));
+                    joins.push((p.session, link, p.me.clone()));
+                }
+                NetReply::Account(Ok(AccountReply::Failed { reason }) | Err(reason)) => {
+                    out.push((p.session, Event::Status(Status::Failed { reason: format!("Couldn't put the file on the server: {reason}") })));
+                }
+                _ => out.push((p.session, Event::Status(Status::Failed { reason: "the server didn't say where the file is".into() }))),
+            }
+            false
+        });
+        for (session, link, me) in joins {
+            if let Err(reason) = self.join(session, &link, &me) {
+                out.push((session, Event::Status(Status::Failed { reason })));
+            }
+        }
+        out
     }
 
     fn with(&self, session: SessionId, f: impl FnOnce(&mut Driver<BrowserSocket>, Instant)) {
@@ -368,7 +439,32 @@ impl LiveLink for NetLink {
         Ok(())
     }
 
+    /// Signed in to the server: the file goes there as yours (a request of its own), then this
+    /// session joins it. Sealed files and share codes are the desktop app's for now.
+    fn publish(&mut self, session: SessionId, o: PublishOptions) -> Result<(), String> {
+        let (server, _) = Endpoint::parse(&o.server)?;
+        if secure_page() && !server.secure && !server.loopback() {
+            return Err("this page was loaded over https, and browsers block unencrypted ws:// connections: use a wss:// server".into());
+        }
+        let token = o.session.clone().or_else(|| self.session_for(&server)).ok_or_else(|| PUBLISH_SIGNED_IN.to_string())?;
+        if o.share {
+            return Err("sharing with a join code needs the desktop app; on a server with accounts people find the file there".into());
+        }
+        if o.sealed == Some(true) {
+            return Err("end-to-end encrypted files are put on a server from the desktop app for now".into());
+        }
+        let snapshot = Replica::new((*o.doc).clone()).snapshot().map_err(|e| e.to_string())?;
+        let answer = Inbox::new(self.wake.clone());
+        let req = NetRequest::Account { server: o.server.clone(), session: token, req: AccountReq::Publish { name: o.name.clone(), snapshot } };
+        start_request(0, req, answer.clone(), &self.limits);
+        self.publishing.retain(|p| p.session != session);
+        self.publishing.push(Publishing { session, answer, server, me: o.me });
+        Ok(())
+    }
+
     fn leave(&mut self, session: SessionId) {
+        // An upload on its way: the file stays on the server, nobody joins it.
+        self.publishing.retain(|p| p.session != session);
         if let Some(id) = self.sessions.remove(session) {
             with_driver(id, |d, now| d.leave(now));
         }
@@ -421,6 +517,7 @@ impl LiveLink for NetLink {
 
     fn poll(&mut self) -> Vec<(SessionId, Event)> {
         let mut out: Vec<(SessionId, Event)> = self.requests.drain().into_iter().map(|e| (NO_SESSION, e)).collect();
+        out.extend(self.published());
         out.extend(self.sessions.poll());
         out
     }

@@ -599,8 +599,19 @@ the provider's `web_redirect_uris`, and with Google add a *Web application* clie
 [server-accounts.md ▸ Google](server-accounts.md#google). Without that, the hosted app offers that
 provider only through the device flow, if it has one.
 
-**What the hosted app doesn't do yet**: it keeps nothing between visits (sign in again after a
-reload), and publishing a file from the browser and team libraries still need the desktop app.
+**Signed in first.** On a server with accounts the hosted app opens on a sign-in screen (the
+server's name and its ways in) and nothing else is usable until you are signed in; a sign-in the
+server no longer takes, and Sign out (the server page's Settings), bring it back. It starts with
+nothing open, on the server's page.
+
+**What the browser keeps.** Your sign-in (the session token) and this device's key for encrypted
+files are kept with the preferences in the page's local storage, so a reload keeps you signed in.
+That is weaker than the desktop app's keychain: any script running on this site and anyone with
+the browser profile can read them; a private window keeps nothing (sign in each time).
+
+**From the browser** you can make a new file on the server (Files ▸ New design file, the + tab
+and Save when the server is the one for new files) and put an open file there; end-to-end
+encrypted files, sharing with join codes and team libraries still need the desktop app.
 
 ## Running a public server
 

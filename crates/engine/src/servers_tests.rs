@@ -143,6 +143,7 @@ fn signed_in(s: &mut Session, server: &str, admin: bool) {
         admin,
         session: TOKEN.into(),
         expires: 9,
+        password: false,
     });
 }
 

@@ -112,6 +112,13 @@ impl Session {
     pub fn default_server(&self) -> Option<String> {
         self.prefs.default_server.clone().filter(|sv| self.signed_in(sv).is_some())
     }
+
+    /// The server whose page the home screen opens on at startup (`servers.setStartHome`), while
+    /// it is one of yours.
+    pub fn start_home_server(&self) -> Option<String> {
+        let url = self.prefs.open_server_home.as_ref()?;
+        self.servers().into_iter().find(|s| s.url == *url).map(|s| s.url)
+    }
 }
 
 fn changing(cmd: &str) -> Result<()> {

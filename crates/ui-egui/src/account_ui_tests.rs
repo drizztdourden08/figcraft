@@ -7,7 +7,9 @@
 use std::sync::{Arc, Mutex};
 
 use figcraft_engine::figcraft_auth::{AuthMode, ProviderInfo, ServerAbout};
-use figcraft_engine::figcraft_collab::message::{AccountReply, AccountReq, Admin, AdminReply, ClientMsg, FileEntry, FileInfo, Member, MyFile, Role};
+use figcraft_engine::figcraft_collab::message::{
+    AccountReply, AccountReq, Admin, AdminReply, ClientMsg, FileEntry, FileInfo, Member, MyFile, Role, TeamMember,
+};
 use figcraft_engine::live::{
     Event as LiveEvent, Flow, HostOptions, LiveLink, Me, NetReply, NetRequest, Presence, ServerInfo, SessionInfo, SignIn, SignInReply,
 };
@@ -83,6 +85,13 @@ impl LiveLink for Link {
                 ],
                 invited: Vec::new(),
             })),
+            NetRequest::Account { req: AccountReq::Team, .. } => NetReply::Account(Ok(AccountReply::Team {
+                file_access: "everyone".into(),
+                people: vec![
+                    TeamMember { account: "a1".into(), name: "Ann".into(), admin: true, avatar: false, email: Some("ann@example.com".into()) },
+                    TeamMember { account: "b2".into(), name: "bob@example.com".into(), admin: false, avatar: false, email: None },
+                ],
+            })),
             NetRequest::Account { .. } => NetReply::Account(Ok(AccountReply::Done)),
             NetRequest::Admin { req: Admin::People, .. } => NetReply::Admin(Ok(AdminReply::People(Vec::new()))),
             other => other.failure()("not in this test".into()),
@@ -130,20 +139,45 @@ fn a_servers_page_signs_in_lists_your_files_and_their_people() {
     let sign_in = crate::live_tests::texts(&shapes).into_iter().filter(|t| t.0 == "Sign in").map(|t| t.1).next().unwrap();
     h.click(sign_in);
     let shapes = h.frames(6);
-    for t in ["Signed in as Ann (ann@example.com)", "Sign out", "Files", "People", "Admin", "Recent", "All files", "Plan", "Folders", "Work"] {
+    for t in [
+        "Signed in as Ann (ann@example.com)",
+        "Sign out",
+        "Files",
+        "People",
+        "Settings",
+        "Admin",
+        "New design file",
+        "Recent",
+        "All files",
+        "Plan",
+        "Folders",
+        "Work",
+    ] {
         assert!(has_text(&shapes, t), "signed in, the page shows {t:?}");
     }
+    // Signed in with a token, not a password: no Account tab.
+    assert!(!has_text(&shapes, "Account"));
     assert!(!format!("{:?}", crate::account_ui::inspect(&h.app)).contains(TOKEN));
-    // The People tab: a file's people, and an owner's invite field.
+    // The People tab: everyone on the server by name (never an email), without invites.
     click(&mut h, "People");
-    let shapes = click(&mut h, "Plan");
-    for t in ["Ann (you)", "Bob", "Invite"] {
-        assert!(has_text(&shapes, t), "the people show {t:?}");
+    let shapes = h.frames(6);
+    for t in ["Ann (you)", "Bob", "Everyone here is in every file on this server."] {
+        assert!(shapes.iter().any(|_| true) && crate::live_tests::texts(&shapes).iter().any(|x| x.0.contains(t)), "the people show {t:?}");
     }
-    assert!(wire.lock().unwrap().asked.iter().any(|r| matches!(r, NetRequest::Account { req: AccountReq::Members { file }, .. } if file == "f1")));
-    // The Admin tab: the server's people, no file management.
+    assert!(!has_text(&shapes, "Invite") && !has_text(&shapes, "bob@example.com"));
+    assert!(wire.lock().unwrap().asked.iter().any(|r| matches!(r, NetRequest::Account { req: AccountReq::Team, .. })));
+    // Settings: this server for new files.
+    let shapes = click(&mut h, "Settings");
+    assert!(has_text(&shapes, "Use this server for new files") && has_text(&shapes, "Open this server's home when FigCraft starts"));
+    // The Admin tab: one page of sections.
     let shapes = click(&mut h, "Admin");
-    assert!(has_text(&shapes, "Ownership") && has_text(&shapes, "Status"));
+    for t in ["People on this server", "Invite people", "Sessions"] {
+        assert!(has_text(&shapes, t), "the admin tab shows {t:?}");
+    }
+    // Signed in with a password: the Account tab, with the password.
+    h.app.session.prefs.accounts[0].password = true;
+    let shapes = click(&mut h, "Account");
+    assert!(has_text(&shapes, "Change password") && has_text(&shapes, "Current password"));
     // Sign out: back to the ways in.
     let shapes = click(&mut h, "Sign out");
     assert!(h.app.session.signed_in(SERVER).is_none());
