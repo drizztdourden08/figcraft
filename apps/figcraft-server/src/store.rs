@@ -1554,20 +1554,27 @@ impl Backend for Store {
             Admin::Links { file } => self.links(&file).map_or_else(failed, |l| AdminReply::Links(l).into()),
             Admin::CreateLink { file, access, label } => self.create_link(&file, access, &label).map_or_else(failed, |l| AdminReply::Link(l).into()),
             Admin::Revoke { file, link } => match self.revoke(&file, &link) {
-                Ok(()) => Handled { reply: AdminReply::Done, revoked: Some((file, link)), removed: None, blocked: None },
+                Ok(()) => Handled { revoked: Some((file, link)), ..AdminReply::Done.into() },
                 Err(e) => failed(e),
             },
             Admin::Rename { file, name } => self.rename(&file, &name).map_or_else(failed, |()| AdminReply::Done.into()),
             Admin::Listing => AdminReply::Listing(self.listing(open)).into(),
             Admin::Reports => AdminReply::Reports(self.reports.clone()).into(),
             Admin::Block { ip } => match self.block(&ip, true) {
-                Ok(ip) => Handled { reply: AdminReply::Done, revoked: None, removed: None, blocked: Some(ip) },
+                Ok(ip) => Handled { blocked: Some(ip), ..AdminReply::Done.into() },
                 Err(e) => failed(e),
             },
             Admin::Unblock { ip } => self.block(&ip, false).map_or_else(failed, |_| AdminReply::Done.into()),
             Admin::Blocked => AdminReply::Blocked(self.blocked()).into(),
             Admin::Code { file, token } => self.set_code(&file, &token).map_or_else(failed, |code| AdminReply::Code { code }.into()),
             Admin::Owned { files } => self.owned(&files).into(),
+            req @ (Admin::People
+            | Admin::RemovePerson { .. }
+            | Admin::EndSessions { .. }
+            | Admin::FileMembers { .. }
+            | Admin::SetFileRole { .. }
+            | Admin::AddFileMember { .. }
+            | Admin::ServerStatus) => self.admin_people(req),
             // The hub removes people itself (it knows who is connected); it never asks the store.
             Admin::RemovePeer { .. } => failed("removing someone from a file is done by the server's hub".into()),
             Admin::Remove { file } => {
@@ -1578,7 +1585,7 @@ impl Backend for Store {
                     Ok(()) => AdminReply::Done,
                     Err(reason) => AdminReply::Failed { reason },
                 };
-                Handled { reply, revoked: None, removed: Some(file), blocked: None }
+                Handled { removed: Some(file), ..reply.into() }
             }
         }
     }

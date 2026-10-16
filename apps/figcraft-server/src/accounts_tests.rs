@@ -31,13 +31,13 @@ impl IdentityProvider for Fake {
     }
 }
 
-fn registry() -> Registry {
+pub(crate) fn registry() -> Registry {
     let mut r = Registry::builtin();
     r.register("fake", |_, _| Ok(Box::new(Fake)));
     r
 }
 
-fn accounts_config(dir: &std::path::Path, mode: &str) -> Config {
+pub(crate) fn accounts_config(dir: &std::path::Path, mode: &str) -> Config {
     Config {
         auth: AuthConfig {
             mode: mode.into(),
@@ -49,16 +49,16 @@ fn accounts_config(dir: &std::path::Path, mode: &str) -> Config {
     }
 }
 
-fn start(cfg: &Config) -> Running {
+pub(crate) fn start(cfg: &Config) -> Running {
     crate::start_with(cfg, &registry()).unwrap()
 }
 
-fn snapshot(name: &str) -> Vec<figcraft_collab::Change> {
+pub(crate) fn snapshot(name: &str) -> Vec<figcraft_collab::Change> {
     Replica::new(Document::new(name)).snapshot().unwrap()
 }
 
 /// A connection signed in with `token`: who it is.
-fn signed(addr: SocketAddr, sign: SignIn) -> (Raw, Result<Me, String>) {
+pub(crate) fn signed(addr: SocketAddr, sign: SignIn) -> (Raw, Result<Me, String>) {
     let mut raw = Raw::connect(addr);
     raw.send(&ClientMsg::SignIn(sign));
     let me = match raw.next() {
@@ -72,12 +72,12 @@ fn signed(addr: SocketAddr, sign: SignIn) -> (Raw, Result<Me, String>) {
     (raw, me)
 }
 
-fn token(sub: &str, email: &str, name: &str) -> SignIn {
+pub(crate) fn token(sub: &str, email: &str, name: &str) -> SignIn {
     SignIn::Token { provider: "fake".into(), token: format!("{sub}|{email}|{name}") }
 }
 
 /// An account connection for `sign`.
-fn account(addr: SocketAddr, sign: SignIn) -> (Raw, Me) {
+pub(crate) fn account(addr: SocketAddr, sign: SignIn) -> (Raw, Me) {
     let (mut raw, me) = signed(addr, sign);
     let me = me.unwrap();
     raw.send(&ClientMsg::OpenAccount(OpenAccount { protocol: PROTOCOL, client_version: message::client_version() }));
@@ -85,7 +85,7 @@ fn account(addr: SocketAddr, sign: SignIn) -> (Raw, Me) {
     (raw, me)
 }
 
-fn ask(raw: &mut Raw, req: AccountReq) -> AccountReply {
+pub(crate) fn ask(raw: &mut Raw, req: AccountReq) -> AccountReply {
     raw.send(&ClientMsg::Account(req));
     match raw.next() {
         ServerMsg::Account(r) => *r,
@@ -106,7 +106,7 @@ fn hello(file: &str, token: &str) -> ClientMsg {
 }
 
 /// Join `file` signed in as `sign` (or nobody): the access, or the refusal.
-fn join(addr: SocketAddr, sign: Option<SignIn>, file: &str, link_token: &str) -> (Raw, Result<message::Access, String>) {
+pub(crate) fn join(addr: SocketAddr, sign: Option<SignIn>, file: &str, link_token: &str) -> (Raw, Result<message::Access, String>) {
     let mut raw = match sign {
         Some(s) => signed(addr, s).0,
         None => Raw::connect(addr),

@@ -2,7 +2,7 @@
 //! on its own and through the server running on it.
 
 use figcraft_collab::Replica;
-use figcraft_collab::message::Access;
+use figcraft_collab::message::{Access, Role};
 use figcraft_doc::Document;
 
 use crate::cli::{self, Cli, Command, Sort, date, parse};
@@ -44,6 +44,26 @@ fn parsing() {
     {
         assert!(parse(&args(bad)).is_err(), "{bad:?}");
     }
+    // Managing people and members.
+    assert_eq!(parse(&args(&["people"])).unwrap().command, Command::People);
+    assert_eq!(parse(&args(&["people", "list"])).unwrap().command, Command::People);
+    assert_eq!(parse(&args(&["status"])).unwrap().command, Command::Status);
+    assert_eq!(parse(&args(&["people", "remove", "a1", "--force"])).unwrap().command, Command::RemovePerson { account: "a1".into(), force: true });
+    assert_eq!(parse(&args(&["people", "remove", "a1"])).unwrap().command, Command::RemovePerson { account: "a1".into(), force: false });
+    assert_eq!(parse(&args(&["people", "end-sessions", "a1"])).unwrap().command, Command::EndSessions { account: "a1".into() });
+    assert_eq!(parse(&args(&["members", "f1"])).unwrap().command, Command::Members { file: "f1".into() });
+    assert_eq!(
+        parse(&args(&["members", "add", "f1", "ann@example.com", "Viewer"])).unwrap().command,
+        Command::AddMember { file: "f1".into(), email: "ann@example.com".into(), role: Role::Viewer }
+    );
+    assert_eq!(
+        parse(&args(&["members", "role", "f1", "a1", "owner"])).unwrap().command,
+        Command::SetRole { file: "f1".into(), account: "a1".into(), role: Role::Owner }
+    );
+    for bad in [&["members", "role", "f1", "a1", "boss"][..], &["people", "remove"], &["members", "add", "f1", "x@y.z"]] {
+        assert!(parse(&args(bad)).is_err(), "{bad:?}");
+    }
+    assert!(cli::USAGE.contains("people remove ACCOUNT [--force]") && cli::USAGE.contains("members role FILE ACCOUNT ROLE"));
     // A config file, with flags over it; unknown keys are errors.
     let dir = TempDir::new("cli-config");
     let file = dir.path().join("server.toml");

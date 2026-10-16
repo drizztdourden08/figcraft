@@ -200,6 +200,14 @@ so everything an older peer reads is unchanged. A server from before it can't re
 refuses the connection ("that message couldn't be read"): the app then shows the files it has
 recorded as they are, without their state on the server. An older app never sends it.
 
+**Managing people** (servers with accounts) came later the same way: `Admin` gained `people`,
+`removePerson {account, force}`, `endSessions {account}`, `fileMembers {file}`, `setFileRole {file,
+account, role}`, `addFileMember {file, email, role}` and `serverStatus` at its end, and
+`AdminReply` gained `people`, `personRemoved {orphaned}`, `lastOwner {files}`, `fileMembers` and
+`serverStatus` at its end. They need the server key or a signed-in admin; ending someone's sessions
+or removing them closes every connection signed in as them. A server from before them can't read
+the requests (see [`server.md`](server.md#managing-people)).
+
 **Encoding (decided):** a binary message is a 1-byte wire version followed by **postcard** (serde),
 which is compact and needs no schema files. Property values inside are compact JSON text: the
 document types use tagged and flattened serde forms that only self-describing formats can read

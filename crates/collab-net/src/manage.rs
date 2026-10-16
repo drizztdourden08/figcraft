@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use figcraft_auth::ServerInfo;
+use figcraft_auth::{ServerInfo, SignIn, SignInReply};
 use figcraft_collab::message::{
     self, Access, Admin, AdminReply, ClientMsg, HostInfo, LibraryReply, LibraryReq, Manage, NewLink, OpenHosting, OpenLibrary, OpenPlugins, PROTOCOL,
     PluginReply, PluginReq, Resolve, ServerMsg,
@@ -23,12 +23,40 @@ type Ws = WebSocket<Duplex>;
 /// server can't be reached, refuses the key or closes the connection (a request it can't do is a
 /// [`AdminReply::Failed`] reply, not an error). Never echoes the key.
 pub fn request(server: &Endpoint, key: &str, requests: Vec<Admin>, limits: &NetLimits, timeout: Duration) -> Result<Vec<AdminReply>, String> {
+    let ws = connect(server, limits, timeout)?;
+    managed(ws, key, requests, limits)
+}
+
+/// [`request`] as an admin of a server with accounts (their email is in its `admins`): signed in
+/// with `session` (a session token from signing in), without the key. Fails when the session has
+/// ended or the person isn't an admin there. Never echoes the token.
+pub fn request_as_admin(
+    server: &Endpoint,
+    session: &str,
+    requests: Vec<Admin>,
+    limits: &NetLimits,
+    timeout: Duration,
+) -> Result<Vec<AdminReply>, String> {
+    let mut ws = connect(server, limits, timeout)?;
+    send(&mut ws, &ClientMsg::SignIn(SignIn::Session { token: session.to_string() }))?;
+    match reply(&mut ws, limits, |m| match m {
+        ServerMsg::SignIn(r) => Some(*r),
+        _ => None,
+    })? {
+        SignInReply::SignedIn(_) => {}
+        SignInReply::Refused { reason } => return Err(format!("{REFUSED}{reason}")),
+        _ => return Err("the server didn't sign this session in".into()),
+    }
+    managed(ws, "", requests, limits)
+}
+
+/// Open managing on `ws` with `key` (empty: as the admin signed in on it), then the requests.
+fn managed(mut ws: Ws, key: &str, requests: Vec<Admin>, limits: &NetLimits) -> Result<Vec<AdminReply>, String> {
     let admin = |m: ServerMsg| match m {
         ServerMsg::Admin(r) => Some(*r),
         _ => None,
     };
     let manage = Manage { protocol: PROTOCOL, key: key.to_string(), client_version: env!("CARGO_PKG_VERSION").to_string() };
-    let mut ws = connect(server, limits, timeout)?;
     send(&mut ws, &ClientMsg::Manage(manage))?;
     match reply(&mut ws, limits, admin)? {
         AdminReply::Ready => {}

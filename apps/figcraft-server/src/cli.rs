@@ -1,5 +1,5 @@
-//! The command line: `figcraft-server` serves; `key`, `files`, `links` and `plugins` manage the
-//! data directory. When a server is running on the directory they ask it (so revoking a link
+//! The command line: `figcraft-server` serves; `key`, `files`, `links`, `plugins`, `people`,
+//! `members` and `status` manage the data directory. When a server is running on the directory they ask it (so revoking a link
 //! disconnects whoever joined with it at once); otherwise they change the directory themselves.
 
 use std::fmt::Write as _;
@@ -7,11 +7,17 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use figcraft_collab::message::{Access, Admin, AdminReply, FileRow, LinkInfo, NewLink, PluginEntry, PluginReply, PluginReq, ReportInfo};
+use std::sync::Arc;
+
+use figcraft_collab::message::{
+    Access, Admin, AdminReply, FileRow, Invited, LinkInfo, Member, NewLink, PersonInfo, PluginEntry, PluginReply, PluginReq, ReportInfo, Role,
+    ServerStatus,
+};
 use figcraft_collab_net::hub::Backend;
 use figcraft_collab_net::{Endpoint, Invite, manage};
 use serde::{Deserialize, Serialize};
 
+use crate::accounts::Accounts;
 use crate::config::Config;
 use crate::disk;
 use crate::store::{self, KEY, Store};
@@ -37,6 +43,15 @@ Usage:
   figcraft-server block-ip IP                    refuse an address (an IPv6 address: its /64) and drop its connections
   figcraft-server unblock-ip IP                  accept an address again
   figcraft-server blocked                        the blocked addresses
+  figcraft-server status                         version, sign-in settings, people, sessions, files, free space
+With accounts ([auth]):
+  figcraft-server people [list]                  everyone who signed in: account, email, sessions, files owned
+  figcraft-server people end-sessions ACCOUNT    sign them out everywhere (their connections close)
+  figcraft-server people remove ACCOUNT [--force]  take them off the server (out of every file, signed out);
+                                                 --force even when they are a file's last owner
+  figcraft-server members FILE                   a file's members and invites
+  figcraft-server members add FILE EMAIL ROLE    let an email in as owner, editor or viewer
+  figcraft-server members role FILE ACCOUNT ROLE give someone who signed in a role (adds them if needed)
 
 Options (also keys of the --config TOML file):
   --listen ADDR       where to listen (default 127.0.0.1:47900; 0.0.0.0:47900 for every network)
@@ -86,6 +101,13 @@ pub enum Command {
     Block { ip: String },
     Unblock { ip: String },
     Blocked,
+    Status,
+    People,
+    RemovePerson { account: String, force: bool },
+    EndSessions { account: String },
+    Members { file: String },
+    AddMember { file: String, email: String, role: Role },
+    SetRole { file: String, account: String, role: Role },
     Help,
     Version,
 }
@@ -110,6 +132,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut rotate = false;
     let mut version = None;
     let mut sort = Sort::Id;
+    let mut force = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = |name: &str| it.next().cloned().ok_or_else(|| format!("{name} needs a value"));
@@ -127,6 +150,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             "--access" => access = Some(Access::parse(&value("--access")?).ok_or("--access must be edit or view")?),
             "--label" => label = value("--label")?,
             "--rotate" => rotate = true,
+            "--force" => force = true,
             "--sort" => {
                 sort = match value("--sort")?.as_str() {
                     "size" => Sort::Size,
@@ -157,10 +181,21 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         ["block-ip", ip] => Command::Block { ip: ip.to_string() },
         ["unblock-ip", ip] => Command::Unblock { ip: ip.to_string() },
         ["blocked"] => Command::Blocked,
+        ["status"] => Command::Status,
+        ["people"] | ["people", "list"] => Command::People,
+        ["people", "remove", account] => Command::RemovePerson { account: account.to_string(), force },
+        ["people", "end-sessions", account] => Command::EndSessions { account: account.to_string() },
+        ["members", "add", file, email, role] => Command::AddMember { file: file.to_string(), email: email.to_string(), role: role_arg(role)? },
+        ["members", "role", file, account, role] => Command::SetRole { file: file.to_string(), account: account.to_string(), role: role_arg(role)? },
+        ["members", file] | ["members", "list", file] => Command::Members { file: file.to_string() },
         _ => return Err(format!("unknown command `{}`", words.join(" "))),
     };
     config.check()?;
     Ok(Cli { config, command })
+}
+
+fn role_arg(s: &str) -> Result<Role, String> {
+    Role::parse(s).ok_or_else(|| format!("{s:?} isn't a role: owner, editor or viewer"))
 }
 
 /// What a running server writes into its data directory.
@@ -246,6 +281,55 @@ pub fn run(cli: &Cli) -> Result<String, String> {
             AdminReply::Done => Ok(format!("Revoked link {link}: it no longer joins, and whoever was in the file with it was disconnected.\n")),
             other => unexpected(other),
         },
+        Command::Status => match admin(cfg, Admin::ServerStatus)? {
+            AdminReply::ServerStatus(s) => Ok(status_text(&s)),
+            other => unexpected(other),
+        },
+        Command::People => match admin(cfg, Admin::People)? {
+            AdminReply::People(people) => Ok(people_table(&people)),
+            other => unexpected(other),
+        },
+        Command::RemovePerson { account, force } => match admin(cfg, Admin::RemovePerson { account: account.clone(), force: *force })? {
+            AdminReply::PersonRemoved { orphaned } => {
+                let mut out = format!("Removed {account}: signed out, out of every file, account forgotten.\n");
+                if !orphaned.is_empty() {
+                    let _ = writeln!(out, "These files have no owner now (give one with `figcraft-server members role FILE ACCOUNT owner`):");
+                    for f in &orphaned {
+                        let _ = writeln!(out, "  {}  {}", f.id, f.name);
+                    }
+                }
+                Ok(out)
+            }
+            AdminReply::LastOwner { files } => {
+                let mut why = format!("{account} is the last owner of {} file{}:", files.len(), if files.len() == 1 { "" } else { "s" });
+                for f in &files {
+                    let _ = write!(why, "\n  {}  {}", f.id, f.name);
+                }
+                why.push_str("\nmake someone else owner first (`members role`), or add --force to leave them with no owner");
+                Err(why)
+            }
+            other => unexpected(other),
+        },
+        Command::EndSessions { account } => match admin(cfg, Admin::EndSessions { account: account.clone() })? {
+            AdminReply::Done => Ok(format!("Ended every session of {account}: they must sign in again.\n")),
+            other => unexpected(other),
+        },
+        Command::Members { file } => match admin(cfg, Admin::FileMembers { file: file.clone() })? {
+            AdminReply::FileMembers { members, invited } => Ok(members_table(&members, &invited)),
+            other => unexpected(other),
+        },
+        Command::AddMember { file, email, role } => {
+            match admin(cfg, Admin::AddFileMember { file: file.clone(), email: email.clone(), role: *role })? {
+                AdminReply::Done => Ok(format!("{email} is in file {file} as {}.\n", role.id())),
+                other => unexpected(other),
+            }
+        }
+        Command::SetRole { file, account, role } => {
+            match admin(cfg, Admin::SetFileRole { file: file.clone(), account: account.clone(), role: *role })? {
+                AdminReply::Done => Ok(format!("{account} is {} of file {file}.\n", role.id())),
+                other => unexpected(other),
+            }
+        }
         Command::Plugins => match directory(cfg, PluginReq::List { query: String::new() })? {
             PluginReply::List(entries) => Ok(plugins_table(&entries)),
             other => unexpected_plugins(other),
@@ -316,7 +400,13 @@ fn running(data: &Path) -> Result<SocketAddr, String> {
 /// Do one request: through the running server, or on the data directory.
 fn admin(cfg: &Config, req: Admin) -> Result<AdminReply, String> {
     match Store::try_open(&cfg.data, cfg.store())? {
-        Some(mut store) => Ok(store.admin(req, &|_| None).reply),
+        Some(mut store) => {
+            // Stopped: who signed in is read from the directory too.
+            if cfg.auth.mode()?.accounts() {
+                store.set_accounts(Arc::new(Accounts::offline(&cfg.data, &cfg.auth, cfg.e2e.mode()?)?));
+            }
+            Ok(store.admin(req, &|_| None).reply)
+        }
         None => {
             let addr = running(&cfg.data)?;
             let key = std::fs::read_to_string(cfg.data.join(KEY)).map_err(|e| format!("can't read the server key: {e}"))?;
@@ -401,6 +491,62 @@ fn files_table(mut files: Vec<FileRow>, sort: Sort, now: u64) -> String {
             f.reports,
             by
         );
+    }
+    out
+}
+
+fn status_text(s: &ServerStatus) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "figcraft-server {}", s.version);
+    let _ = writeln!(out, "Access:    {}", s.info.auth.id());
+    let _ = writeln!(out, "Sealed:    {}", s.info.e2e.id());
+    if !s.info.providers.is_empty() {
+        let list: Vec<String> = s.info.providers.iter().map(|p| format!("{} ({})", p.id, p.label)).collect();
+        let _ = writeln!(out, "Sign-ins:  {}", list.join(", "));
+    }
+    let _ = writeln!(out, "People:    {} ({} sessions)", s.people, s.sessions);
+    let _ = writeln!(out, "Files:     {}", s.files);
+    if let Some(free) = s.free_bytes {
+        let _ = writeln!(out, "Free disk: {}", size(free));
+    }
+    out
+}
+
+fn people_table(people: &[PersonInfo]) -> String {
+    if people.is_empty() {
+        return "Nobody has signed in yet.\n".into();
+    }
+    let mut out =
+        String::from("ACCOUNT           PROVIDER    EMAIL                           NAME                  SESSIONS  OWNS  LAST SEEN   ADMIN\n");
+    for p in people {
+        let _ = writeln!(
+            out,
+            "{:<16}  {:<10}  {:<30}  {:<20}  {:>8}  {:>4}  {:<10}  {}",
+            p.account,
+            elide(&p.provider, 10),
+            elide(p.email.as_deref().unwrap_or("-"), 30),
+            elide(&p.name, 20),
+            p.sessions,
+            p.owned,
+            day(p.seen),
+            if p.admin { "yes" } else { "" }
+        );
+    }
+    out
+}
+
+fn members_table(members: &[Member], invited: &[Invited]) -> String {
+    let mut out = String::new();
+    if members.is_empty() {
+        out.push_str("No members (give someone a role with `figcraft-server members role FILE ACCOUNT owner`).\n");
+    } else {
+        out.push_str("ACCOUNT           ROLE    EMAIL                           NAME\n");
+        for m in members {
+            let _ = writeln!(out, "{:<16}  {:<6}  {:<30}  {}", m.account, m.role.id(), elide(m.email.as_deref().unwrap_or("-"), 30), m.name);
+        }
+    }
+    for v in invited {
+        let _ = writeln!(out, "invited           {:<6}  {}", v.role.id(), v.email);
     }
     out
 }
