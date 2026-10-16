@@ -72,9 +72,10 @@ pub fn start(cfg: &Config) -> Result<Running, String> {
 
 /// [`start`], with identity provider kinds of your own beside the built-in ones.
 pub fn start_with(cfg: &Config, registry: &Registry) -> Result<Running, String> {
-    cfg.check()?;
+    cfg.check_with(registry)?;
+    let fetch = Arc::new(Https::new()?);
     let mut store = Store::open(&cfg.data, cfg.store())?;
-    let accounts = Arc::new(Accounts::open(&cfg.data, &cfg.auth, cfg.e2e.mode()?, registry, Arc::new(Https::new()))?);
+    let accounts = Arc::new(Accounts::open(&cfg.data, &cfg.auth, cfg.e2e.mode()?, registry, fetch)?);
     store.set_accounts(accounts.clone());
     for p in store.problems() {
         log::warn!("{p}");
@@ -128,6 +129,8 @@ mod owned_tests;
 mod public_tests;
 #[cfg(test)]
 mod server_tests;
+#[cfg(test)]
+mod settings_tests;
 #[cfg(test)]
 mod store_tests;
 #[cfg(test)]

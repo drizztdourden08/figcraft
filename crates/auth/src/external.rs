@@ -24,6 +24,8 @@ pub struct External {
     id: String,
     label: String,
     verify_url: String,
+    /// An email counts as verified when the answer doesn't say (`trust_email`).
+    trust_email: bool,
     fetch: Arc<dyn Fetch>,
 }
 
@@ -36,7 +38,7 @@ impl External {
             return Err(format!("provider {:?}: `verify_url` must be https:// (or http:// on this machine)", cfg.id));
         }
         let label = if cfg.label.trim().is_empty() { cfg.id.clone() } else { cfg.label.trim().to_string() };
-        Ok(External { id: cfg.id.clone(), label, verify_url: url.to_string(), fetch })
+        Ok(External { id: cfg.id.clone(), label, verify_url: url.to_string(), trust_email: cfg.trust_email, fetch })
     }
 }
 
@@ -67,7 +69,11 @@ impl IdentityProvider for External {
             provider: self.id.clone(),
             subject,
             email: s("email").map(|e| e.to_ascii_lowercase()),
-            email_verified: v["email_verified"].as_bool().unwrap_or(false),
+            email_verified: match &v["email_verified"] {
+                Value::Bool(b) => *b,
+                Value::Null => self.trust_email,
+                _ => false,
+            },
             name: s("name"),
         })
     }

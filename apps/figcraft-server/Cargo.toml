@@ -23,6 +23,9 @@ figcraft-collab-net = { workspace = true }
 figcraft-auth = { workspace = true, features = ["providers"] }
 # HTTPS to identity providers (discovery, keys, token exchanges).
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+# Mozilla's roots as certificates, so a private authority (FIGCRAFT_CA_FILE) can be trusted
+# beside them (the same list ureq's own default, webpki-roots, holds).
+webpki-root-certs = "1"
 # Checking a team library before keeping it (read as files using it read it).
 figcraft-format = { workspace = true }
 # Checking plugin bundles before the plugin directory keeps them (never run here).
@@ -42,6 +45,8 @@ ctrlc = { version = "3", features = ["termination"] }
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 
 [dev-dependencies]
+# A test authority's certificate as PEM (FIGCRAFT_CA_FILE).
+base64 = { workspace = true }
 # Crafting hostile archives (zip bombs) in tests.
 zip = { workspace = true }
 wat = { workspace = true }

@@ -46,7 +46,7 @@ pub struct ProviderConfig {
     pub kind: String,
     /// What people see (default: from the preset, else the id).
     pub label: String,
-    /// `oidc`: fills `issuer`, `scopes` and the label (`"google"`, `"microsoft"`, `"gitlab"`).
+    /// `oidc`: fills `issuer` and the label (`"google"` or `"gitlab"`; see `oidc::PRESETS`).
     pub preset: String,
     /// `oidc`: the issuer (`https://accounts.google.com`); its discovery document is
     /// `<issuer>/.well-known/openid-configuration`.
@@ -59,11 +59,17 @@ pub struct ProviderConfig {
     pub scopes: Vec<String>,
     /// `oidc`: extra parameters for the sign-in page (`[["prompt", "select_account"]]`).
     pub params: Vec<(String, String)>,
-    /// `oidc`: the flows offered (default: `browser`, and `device` when the issuer has a device
-    /// endpoint).
+    /// `oidc`: the flows offered, `"browser"` and/or `"device"` (default: `["browser"]` only; the
+    /// device flow is offered only when listed here, and needs the issuer's device endpoint).
     pub flows: Vec<String>,
-    /// `external`: where the server POSTs `{"token": …}` to learn who it is.
+    /// `external`: where the server POSTs `{"provider": …, "token": …}` to learn who it is.
     pub verify_url: String,
+    /// `oidc` and `external`: count an email as verified when the provider doesn't say
+    /// (`email_verified` absent, as with Microsoft Entra ID). Default false. Only for a provider
+    /// that hands out nothing but emails it has checked (a single-tenant Entra ID, a directory you
+    /// run): with any other, someone could claim an address that isn't theirs and pass the
+    /// allow-lists or become an admin. An explicit `email_verified: false` is never overridden.
+    pub trust_email: bool,
 }
 
 /// `[e2e]`.

@@ -33,14 +33,15 @@ app, on the local network) don't change.
 
 ## Configuration
 
-Two settings in `server.toml` (each also a command-line flag, like every other setting); leaving
-them out keeps today's server.
+Two settings in `server.toml`, in its `[auth]` and `[e2e]` sections (unlike the server's other
+settings these have no command-line flags: they live only in the file); leaving them out keeps
+today's server.
 
 | `auth.mode` ↓ / `e2e.mode` → | `off` (default) | `optional` | `required` |
 |---|---|---|---|
 | `links` (default): share links and join codes | Today's server | Owners may seal a file; its key travels in the link's `#` part (never sent to the server); join codes can't carry a key, so sealed files have none | Every published file is sealed, key in the link |
 | `accounts`: signing in is required; people have a role per file | Private server with real sign-in; the server can read files | Owners choose per file; sealed files keep a keyring per device | Every file sealed; keys per account and device |
-| `accounts+links`: both; links keep working, a file can demand sign-in | Teams plus share links | Either, per file | Sealed; a link carries the key and still checks sign-in when the file demands it |
+| `accounts+links`: both; links keep working (a file demanding sign-in even with a link is not built yet) | Teams plus share links | Either, per file | Sealed; a link carries the key (and would check sign-in when the file demands it, once that is built) |
 
 ```toml
 [auth]
@@ -53,7 +54,7 @@ session_days = 30                 # how long a sign-in lasts without being used
 [[auth.provider]]
 id = "google"                     # what apps show and send; any name
 kind = "oidc"
-preset = "google"                 # fills issuer and scopes
+preset = "google"                 # fills issuer and label ("google" or "gitlab")
 client_id = "1234-abc.apps.googleusercontent.com"
 client_secret_file = "/etc/figcraft-server/google.secret"
 
@@ -74,8 +75,11 @@ label = "Company token"
 mode = "optional"                 # "off" | "optional" | "required"
 ```
 
-`figcraft-server check` validates the combination; `figcraft-server providers` fetches each
-issuer's discovery document and reports what's wrong.
+`figcraft-server check` validates the combination and builds each provider without the network
+(`Registry::check`): an unknown kind or preset, a missing `issuer` or `client_id`, an unreadable
+`client_secret_file`, both secret keys, an unknown flow or a `verify_url` that isn't `https://` are
+reported there, not at startup. The issuer itself is first contacted when an app asks what the
+server accepts.
 
 ## Identity providers
 
@@ -94,29 +98,39 @@ pub trait IdentityProvider: Send + Sync {
     fn info(&self) -> ProviderInfo;  // id, label and the flows apps may use
     fn exchange_code(&self, code: &str, verifier: &str, redirect_uri: &str) -> Result<Identity, AuthError>;
     fn start_device(&self) -> Result<DeviceStart, AuthError>;
-    fn poll_device(&self, device_code: &str) -> Result<Option<Identity>, AuthError>;
+    fn poll_device(&self, device_code: &str) -> Result<Identity, AuthError>;  // AuthError::Pending until the code is entered
     fn verify_token(&self, token: &str) -> Result<Identity, AuthError>;
 }
 
 pub trait Fetch: Send + Sync {   // HTTPS, supplied by the server binary
-    fn get(&self, url: &str) -> Result<Vec<u8>, AuthError>;
-    fn post_form(&self, url: &str, form: &[(&str, &str)]) -> Result<Vec<u8>, AuthError>;
-    fn post_json(&self, url: &str, body: &[u8]) -> Result<Vec<u8>, AuthError>;
+    fn get(&self, url: &str) -> Result<Vec<u8>, FetchError>;
+    fn post_form(&self, url: &str, form: &[(&str, &str)]) -> Result<Vec<u8>, FetchError>;
+    fn post_json(&self, url: &str, body: &[u8]) -> Result<Vec<u8>, FetchError>;
 }
 ```
 
 A person is `(provider id, subject)`, never an email alone, so two providers can't collide. The
-methods a provider doesn't support return `AuthError::Unsupported`.
+methods a provider doesn't support return `AuthError::Unsupported`. Providers must not use the
+network while being built (only when used), so settings can be checked offline.
+
+An email counts for allow-lists, admins and invites only when the provider says it is verified
+(`email_verified`). Some issuers never say (Microsoft Entra ID): `trust_email = true` on a provider
+counts its emails as verified when the claim is absent (an explicit `false` still counts as
+unverified). It is only safe for an issuer that hands out nothing but emails it has checked, such
+as a single-tenant Entra ID or a directory you run; anywhere else someone could claim an address
+that isn't theirs.
 
 | Kind | Flows | How the server checks |
 |---|---|---|
-| `oidc` | `browser` (authorization code + PKCE, loopback redirect), `device` (RFC 8628) when the issuer has a device endpoint | Discovery document → token endpoint → ID token signature against the issuer's keys (cached, refetched when a key id is new), `iss`, `aud`, `exp`, `nbf`, `iat`; `email_verified` for allow-lists |
-| `oidc` + `preset = "google"` | `browser`, `device` | The same code; the preset only fills the issuer and scopes |
-| `external` | `token` | POSTs `{"token": …}` to `verify_url`, expects `{"subject", "email"?, "name"?}` (200) or a refusal; reference verifier in `examples/auth-verifier/` |
+| `oidc` | `browser` (authorization code + PKCE, loopback redirect) by default; `device` (RFC 8628) only when `flows` lists it, and the issuer has a device endpoint | Discovery document → token endpoint → ID token signature against the issuer's keys (cached, refetched when a key id is new), `iss`, `aud`, `exp`, `nbf`, `iat`; `email_verified` (or `trust_email`) for allow-lists |
+| `oidc` + `preset = "google"` or `"gitlab"` | The same | The same code; the preset only fills the issuer and the label |
+| `external` | `token` | POSTs `{"provider": …, "token": …}` to `verify_url`, expects `{"subject", "email"?, "email_verified"?, "name"?}` (200) or a refusal (401/403 with an optional `{"error"}`); reference verifier in [`examples/auth-verifier/`](../examples/auth-verifier/) |
 
 **Adding a provider**: a config block for any OpenID Connect issuer; an `external` verifier in any
-language, with no rebuild; or an `IdentityProvider` implementation in Rust registered with
-`figcraft_server::providers::register` for those who want it in the binary.
+language, with no rebuild; or an `IdentityProvider` implementation in Rust for those who want it in
+the binary: register a factory with `figcraft_auth::registry::Registry::register` and start the
+server with `figcraft_server::start_with(&config, &registry)` (and check settings with
+`Config::check_with(&registry)`); see [`server-accounts.md`](server-accounts.md#choosing-a-provider).
 
 ### Signing in
 
@@ -273,7 +287,8 @@ members and keyrings and builds the providers from its config.
 2. `crates/auth`, `Info`, and the server advertising it (no visible change).
 3. OpenID Connect provider, accounts on the server (people, sessions, members, roles).
 4. Sign-in in the app and `figcraft-cli` (browser, device, token flows), the Share dialog's people.
-5. `external` provider and its reference verifier.
+5. `external` provider and its reference verifier (built: the provider with step 3, the example
+   verifier in `examples/auth-verifier/`).
 6. `crates/collab-seal`.
 7. `crates/collab-opaque` and sealed files on the server.
 8. Sealing in the app; sealed links.

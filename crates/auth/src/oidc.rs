@@ -60,6 +60,8 @@ pub struct Oidc {
     params: Vec<(String, String)>,
     browser: bool,
     device: bool,
+    /// An email counts as verified when the token doesn't say (`trust_email`).
+    trust_email: bool,
     fetch: Arc<dyn Fetch>,
     cache: Mutex<Cache>,
 }
@@ -123,6 +125,7 @@ impl Oidc {
             params: cfg.params.clone(),
             browser: flows.iter().any(|f| f == "browser"),
             device: flows.iter().any(|f| f == "device"),
+            trust_email: cfg.trust_email,
             fetch,
             cache: Mutex::new(Cache { discovery: None, keys: None, refetched: None }),
         })
@@ -179,7 +182,7 @@ impl Oidc {
             .ok_or_else(|| AuthError::Refused("the sign-in couldn't be checked: it was signed with an unknown key".into()))?;
         jwt::verify_signature(&parsed, key)?;
         jwt::check_claims(&parsed.claims, &Expect { issuer: &d.issuer, audience: &self.client_id, now: now() })?;
-        Ok(identity(&self.id, &parsed.claims))
+        Ok(identity(&self.id, &parsed.claims, self.trust_email))
     }
 
     fn with_secret<'a>(&'a self, form: &mut Vec<(&'a str, &'a str)>) {
@@ -190,13 +193,15 @@ impl Oidc {
     }
 }
 
-/// The identity in a checked token's claims.
-fn identity(provider: &str, claims: &Value) -> Identity {
+/// The identity in a checked token's claims. Without an `email_verified` claim the email counts
+/// as verified only when the provider is configured with `trust_email`.
+fn identity(provider: &str, claims: &Value, trust_email: bool) -> Identity {
     let s = |k: &str| claims[k].as_str().map(str::trim).filter(|v| !v.is_empty()).map(String::from);
     let verified = match &claims["email_verified"] {
         Value::Bool(b) => *b,
         // Some issuers send it as a string.
         Value::String(v) => v == "true",
+        Value::Null => trust_email,
         _ => false,
     };
     Identity {

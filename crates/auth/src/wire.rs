@@ -12,7 +12,8 @@ pub enum AuthMode {
     Links,
     /// Signing in is required, and people have a role per file.
     Accounts,
-    /// Both: links keep working, and a file can demand signing in.
+    /// Both: members sign in, and share links and join codes keep working (a file that demands
+    /// signing in even with a link isn't built yet).
     AccountsAndLinks,
 }
 

@@ -11,6 +11,9 @@
 # It makes the `figcraft` user, its data directory and /etc/figcraft-server/server.toml (only when
 # missing: your edits are kept), installs the systemd units and its own Caddy site, opens SSH, 80
 # and 443 in ufw and starts it all. Safe to run again: it upgrades and restarts only on change.
+# With accounts turned on in server.toml ([auth] mode = "accounts" or "accounts+links") it lets
+# the server reach identity providers (a systemd drop-in, outbound.conf); run it again after
+# turning accounts on or off.
 #
 # Options:
 #   --host HOST        the DNS name people use (its A/AAAA records must point at this machine)
@@ -76,10 +79,25 @@ caddy_main() { # caddy_main FILE EMAIL: the main Caddyfile to install, on stdout
   fi
 }
 
+accounts_on() { # accounts_on FILE: true when the settings in FILE turn accounts on
+  # `mode` under [auth] (or `auth.mode` at the top), quoted either way, comments ignored.
+  awk '
+    { line = $0; sub(/#.*/, "", line) }
+    line ~ /^[ \t]*\[/ { section = line; gsub(/[ \t]/, "", section); next }
+    (section == "[auth]" && line ~ /^[ \t]*mode[ \t]*=/) || (section == "" && line ~ /^[ \t]*auth\.mode[ \t]*=/) {
+      value = line; sub(/^[^=]*=[ \t]*/, "", value)
+      if (index(value, "accounts") == 2) found = 1
+    }
+    END { exit found ? 0 : 1 }
+  ' "$1"
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     # For tests (packaging/server/install-test.sh): print the Caddyfile this script would write.
     --caddy-main) caddy_main "${2:-}" "${3:-}"; exit 0 ;;
+    # For tests: whether the settings in FILE turn accounts on (exit status).
+    --accounts-on) accounts_on "${2:-}"; exit $? ;;
     --host) HOST="${2:-}"; shift 2 ;;
     --email) EMAIL="${2:-}"; shift 2 ;;
     --terms) TERMS="${2:-}"; shift 2 ;;
@@ -90,7 +108,7 @@ while [ $# -gt 0 ]; do
     --backups) BACKUPS=true; shift ;;
     --no-firewall) FIREWALL=false; shift ;;
     --firewall-anyway) FIREWALL_ANYWAY=true; shift ;;
-    -h | --help) sed -n '2,27p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,30p' "$0"; exit 0 ;;
     *) die "unknown option $1 (see --help)" ;;
   esac
 done
@@ -314,6 +332,29 @@ UNITS=false
 install_file "$FILES/figcraft-server.service" /etc/systemd/system/figcraft-server.service 644 && UNITS=true
 install_file "$FILES/figcraft-backup.service" /etc/systemd/system/figcraft-backup.service 644 && UNITS=true
 install_file "$FILES/figcraft-backup.timer" /etc/systemd/system/figcraft-backup.timer 644 && UNITS=true
+# Accounts: the server fetches from identity providers itself, so the unit's IPAddressAllow /
+# IPAddressDeny (this machine only) are cleared by a drop-in of ours; without accounts it goes.
+DROPIN_DIR=/etc/systemd/system/figcraft-server.service.d
+DROPIN="$DROPIN_DIR/outbound.conf"
+if accounts_on "$CONFIG"; then
+  OUTBOUND="$(mktemp)"
+  printf '%s
+# Accounts are on in %s: the server reaches identity providers over HTTPS.
+[Service]
+IPAddressAllow=
+IPAddressDeny=
+' "$MARK" "$CONFIG" >"$OUTBOUND"
+  install -d -m 755 "$DROPIN_DIR"
+  if install_file "$OUTBOUND" "$DROPIN" 644; then
+    say "Accounts are on: the server may reach identity providers ($DROPIN)"
+    UNITS=true
+  fi
+  rm -f "$OUTBOUND"
+elif [ -f "$DROPIN" ] && grep -qF "$MARK" "$DROPIN"; then
+  say "Accounts are off: the server is limited to this machine again"
+  rm -f "$DROPIN"
+  UNITS=true
+fi
 if [ "$UNITS" = true ]; then
   systemctl daemon-reload
   CHANGED=true
@@ -407,6 +448,7 @@ figcraft-server is running behind Caddy.
              $ADMIN block-ip ADDRESS      (unblock-ip, blocked)
   Server key: $ADMIN key
   Settings:  $CONFIG (then: systemctl restart $SERVICE)
+  Accounts:  docs/server-accounts.md (after turning them on or off in $CONFIG, run this script again)
   Backups:   systemctl enable --now figcraft-backup.timer   (nightly, to /var/backups/figcraft-server;
              the archives hold every file and the server key: keep them as private as the server)
   Upgrade:   run this script again
