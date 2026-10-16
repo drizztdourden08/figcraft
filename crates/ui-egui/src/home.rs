@@ -1,6 +1,7 @@
 //! The home screen: Recents (new file, open, join with a code, the Getting started tips, open and
-//! recent files ([`crate::home_recents`]), and templates to start from on a first run), Online (your online files:
-//! [`crate::online`]) and Templates (the starter templates as cards with thumbnails rendered from
+//! recent files ([`crate::home_recents`]), and templates to start from on a first run), Templates,
+//! and a page for each remote server you use ([`crate::account_ui::page`]: signing in there, your
+//! files there, the files you shared there from this computer). Templates (the starter templates as cards with thumbnails rendered from
 //! the documents themselves, searched and filtered by kind).
 
 use std::collections::BTreeMap;
@@ -21,28 +22,29 @@ use crate::widgets;
 pub enum Section {
     #[default]
     Recents,
-    Online,
     Templates,
+    /// The page of a remote server: its index in [`crate::account_ui::home_servers`].
+    Server(usize),
 }
 
 impl Section {
-    /// The sidebar, top to bottom.
-    const ALL: [(Section, Icon, &'static str); 3] = [
-        (Section::Recents, Icon::Home, tr_noop("Recents")),
-        (Section::Online, Icon::Online, tr_noop("Online")),
-        (Section::Templates, Icon::Assets, tr_noop("Templates")),
-    ];
+    /// The sidebar's own sections, top to bottom (the servers follow).
+    const ALL: [(Section, Icon, &'static str); 2] =
+        [(Section::Recents, Icon::Home, tr_noop("Recents")), (Section::Templates, Icon::Assets, tr_noop("Templates"))];
 
-    /// The id `ui.set {homeSection}` and `ui.inspect` use.
-    pub fn id(self) -> &'static str {
+    /// The id `ui.set {homeSection}` and `ui.inspect` use (`server:<n>` for a server's page).
+    pub fn id(self) -> String {
         match self {
-            Section::Recents => "recents",
-            Section::Online => "online",
-            Section::Templates => "templates",
+            Section::Recents => "recents".into(),
+            Section::Templates => "templates".into(),
+            Section::Server(i) => format!("server:{i}"),
         }
     }
 
     pub fn parse(id: &str) -> Option<Section> {
+        if let Some(i) = id.strip_prefix("server:").and_then(|n| n.parse().ok()) {
+            return Some(Section::Server(i));
+        }
         Section::ALL.into_iter().map(|(section, ..)| section).find(|section| section.id() == id)
     }
 }
@@ -143,10 +145,13 @@ pub fn show(app: &mut FigApp, ui: &mut Ui) {
         let left = Rect::from_min_size(rect.min, vec2(SIDEBAR, rect.height()));
         ui.painter().line_segment([left.right_top(), left.right_bottom()], Stroke::new(1.0, t.border));
         sidebar(app, ui, &t, left);
-        if app.ui.home_view.section == Section::Online {
-            // Your online files lay themselves out in the area (and scroll their own list).
+        if let Section::Server(i) = app.ui.home_view.section {
+            // A server's page lays itself out in the area (and scrolls its own content).
             let area = Rect::from_min_max(pos2(left.max.x + 40.0, rect.min.y + 24.0), rect.max - vec2(40.0, 24.0));
-            crate::online::section(app, ui, area, &t);
+            match crate::account_ui::home_servers(app).into_iter().nth(i) {
+                Some(server) => crate::account_ui::page(app, ui, area, &t, &server),
+                None => app.ui.home_view.section = Section::Recents,
+            }
             opened_join(app);
             return;
         }
@@ -198,17 +203,30 @@ fn sidebar(app: &mut FigApp, ui: &mut Ui, t: &Tokens, left: Rect) {
     icons::paint(ui.painter(), Rect::from_min_size(pos2(left.min.x + 16.0, y), vec2(20.0, 20.0)), Icon::Logo, ACCENT);
     ui.painter().text(pos2(left.min.x + 44.0, y + 10.0), Align2::LEFT_CENTER, "FigCraft", semibold(14.0), t.text);
     y += 48.0;
-    for (section, icon, label) in Section::ALL {
+    // Here, then each remote server.
+    let servers = crate::account_ui::home_servers(app);
+    let entries: Vec<(Section, Icon, String)> = Section::ALL
+        .into_iter()
+        .map(|(s, icon, label)| (s, icon, tr(label).to_string()))
+        .chain(servers.iter().enumerate().map(|(i, s)| (Section::Server(i), Icon::Online, s.name.clone())))
+        .collect();
+    for (n, (section, icon, label)) in entries.into_iter().enumerate() {
+        if n == Section::ALL.len() {
+            y += 12.0;
+            ui.painter().text(pos2(left.min.x + 18.0, y + 8.0), Align2::LEFT_CENTER, tr("Servers"), semibold(11.0), t.text_secondary);
+            y += 24.0;
+        }
         let r = Rect::from_min_size(pos2(left.min.x + 8.0, y), vec2(SIDEBAR - 16.0, 32.0));
-        let resp = ui.interact(r, ui.id().with(("home_section", label)), Sense::click());
+        let resp = ui.interact(r, ui.id().with(("home_section", n)), Sense::click());
         let current = app.ui.home_view.section == section;
-        a11y::tab(&resp, tr(label), current);
+        a11y::tab(&resp, &label, current);
         if current || resp.hovered() {
             ui.painter().rect_filled(r, CornerRadius::same(5), if current { t.selected_row } else { t.hover });
         }
         focus_ring(ui, t, r, &resp, 5);
         icons::paint(ui.painter(), Rect::from_min_size(pos2(r.min.x + 10.0, r.center().y - 8.0), vec2(16.0, 16.0)), icon, t.icon);
-        ui.painter().text(pos2(r.min.x + 36.0, r.center().y), Align2::LEFT_CENTER, tr(label), regular(12.0), t.text);
+        let shown = widgets::elide(ui, &label, r.width() - 46.0);
+        ui.painter().text(pos2(r.min.x + 36.0, r.center().y), Align2::LEFT_CENTER, shown, regular(12.0), t.text);
         if resp.clicked() {
             app.ui.home_view.section = section;
         }

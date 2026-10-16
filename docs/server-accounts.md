@@ -545,12 +545,39 @@ they had.
 
 ## Day to day
 
-People sign in from the app: the app's sign-in (when they connect to the server, or from its
-settings) lists the server's providers; **Sign in** opens the provider's page in the system
-browser, and the app comes back signed in. Where an app can't open a browser (`figcraft-cli`,
-agents through MCP), the device flow shows a code to type on another device; an `external`
-provider asks for the token. *The sign-in in the app and the CLI is being built (step 4 of
-[`accounts-and-e2e.md`](accounts-and-e2e.md#steps)); the server side described here is done.*
+People add the server in the app under **Preferences ▸ Servers** (a name and its address,
+`wss://figcraft.example.com/`); the browser build that a server hosts uses that server only. The
+home screen then has a page for the server, under **Servers** in its sidebar:
+
+The app shows a server by the name given to it there, never by its address.
+
+- **Signing in**: the page offers the server's ways in, from what it says it accepts: none for a
+  server open to everyone (links and codes only); a username and password for basic sign-in; a
+  token field for an `external` provider; and for each single sign-on provider a light **Sign in
+  with *Label*** button (a plain key, never the provider's logo). The browser flow says *Finish
+  signing in in your browser* (with **Cancel**); the device flow shows the code to type (**Copy
+  code**, **Open the page**); in the browser build every sign-on uses the code. A sign-in kept
+  from before is checked when the page opens, without asking; one the server no longer takes asks
+  you to sign in again. **Sign out** is next to your name.
+- **Files** (the first tab): your files there as cards, like the home screen's own: **Recent**
+  first, then **All files** (and folders, with the path to go back up, once the server keeps
+  folders), each with your role and *Encrypted* for sealed files. A click opens one (as a member,
+  no link needed). **Put an open file here** publishes an open file to the server as yours.
+- **People**: each of your files; one opens to show who is in it, and owners change roles, remove
+  people, take invites back and **Invite** by email.
+- **Account**: **Change password** (basic sign-in), and on servers that keep sealed files your
+  devices, the recovery key, **Revoke**, **Make a recovery key** (shown once) and **Use a recovery
+  key**. Someone whose devices changed gets a gentle note in People, with **Show safety number**.
+- **Admin** (admins only): **Usernames** (basic sign-in: **Add user**, **Reset password**, Remove;
+  a password the server makes shows once, with Copy), **People** (end someone's sessions, **Remove…** them from the server;
+  when they are the last owner of files, **Make someone else owner** or **Remove anyway**, and
+  files left without an owner say so with **Give it an owner**), **Ownership** (give a file an
+  owner) and **Status**. Files themselves are managed from Files, not here.
+- The **Share** popover of a file on the server shows its **People** in the same way. To put a
+  file on the server from there, choose the server under **Online** and **Put on *server***.
+
+`figcraft-cli` and agents (MCP) use the same commands: `servers.*`, `account.*`, `collab.members`
+and the others below, `admin.*`.
 
 - **Publishing** a file to the server while signed in makes the publisher its **owner**; no server
   key is needed. A person owns at most 1,000 files on one server. With `accounts` the file gets no

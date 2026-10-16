@@ -8,6 +8,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod accounts;
+pub mod admin;
 pub mod al_keys;
 pub mod annotations;
 pub mod arc_handles;
@@ -47,6 +48,7 @@ pub mod proto_run;
 pub mod rename;
 pub mod rotation_origin;
 pub mod server_files;
+pub mod servers;
 pub mod shape_handles;
 pub mod shapebuilder;
 pub mod snap;
@@ -61,6 +63,7 @@ pub mod vectoredit;
 pub mod widgets;
 
 pub use cmd::{CommandSpec, all_commands, find_command};
+pub use figcraft_auth;
 pub use figcraft_collab;
 pub use figcraft_doc as doc;
 pub use figcraft_svg::looks_like_svg;
@@ -656,6 +659,10 @@ pub struct Prefs {
     /// registered, and its secret when no keychain keeps it (see [`devices`]).
     #[serde(skip_serializing_if = "devices::DevicePrefs::is_empty", deserialize_with = "devices::read")]
     pub device: devices::DevicePrefs,
+    /// The remote servers you use, in order ([`servers::MAX_SERVERS`] at most). `None`: never
+    /// changed, the server for online sharing is the list ([`Session::servers`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub servers: Option<Vec<servers::SavedServer>>,
     /// The Getting started tips on the home screen were closed (Help ▸ Getting started shows them
     /// again).
     pub getting_started_dismissed: bool,
@@ -695,6 +702,7 @@ impl Default for Prefs {
             accounts: Vec::new(),
             file_keys: Vec::new(),
             device: devices::DevicePrefs::default(),
+            servers: None,
             getting_started_dismissed: false,
             home_views: BTreeMap::new(),
             home_sort: "modified".into(),

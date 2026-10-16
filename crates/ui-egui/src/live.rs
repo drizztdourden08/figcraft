@@ -90,8 +90,10 @@ pub struct LiveUi {
     pub join: Option<String>,
     /// Put the keyboard in the Join dialog's field on its next frame.
     focus_join: bool,
-    /// Share on the local network (else online, through the server in Preferences).
+    /// Share on the local network (else online, through one of your servers).
     pub local: bool,
+    /// The server to share online through (empty: the first of yours).
+    pub online_server: String,
     /// The Share popover's Advanced part shows; what it sets for a local network share: only
     /// this computer can join, and the port (empty: the usual one).
     pub advanced: bool,
@@ -102,6 +104,9 @@ pub struct LiveUi {
     /// The join started from the home screen: what it is doing shows under the field, and its
     /// file's tab shows when it opens.
     pub home_join: Option<SessionId>,
+    /// The link that join was started with, when the home screen knows it (a file on a server's
+    /// page): Try again joins with it.
+    pub home_join_link: Option<String>,
     /// Remove from server… was clicked: its confirmation shows.
     pub confirm_remove: bool,
     /// What the server for online sharing said about its hosting (`collab.serverInfo`), and the
@@ -601,12 +606,23 @@ pub fn share_popover(app: &mut FigApp, anchor: &egui::Response) {
             if !line.is_empty() {
                 widgets::label(ui, &line, col);
             }
+            // A sealed file: the server keeps it but can't read it.
+            let live = app.session.live();
+            let sealed = live.info.as_ref().is_some_and(|i| figcraft_engine::file_keys::sealed_link(&i.link))
+                || live.published.as_ref().is_some_and(|p| figcraft_engine::file_keys::sealed_link(&p.edit));
+            if sealed && status.active() {
+                widgets::label(ui, tr("End-to-end encrypted: the server can't read this file."), t.success);
+            }
             match (&status, role, &share) {
                 (Status::Off | Status::Failed { .. }, ..) => start_ui(app, ui, &t),
                 (Status::Live, _, Some(share)) if share.links.is_none() => private_ui(app, ui, &t, share),
                 (_, _, Some(share)) => share_ui(app, ui, &t, share),
                 (Status::Live, Some(Role::Host), _) => host_ui(app, ui),
                 _ => guest_ui(app, ui, &t),
+            }
+            // A file on a server where you are signed in: who is in it.
+            if status == Status::Live {
+                crate::account_ui::people_section(app, ui, &t);
             }
         });
         ui.separator();
@@ -624,11 +640,6 @@ fn people_count(others: usize) -> String {
     }
 }
 
-/// The host a server address names (`wss://share.example/` is `share.example`).
-fn server_host(server: &str) -> &str {
-    server.split_once("://").map_or(server, |(_, rest)| rest).trim_end_matches('/')
-}
-
 /// What a server says about its hosting (`collab.serverInfo`): who runs it, its terms, how long
 /// files nobody opens are kept, and that it can read them.
 fn hosting_lines(ui: &mut Ui, t: &Tokens, info: &Value) {
@@ -644,7 +655,10 @@ fn hosting_lines(ui: &mut Ui, t: &Tokens, info: &Value) {
 fn online_note(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     widgets::label(
         ui,
-        &trf("People join from anywhere with a code. The file is kept on {server} while you share it.", &[("server", &server_host(server))]),
+        &trf(
+            "People join from anywhere with a code. The file is kept on {server} while you share it.",
+            &[("server", &crate::account_ui::server_name(app, server))],
+        ),
         t.text_secondary,
     );
     match app.ui.live.server_info.as_ref().filter(|(at, _)| at == server) {
@@ -692,7 +706,19 @@ pub fn join_field(app: &mut FigApp, ui: &mut Ui, typed: &mut String, id: egui::I
 
 /// What join `session` is doing, under the field it was started from (the home screen): on its
 /// way, or why it failed.
-pub fn join_status(app: &FigApp, ui: &mut Ui, t: &Tokens, session: SessionId) {
+pub fn join_status(app: &mut FigApp, ui: &mut Ui, t: &Tokens, session: SessionId) {
+    // A sealed file whose key this device doesn't have yet: nothing is wrong, someone must let it
+    // in.
+    if app.session.waiting_for_access(session) {
+        widgets::label(ui, tr("Waiting for an owner or editor to open FigCraft and give this device access."), t.text_secondary);
+        if let Some(link) = app.ui.live.home_join_link.clone()
+            && widgets::button(ui, tr("Try again"), false, true).clicked()
+            && let Some(j) = app.run("collab.join", json!({"link": link}))
+        {
+            app.ui.live.home_join = j["session"].as_u64();
+        }
+        return;
+    }
     match app.session.live.get(session).map(|l| &l.status) {
         Some(Status::Connecting) => widgets::label(ui, tr("Joining…"), t.text_secondary),
         Some(Status::Failed { reason }) => widgets::label(ui, reason, t.danger),
@@ -717,21 +743,58 @@ fn start_ui(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
         widgets::label(ui, tr(BROWSER_NOTE), t.text_secondary);
         return;
     }
-    // Without a server in Preferences only the local network is left.
-    let server = app.session.prefs.publish_server.trim().to_string();
+    // Without servers only the local network is left.
+    let servers = app.session.servers();
+    let at = servers.iter().position(|s| s.url == app.ui.live.online_server).unwrap_or(0);
+    let server = servers.get(at).map(|s| s.url.clone()).unwrap_or_default();
     let local = app.ui.live.local || server.is_empty();
     if server.is_empty() {
-        widgets::label(ui, tr("Sharing on the local network (online sharing is off: no server is set in Preferences)."), t.text_secondary);
+        widgets::label(ui, tr("Sharing on the local network (add a server in Preferences ▸ Servers to share online)."), t.text_secondary);
     } else if let Some(i) = widgets::segmented_text(ui, &[tr("Online"), tr("Local network")], usize::from(local)) {
         app.ui.live.local = i == 1;
     }
+    if !local && servers.len() > 1 {
+        // Which of your servers.
+        for (i, s) in servers.iter().enumerate() {
+            if widgets::radio(ui, i == at, &s.name) {
+                app.ui.live.online_server = s.url.clone();
+            }
+        }
+    }
+    let ctx = ui.ctx().clone();
+    // A server where only signed-in members get in: the file goes there as yours.
+    let members_only =
+        !local && crate::account_ui::info(app, &ctx, &server).is_some_and(|i| crate::account_ui::has_accounts(&i) && i["links"] == false);
     if local {
         widgets::label(ui, tr("People on your network join with a code. Nothing goes through a server."), t.text_secondary);
+    } else if members_only {
+        let host = servers.get(at).map(|s| s.name.clone()).unwrap_or_default();
+        if app.session.signed_in(&server).is_some() {
+            widgets::label(ui, &trf("The file goes on {server} as yours: only people you invite get in.", &[("server", &host)]), t.text_secondary);
+            if widgets::button(ui, &trf("Put on {server}", &[("server", &host)]), true, true).clicked() {
+                app.run("collab.publish", json!({"server": server}));
+            }
+        } else {
+            widgets::label(
+                ui,
+                &trf("Sign in to {server} on its page of the home screen to put files there.", &[("server", &host)]),
+                t.text_secondary,
+            );
+            if widgets::button(ui, &trf("Go to {server}", &[("server", &host)]), true, true).clicked() {
+                let i = crate::account_ui::home_servers(app).iter().position(|s| s.url == server).unwrap_or(0);
+                app.ui.home = true;
+                app.ui.home_view.section = crate::home::Section::Server(i);
+                ui.close();
+            }
+        }
     } else {
         online_note(app, ui, t, &server);
     }
-    if widgets::button(ui, tr("Start sharing"), true, true).clicked() {
+    if !members_only && widgets::button(ui, tr("Start sharing"), true, true).clicked() {
         let mut params = json!({"via": if local { "local" } else { "online" }});
+        if !local {
+            params["server"] = json!(server);
+        }
         if local && app.ui.live.this_computer {
             params["bind"] = json!("local");
         }
@@ -740,34 +803,29 @@ fn start_ui(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
         }
         app.run("collab.share", params);
     }
-    join_and_advanced(app, ui, t, |app, ui, t| {
-        if local {
-            if widgets::checkbox(ui, app.ui.live.this_computer, tr("This computer only")) {
-                app.ui.live.this_computer = !app.ui.live.this_computer;
-            }
-            ui.horizontal(|ui| {
-                widgets::label(ui, tr("Port"), t.text);
-                if let Some(port) = widgets::text_field_named(ui, egui::Id::new("live_port"), &app.ui.live.port, 70.0, tr("Port")) {
-                    // Digits only; empty: the usual port, or any free one.
-                    app.ui.live.port = port.trim().parse::<u16>().map(|p| p.to_string()).unwrap_or_default();
-                }
-            });
-        } else {
-            widgets::label(ui, tr("Another server, or one that needs its key. The usual server is set in Preferences."), t.text_secondary);
-            if widgets::button(ui, tr("Publish to another server…"), false, true).clicked() {
-                open_publish(app);
-                ui.close();
-            }
+    join_and_advanced(app, ui, t, local, |app, ui, t| {
+        if widgets::checkbox(ui, app.ui.live.this_computer, tr("This computer only")) {
+            app.ui.live.this_computer = !app.ui.live.this_computer;
         }
+        ui.horizontal(|ui| {
+            widgets::label(ui, tr("Port"), t.text);
+            if let Some(port) = widgets::text_field_named(ui, egui::Id::new("live_port"), &app.ui.live.port, 70.0, tr("Port")) {
+                // Digits only; empty: the usual port, or any free one.
+                app.ui.live.port = port.trim().parse::<u16>().map(|p| p.to_string()).unwrap_or_default();
+            }
+        });
     });
 }
 
 /// Under what starts a share: the join field, then the Advanced part (`advanced` draws it while
 /// it is open).
-fn join_and_advanced(app: &mut FigApp, ui: &mut Ui, t: &Tokens, advanced: impl FnOnce(&mut FigApp, &mut Ui, &Tokens)) {
+fn join_and_advanced(app: &mut FigApp, ui: &mut Ui, t: &Tokens, has_advanced: bool, advanced: impl FnOnce(&mut FigApp, &mut Ui, &Tokens)) {
     ui.separator();
     widgets::label(ui, tr("Join with a code"), t.text);
     join_row(app, ui, JOIN_WIDTH);
+    if !has_advanced {
+        return;
+    }
     if widgets::disclosure(ui, tr("Advanced"), app.ui.live.advanced) {
         app.ui.live.advanced = !app.ui.live.advanced;
     }
@@ -780,7 +838,7 @@ fn join_and_advanced(app: &mut FigApp, ui: &mut Ui, t: &Tokens, advanced: impl F
 /// others new links and codes for this same file; taking it off the server is a separate,
 /// confirmed step under Advanced.
 fn private_ui(app: &mut FigApp, ui: &mut Ui, t: &Tokens, share: &Share) {
-    let host = server_host(share.server.split('?').next().unwrap_or_default()).to_string();
+    let host = crate::account_ui::server_name(app, share.server.split('?').next().unwrap_or_default());
     widgets::label(
         ui,
         &trf("This file is on {server}, open only to you. Share it to let others in with a new code.", &[("server", &host)]),
@@ -801,7 +859,7 @@ fn private_ui(app: &mut FigApp, ui: &mut Ui, t: &Tokens, share: &Share) {
         app.session.live().published.as_ref().is_some_and(|p| p.owner.is_some())
             || app.session.prefs.online_files.iter().any(|f| f.file == *file && figcraft_engine::online::same_server(&f.server, server))
     });
-    join_and_advanced(app, ui, t, |app, ui, t| {
+    join_and_advanced(app, ui, t, true, |app, ui, t| {
         if widgets::button(ui, tr("Leave session"), false, true).on_hover_text(tr("Your copy stays open; the file stays on the server")).clicked() {
             app.run("collab.leave", json!({}));
         }
@@ -931,14 +989,20 @@ fn guest_ui(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
     let live = app.session.live();
     let view = live.info.as_ref().is_some_and(|i| i.access == Access::View);
     if let Some(i) = live.info.as_ref() {
-        widgets::label(ui, &format!("{} · {}", i.address, if view { tr("View only") } else { tr("Can edit") }), t.text_secondary);
+        // A server by its name; a session on the local network by its address.
+        let key = figcraft_engine::accounts::server_of(&i.link).map(|s| figcraft_engine::accounts::server_key(&s));
+        let known = key.filter(|k| crate::account_ui::home_servers(app).iter().any(|s| s.url == *k));
+        let place = known.map_or_else(|| i.address.clone(), |k| crate::account_ui::server_name(app, &k));
+        widgets::label(ui, &format!("{place} · {}", if view { tr("View only") } else { tr("Can edit") }), t.text_secondary);
         if !i.pages.is_empty() {
             let pages: Vec<&str> = i.pages.iter().map(|p| p.name.as_str()).take(8).collect();
             widgets::label(ui, &trf("Pages: {pages}", &[("pages", &pages.join(", "))]), t.text_secondary);
         }
     }
     let hosting = live.hosting.clone();
-    if let Some(p) = live.published.clone() {
+    // A file on a server with accounts has people (below), not links to pass on.
+    let members = app.session.people_file().is_some();
+    if let Some(p) = live.published.clone().filter(|_| !members) {
         link_rows(app, ui, &[(tr("Edit link"), &p.edit, tr("Edit link copied")), (tr("View link"), &p.view, tr("View link copied"))]);
         widgets::label(ui, tr(PUBLISHED_NOTE), t.text_secondary);
     }

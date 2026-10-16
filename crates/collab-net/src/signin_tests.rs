@@ -112,3 +112,11 @@ fn a_redirect_arriving_in_pieces_is_read_whole() {
     assert_eq!(wait_for_code(&listener, "st", Instant::now() + Duration::from_secs(10)).unwrap(), "slow-code");
     assert!(browser.join().unwrap().contains("Signed in"));
 }
+
+#[test]
+fn the_app_reads_a_server_sign_out_as_the_end_of_its_sign_in() {
+    // The engine forgets the sign-in when a session closes with this reason (it can't see the hub).
+    assert!(crate::hub::SIGNED_OUT.starts_with(figcraft_engine::accounts::SIGNED_OUT));
+    assert!(figcraft_engine::accounts::session_ended(crate::hub::SIGNED_OUT));
+    assert!(!figcraft_engine::accounts::session_ended(crate::hub::REMOVED));
+}

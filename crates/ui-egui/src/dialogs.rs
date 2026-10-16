@@ -83,6 +83,25 @@ impl AboutTab {
     }
 }
 
+/// The Preferences window's tabs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PrefsTab {
+    #[default]
+    General,
+    Servers,
+}
+
+impl PrefsTab {
+    pub const ALL: [PrefsTab; 2] = [PrefsTab::General, PrefsTab::Servers];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PrefsTab::General => tr("General"),
+            PrefsTab::Servers => tr("Servers"),
+        }
+    }
+}
+
 /// The About window's width, the same on every tab (the Contributors table needs the room).
 pub const ABOUT_WIDTH: f32 = 640.0;
 
@@ -160,6 +179,8 @@ pub fn keys(app: &mut FigApp, ctx: &Context) {
 pub fn show(app: &mut FigApp, ctx: &Context) {
     // Dropped files waiting to open: their card, then (once it has shown) the files.
     crate::pending_open::pending_opens(app, ctx);
+    crate::account_ui::tick(app, ctx);
+    crate::account_ui::sign_in_window(app, ctx);
     let t = Tokens::get(ctx);
     if app.ui.about {
         let mut open = true;
@@ -179,8 +200,20 @@ pub fn show(app: &mut FigApp, ctx: &Context) {
     }
     if app.ui.preferences {
         let mut open = true;
-        window(tr("Preferences"), ctx).open(&mut open).show(ctx, |ui| {
-            ui.set_width(360.0);
+        // Each tab sizes the window to its own content.
+        let tab = app.ui.prefs_tab;
+        window(tr("Preferences"), ctx).id(egui::Id::new(("Preferences", tab))).open(&mut open).show(ctx, |ui| {
+            ui.set_width(400.0);
+            // The browser build hosted by a server uses that server only: no Servers tab there.
+            if figcraft_engine::servers::editable() {
+                tab_strip(ui, &t, &PrefsTab::ALL, PrefsTab::label, &mut app.ui.prefs_tab);
+                ui.add_space(8.0);
+            }
+            if app.ui.prefs_tab == PrefsTab::Servers && figcraft_engine::servers::editable() {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                crate::account_ui::servers_tab(app, ui, &t);
+                return;
+            }
             let prefs = app.session.prefs.clone();
             let mut toggles = vec![];
             for (label, val, cmd) in [
@@ -223,23 +256,6 @@ pub fn show(app: &mut FigApp, ctx: &Context) {
                     app.run("pref.userName", json!({"name": name}));
                 }
             });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(tr("Server for online sharing"));
-                // Where Share ▸ Online keeps files and join codes are asked; no key here
-                // (preferences are saved as text).
-                let name = tr("Server for online sharing");
-                if let Some(url) = crate::widgets::text_field_named(ui, egui::Id::new("pref_publish_server"), &prefs.publish_server, 220.0, name) {
-                    app.run("pref.publishServer", json!({"url": url}));
-                }
-                let usual = prefs.publish_server == figcraft_engine::live::DEFAULT_SERVER;
-                if crate::widgets::button(ui, tr("Reset"), false, !usual).on_hover_text(tr("Back to the FigCraft server")).clicked() {
-                    app.run("pref.publishServer", json!({}));
-                }
-            });
-            if prefs.publish_server.is_empty() {
-                crate::widgets::label(ui, tr("Online sharing is off: files are shared on the local network only."), t.text_secondary);
-            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.label(tr("Nudge amount"));

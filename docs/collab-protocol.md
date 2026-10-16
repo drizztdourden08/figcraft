@@ -629,7 +629,7 @@ resuming with its offline edits, and leaving the session going back to snapshot 
   server that names no file, then one `Admin owned` with every file recorded on that server.
   A file the server answers `null` for shows as gone (removed or expired) and can be cleared; a
   name changed elsewhere is taken over; share links that are no longer among the file's links
-  mark it as not shared. Nothing is asked until the list is opened (Home ▸ Online) or refreshed
+  mark it as not shared. Nothing is asked until the list is opened (the server's page of the home screen) or refreshed
   by a command. A server that can't be reached, or is older than the request, leaves the records
   as they are and is reported beside them (`problems`).
 - **Managing from the list.** `collab.manageFile {file, action}` takes the server and the token

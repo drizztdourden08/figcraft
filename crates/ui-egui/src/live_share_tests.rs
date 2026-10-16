@@ -12,8 +12,8 @@ use egui::{Event, Key, Shape};
 use figcraft_engine::figcraft_collab::code::{self, Local};
 use figcraft_engine::figcraft_collab::message::ClientMsg;
 use figcraft_engine::live::{
-    Access, DEFAULT_SERVER, Event as LiveEvent, HostOptions, LiveLink, NetReply, NetRequest, Peer, Presence, PublishOptions, Published, Role,
-    SessionInfo, Shared as SharedLinks, SharedLink, Status,
+    Access, Event as LiveEvent, HostOptions, LiveLink, NetReply, NetRequest, Peer, Presence, PublishOptions, Published, Role, SessionInfo,
+    Shared as SharedLinks, SharedLink, Status,
 };
 use serde_json::json;
 
@@ -207,8 +207,7 @@ fn document_arrives(h: &mut Harness, script: &Shared) {
 fn not_sharing_the_popover_offers_one_way_to_start_and_one_to_join() {
     let (mut h, script) = harness();
     let shapes = open(&mut h);
-    for t in ["Share this file", "Online", "Local network", "Start sharing", "Join with a code", "Join", "Advanced", "About this server", "Export…"]
-    {
+    for t in ["Share this file", "Online", "Local network", "Start sharing", "Join with a code", "Join", "About this server", "Export…"] {
         assert!(has_text(&shapes, t), "the popover shows {t:?}");
     }
     assert!(has_text(&shapes, "People join from anywhere with a code. The file is kept on share.example while you share it."));
@@ -216,11 +215,13 @@ fn not_sharing_the_popover_offers_one_way_to_start_and_one_to_join() {
     for t in ["Server address", "Port", "This computer only", "Publish to another server…", "WebSocket URL", "Not in a live session"] {
         assert!(!has_text(&shapes, t), "not in the main flow: {t:?}");
     }
-    let shapes = click(&mut h, &shapes, "Advanced");
-    assert!(has_text(&shapes, "Publish to another server…") && !has_text(&shapes, "Port"));
+    // Online, nothing more to set: other servers are added in Preferences ▸ Servers.
+    assert!(!has_text(&shapes, "Advanced"));
     // The local network: what it means, and its own advanced part.
     let shapes = click(&mut h, &shapes, "Local network");
     assert!(has_text(&shapes, "People on your network join with a code. Nothing goes through a server."));
+    assert!(has_text(&shapes, "Advanced") && !has_text(&shapes, "This computer only"));
+    let shapes = click(&mut h, &shapes, "Advanced");
     assert!(has_text(&shapes, "This computer only") && has_text(&shapes, "Port") && !has_text(&shapes, "Publish to another server…"));
     assert!(!has_text(&shapes, "About this server"));
     assert_eq!(crate::live::inspect(&h.app)["local"], true);
@@ -465,21 +466,21 @@ fn the_join_dialog_is_the_same_field() {
 }
 
 #[test]
-fn the_server_preference_resets_and_turns_online_sharing_off() {
+fn preferences_list_the_servers_and_without_one_the_popover_shares_on_the_network() {
     let (mut h, script) = harness();
     h.app.ui.preferences = true;
     let shapes = h.frames(2);
-    assert!(has_text(&shapes, "Server for online sharing") && has_text(&shapes, "Reset"));
-    click(&mut h, &shapes, "Reset");
-    assert_eq!(h.app.session.prefs.publish_server, DEFAULT_SERVER);
-    // Off: Preferences say what that means, and the popover offers the local network only.
-    h.app.session.execute("pref.publishServer", &json!({"url": ""})).unwrap();
+    let shapes = click(&mut h, &shapes, "Servers");
+    assert!(has_text(&shapes, "share.example") && has_text(&shapes, "Add") && !has_text(&shapes, "Server for online sharing"));
+    click(&mut h, &shapes, "Remove");
+    assert!(h.app.session.servers().is_empty());
+    assert_eq!(h.app.session.prefs.publish_server, "", "online sharing follows the list");
     let shapes = h.frames(2);
-    assert!(has_text(&shapes, "Online sharing is off: files are shared on the local network only."));
+    assert!(has_text(&shapes, "No servers yet."));
     h.app.ui.preferences = false;
     h.frames(2);
     let shapes = open(&mut h);
-    assert!(has_text(&shapes, "Sharing on the local network (online sharing is off: no server is set in Preferences)."));
+    assert!(has_text(&shapes, "Sharing on the local network (add a server in Preferences ▸ Servers to share online)."));
     assert!(!has_text(&shapes, "Online") && has_text(&shapes, "Start sharing"));
     click(&mut h, &shapes, "Start sharing");
     let s = script.lock().unwrap();

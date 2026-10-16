@@ -6,6 +6,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod a11y;
+pub mod account_ui;
+pub mod admin_ui;
 pub mod assets_panel;
 pub mod bidi;
 pub mod branch_ui;
@@ -69,6 +71,8 @@ mod theme_startup_tests;
 
 #[cfg(test)]
 mod a11y_tests;
+#[cfg(test)]
+mod account_ui_tests;
 #[cfg(test)]
 mod async_dialog_tests;
 #[cfg(test)]
@@ -410,6 +414,8 @@ pub struct UiState {
     /// The tab the About window shows.
     pub about_tab: dialogs::AboutTab,
     pub preferences: bool,
+    /// The Preferences window's tab.
+    pub prefs_tab: dialogs::PrefsTab,
     pub shortcuts_panel: bool,
     /// The Keyboard shortcuts panel's tab and search text.
     pub shortcuts_tab: figcraft_engine::keymap::Group,
@@ -515,6 +521,10 @@ pub struct UiState {
     pub live: live::LiveUi,
     /// Home ▸ Online.
     pub online: online::OnlineUi,
+    /// Servers and accounts: server mode's files, signing in, the Share popover's people.
+    pub account: account_ui::AccountUi,
+    /// The admin tools of the server whose page shows (for admins).
+    pub admin: Option<admin_ui::AdminWindow>,
     /// The window was asked to close with unsaved changes: the question shows.
     pub confirm_close: bool,
 }
@@ -537,6 +547,7 @@ impl Default for UiState {
             about: false,
             about_tab: dialogs::AboutTab::About,
             preferences: false,
+            prefs_tab: dialogs::PrefsTab::General,
             shortcuts_panel: false,
             shortcuts_tab: figcraft_engine::keymap::Group::Essential,
             shortcuts_query: String::new(),
@@ -597,6 +608,8 @@ impl Default for UiState {
             plugin_form: None,
             live: live::LiveUi::default(),
             online: online::OnlineUi::default(),
+            account: account_ui::AccountUi::default(),
+            admin: None,
             confirm_close: false,
         }
     }
@@ -638,6 +651,10 @@ pub struct FigApp {
     /// The latest UI context schedules the first poll and wakes the app when a dialog completes.
     ui_context: Option<egui::Context>,
 }
+
+/// Commands the window runs by itself (not because you asked): their errors are logged, not
+/// shown (a server that can't be reached says so where it is shown).
+const QUIET: [&str; 3] = ["account.info", "account.check", "account.thumbnail"];
 
 /// What to do with the result of a command run in the background.
 pub type Done = Box<dyn FnOnce(&mut FigApp, &egui::Context, Value)>;
@@ -695,6 +712,7 @@ impl FigApp {
         match r {
             Ok(Some(v)) => done(self, ctx, v),
             Ok(None) => self.waiting.push((id.to_string(), done)),
+            Err(e) if QUIET.contains(&id) => log::info!("{id}: {e}"),
             Err(e) => self.failed(id, &e),
         }
     }
@@ -713,6 +731,7 @@ impl FigApp {
             match (r, done) {
                 (Ok(v), Some(done)) => done(self, ctx, v),
                 (Ok(_), None) => {}
+                (Err(e), _) if QUIET.contains(&id.as_str()) => log::info!("{id}: {e}"),
                 (Err(e), _) => self.failed(&id, &e),
             }
         }
@@ -767,7 +786,17 @@ impl FigApp {
     }
 
     pub fn toast(&mut self, msg: impl Into<String>) {
-        self.ui.toast = Some((msg.into(), ToastClock::Raised));
+        // Servers by their names, never their addresses (errors from the network name them).
+        let mut msg: String = msg.into();
+        for s in account_ui::home_servers(self) {
+            let host = figcraft_engine::servers::host(&s.url).to_string();
+            for at in [s.url.clone(), s.url.trim_end_matches('/').to_string(), host] {
+                if !at.is_empty() && at != s.name {
+                    msg = msg.replace(&at, &s.name);
+                }
+            }
+        }
+        self.ui.toast = Some((msg, ToastClock::Raised));
     }
 
     /// Say that `n` documents left unsaved by a crash were opened again from recovery copies.
@@ -898,6 +927,7 @@ impl FigApp {
                         self.services.open_url(url);
                     }
                 }
+                "account.code" | "account.signedOut" => account_ui::request(self, &r.kind, &r.data),
                 "window.new" | "window.focus" | "window.fullscreen" => self.window_requests.push(r),
                 _ => {}
             }
@@ -1257,9 +1287,9 @@ impl FigApp {
         }
         // What happened in a live session (the network woke us for it).
         if self.session.live_poll() {
-            if let Some(m) = self.session.message.take() {
-                self.toast(m);
-            }
+            // What a session asked of the window (a server that signed you out asks you to sign
+            // in again), and its message.
+            self.handle_ui_requests();
             self.background_done(&ctx);
         }
         windows::begin(self, &ctx);
@@ -1535,6 +1565,7 @@ impl FigApp {
             "lastError": self.ui.last_error,
         });
         state["pendingOpens"] = json!(self.ui.pending_opens.len());
+        state["servers"] = account_ui::inspect(self);
         state
     }
 }

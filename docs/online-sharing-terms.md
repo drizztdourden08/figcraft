@@ -6,7 +6,7 @@
 > network, which involves no server.
 
 FigCraft works without this service. You only use it when you choose Share ▸ Online, join a file
-someone shared that way, or open Home ▸ Online. By doing so you agree to what follows. If you
+someone shared that way, or open its page on the home screen. By doing so you agree to what follows. If you
 don't, don't use the default server: share on your local network, or run your own
 [`figcraft-server`](server.md).
 
@@ -27,7 +27,7 @@ any other damage from using it.
 
 - **The file you share:** its whole contents, including images, names and comments in it, and its
   name. It stays on the server after you stop sharing, until you remove it (Share ▸ Advanced ▸
-  Remove from server…, or Home ▸ Online) or until nobody has opened it for **30 days**, when the
+  Remove from server…, or the server's page on the home screen) or until nobody has opened it for **30 days**, when the
   server deletes it.
 - **Who is in a file:** the display name each person typed and their cursor and selection, only
   while they are connected. They are not kept afterwards.

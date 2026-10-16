@@ -62,34 +62,37 @@ fn templates_tab(u: &mut Ui) -> Vec<Shape> {
 }
 
 #[test]
-fn the_sidebar_has_recents_online_and_templates_and_no_placeholders() {
+fn the_sidebar_has_recents_templates_and_the_servers_and_no_placeholders() {
     let mut u = first_run();
     let s = shapes(&mut u);
-    assert!(has_text(&s, "Recents") && has_text(&s, "Online") && has_text(&s, "Templates"));
+    let server = figcraft_engine::servers::host(figcraft_engine::live::DEFAULT_SERVER);
+    assert!(has_text(&s, "Recents") && has_text(&s, "Templates") && has_text(&s, "Servers") && has_text(&s, server));
     assert!(!has_text(&s, "Drafts") && !has_text(&s, "Community"));
     u.ctx.enable_accesskit();
     u.frame(vec![]);
     let nodes: Vec<_> = u.frame_output(vec![]).platform_output.accesskit_update.unwrap().nodes.into_iter().map(|(_, n)| n).collect();
     let tab = |label: &str| nodes.iter().find(|n| n.role() == Role::Tab && n.label() == Some(label)).unwrap_or_else(|| panic!("no tab {label}"));
-    assert_eq!((tab("Recents").is_selected(), tab("Online").is_selected(), tab("Templates").is_selected()), (Some(true), Some(false), Some(false)));
-    // In reading order: Recents, Online, Templates.
+    let server = figcraft_engine::servers::host(figcraft_engine::live::DEFAULT_SERVER);
+    assert_eq!((tab("Recents").is_selected(), tab("Templates").is_selected(), tab(server).is_selected()), (Some(true), Some(false), Some(false)));
+    // In reading order: Recents, Templates, then the servers (the built-in one to start with).
     let top = |label: &str| tab(label).bounds().unwrap().y0;
-    assert!(top("Recents") < top("Online") && top("Online") < top("Templates"));
+    assert!(top("Recents") < top("Templates") && top("Templates") < top(server));
     // Each is clicked into, and `ui.inspect` and `ui.set {homeSection}` name them the same way.
-    for (label, section) in [("Online", Section::Online), ("Templates", Section::Templates), ("Recents", Section::Recents)] {
+    for (label, section) in [(server, Section::Server(0)), ("Templates", Section::Templates), ("Recents", Section::Recents)] {
         let s = shapes(&mut u);
         click(&mut u, text_center(&s, label));
         assert_eq!(u.app.ui.home_view.section, section);
         let inspect = u.app.inspect();
         assert_eq!(inspect["homeSection"], section.id());
-        assert_eq!(inspect["online"]["open"], section == Section::Online);
-        assert_eq!(Section::parse(section.id()), Some(section));
+        assert_eq!(inspect["online"]["open"], section == Section::Server(0));
+        assert_eq!(Section::parse(&section.id()), Some(section));
     }
     assert_eq!(Section::parse("drafts"), None);
-    // The Online section is the online files' own.
-    u.app.ui.home_view.section = Section::Online;
+    // A server's page has the files shared there from this computer.
+    u.app.ui.home_view.section = Section::Server(0);
     let s = settle(&mut u);
     assert!(has_text(&s, "Online files") && !has_text(&s, "Getting started") && !has_text(&s, "Start from a template"));
+    assert_eq!(Section::parse("server:3"), Some(Section::Server(3)));
 }
 
 #[test]
@@ -200,7 +203,7 @@ fn thumbnails_are_cached_per_theme() {
 fn the_home_screen_draws_no_frames_once_its_thumbnails_are_in() {
     let (mut h, _) = crate::live_tests::Harness::new();
     h.app.ui.home = true;
-    for tab in [Section::Templates, Section::Online, Section::Recents] {
+    for tab in [Section::Templates, Section::Server(0), Section::Recents] {
         h.app.ui.home_view.section = tab;
         h.frames(60);
         let (_, delay) = h.frame(vec![]);
@@ -325,7 +328,8 @@ fn tab_walks_the_sidebar_in_order_before_a_sections_controls() {
         }
     }
     let at = |name: &str| names.iter().position(|n| n == name).unwrap_or_else(|| panic!("Tab never reached {name:?}: {names:?}"));
-    assert!(at("Recents") < at("Online") && at("Online") < at("Templates") && at("Templates") < at("Open file"), "{names:?}");
+    let server = figcraft_engine::servers::host(figcraft_engine::live::DEFAULT_SERVER);
+    assert!(at("Recents") < at("Templates") && at("Templates") < at(server) && at(server) < at("Open file"), "{names:?}");
 }
 
 /// A temporary directory of its own for a test's files, removed with them when dropped.

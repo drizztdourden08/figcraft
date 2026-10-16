@@ -1,5 +1,5 @@
-//! Files on a server in the window: the Publish to server dialog (from the File menu and the
-//! Share popover; its field takes the keyboard; Escape closes it; publishing leaves the tab
+//! Files on a server in the window: the Publish to server dialog (the `collab.publish` menu
+//! command, for operators publishing with a server's key; its field takes the keyboard; Escape closes it; publishing leaves the tab
 //! read-only until the file is there; a server open to the public takes it without a key and the
 //! owner token shows once), the Share popover's address, access, a published file's links, where
 //! it is hosted, when it expires and reporting it, and a view link's "View only" badge with only
@@ -58,14 +58,8 @@ fn the_publish_dialog() {
     assert!(focused(&h, "live_publish_server"), "the address field takes the keyboard");
     key(&mut h, Key::Escape);
     assert!(h.app.ui.live.publish.is_none(), "Escape closes it");
-    // From the Share popover, then publish.
-    let shapes = h.frames(2);
-    h.click(text_center(&shapes, "Share"));
-    let shapes = h.frames(2);
-    h.click(text_center(&shapes, "Advanced"));
-    let shapes = h.frames(2);
-    assert!(has_text(&shapes, "Another server, or one that needs its key. The usual server is set in Preferences."));
-    h.click(text_center(&shapes, "Publish to another server…"));
+    // Open again, then publish.
+    crate::menus::invoke(&mut h.app, "collab.publish");
     let shapes = h.frames(2);
     assert!(has_text(
         &shapes,
