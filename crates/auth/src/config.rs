@@ -22,6 +22,40 @@ pub struct AuthConfig {
     pub session_days: f64,
     /// `[[auth.provider]]`.
     pub provider: Vec<ProviderConfig>,
+    /// Who sees which files on a server with accounts: `"everyone"` (default: everyone allowed on
+    /// the server sees, opens and edits every file; admins add people to the server) or
+    /// `"members"` (each file has its own members, invited by its owners).
+    pub file_access: String,
+}
+
+/// Who sees which files on a server with accounts (`[auth] file_access`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FileAccess {
+    /// Everyone allowed on the server is in every file (as an editor; whoever made a file owns
+    /// it). Per-file invites don't apply: admins add people to the server.
+    #[default]
+    Everyone,
+    /// Each file has members with a role, invited by its owners.
+    Members,
+}
+
+impl FileAccess {
+    /// `"everyone"` or `"members"`.
+    pub fn id(self) -> &'static str {
+        match self {
+            FileAccess::Everyone => "everyone",
+            FileAccess::Members => "members",
+        }
+    }
+
+    /// From [`id`](Self::id) (any case, surrounding spaces ignored).
+    pub fn parse(s: &str) -> Option<FileAccess> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "everyone" | "all" => Some(FileAccess::Everyone),
+            "members" => Some(FileAccess::Members),
+            _ => None,
+        }
+    }
 }
 
 impl Default for AuthConfig {
@@ -33,6 +67,7 @@ impl Default for AuthConfig {
             allow_domains: Vec::new(),
             session_days: 30.0,
             provider: Vec::new(),
+            file_access: FileAccess::Everyone.id().into(),
         }
     }
 }
@@ -121,6 +156,11 @@ impl AuthConfig {
             .ok_or_else(|| format!("`auth.mode` must be \"links\" (or \"open\"), \"accounts\" or \"accounts+links\", not {:?}", self.mode))
     }
 
+    pub fn file_access(&self) -> Result<FileAccess, String> {
+        FileAccess::parse(&self.file_access)
+            .ok_or_else(|| format!("`auth.file_access` must be \"everyone\" or \"members\", not {:?}", self.file_access))
+    }
+
     pub fn policy(&self) -> Policy {
         Policy::new(&self.admins, &self.allow_emails, &self.allow_domains)
     }
@@ -134,6 +174,7 @@ impl AuthConfig {
     /// Check what doesn't depend on a provider's kind (each kind checks its own keys when built).
     pub fn check(&self) -> Result<(), String> {
         let mode = self.mode()?;
+        self.file_access()?;
         if !self.session_days.is_finite() || !(0.01..=3650.0).contains(&self.session_days) {
             return Err("`auth.session_days` must be from 0.01 to 3650".into());
         }

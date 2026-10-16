@@ -8,7 +8,7 @@
 //! The app shows them in the server's section of the home screen. Every `admin.*` command takes
 //! `server?` (default: the first server).
 
-use figcraft_collab::message::{Admin, AdminReply, FileInfo, OwnerlessFile, PersonInfo, Secret, UserInfo};
+use figcraft_collab::message::{Admin, AdminReply, AllowList, FileInfo, OwnerlessFile, PersonInfo, Secret, UserInfo};
 use serde_json::{Value, json};
 
 use crate::accounts::{info_json, invited_json, member_json, role, session_ended};
@@ -146,6 +146,42 @@ fn status(s: &mut Session, p: &Value) -> Result<Value> {
     }
 }
 
+fn allowed_json(server: &str, a: &AllowList) -> Value {
+    let emails: Vec<Value> =
+        a.emails.iter().map(|e| json!({"email": e.email, "admin": e.admin, "settings": e.settings, "account": e.account})).collect();
+    json!({"server": server, "open": a.open, "emails": emails, "domains": a.domains, "adminAccounts": a.admin_accounts})
+}
+
+fn allowed(s: &mut Session, p: &Value) -> Result<Value> {
+    match s.admin_request("admin.allowed", p, Admin::Allowed)? {
+        (server, AdminReply::Allowed(a)) => Ok(allowed_json(&server, &a)),
+        _ => Err(other()),
+    }
+}
+
+fn allow_email(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "admin.allowEmail";
+    let email = req_string(CMD, p, "email")?.trim().to_ascii_lowercase();
+    let admin = boolean(p, "admin").unwrap_or(false);
+    s.admin_request(CMD, p, Admin::AllowEmail { email: email.clone(), admin })?;
+    Ok(json!({"email": email, "admin": admin, "allowed": true}))
+}
+
+fn disallow_email(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "admin.disallowEmail";
+    let email = req_string(CMD, p, "email")?.trim().to_ascii_lowercase();
+    s.admin_request(CMD, p, Admin::DisallowEmail { email: email.clone() })?;
+    Ok(json!({"email": email, "allowed": false}))
+}
+
+fn set_admin(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "admin.setAdmin";
+    let account = req_string(CMD, p, "account")?;
+    let admin = boolean(p, "admin").ok_or_else(|| bad(CMD, "give `admin`: true or false"))?;
+    s.admin_request(CMD, p, Admin::SetAdmin { account: account.clone(), admin })?;
+    Ok(json!({"account": account, "admin": admin}))
+}
+
 fn user_json(u: &UserInfo) -> Value {
     json!({
         "username": u.username, "account": u.account, "email": u.email, "name": u.name, "created": u.created, "changed": u.changed,
@@ -223,6 +259,34 @@ pub fn specs() -> Vec<CommandSpec> {
             "{username, server?} → {username, removed}: they can't sign in with it any more; their account and files stay (admins)",
             false,
             remove_user
+        ),
+        spec!(
+            "admin.allowed",
+            "Who may sign in",
+            "{server?} → {server, open (anyone the server's sign-ins vouch for gets in: no list narrows it), emails: [{email, admin, settings (from server.toml: change it there), account (once they signed in, else null)}], domains (server.toml's allow_domains), adminAccounts (people made admins with admin.setAdmin)}: the server's allow-list, the settings' and the admins' together (admins)",
+            false,
+            allowed
+        ),
+        spec!(
+            "admin.allowEmail",
+            "Add person to server",
+            "{email, admin? (default false: also make them an admin), server?} → {email, admin, allowed: true}: lets that email sign in (an SSO server: with any of its sign-ins). Once the list has anyone, only the emails and domains listed (and admins) get in (admins)",
+            false,
+            allow_email
+        ),
+        spec!(
+            "admin.disallowEmail",
+            "Remove email from server",
+            "{email, server?} → {email, allowed: false}: takes an email off the admins' list (one in server.toml stays); its person's sessions end when they may no longer sign in (their files stay; admin.removePerson takes them off the server) (admins)",
+            false,
+            disallow_email
+        ),
+        spec!(
+            "admin.setAdmin",
+            "Make admin",
+            "{account, admin (true | false), server?} → {account, admin}: makes someone who signed in there an admin, or not (an admin by server.toml stays one); they see it when they next sign in or `account.check` (admins)",
+            false,
+            set_admin
         ),
         spec!(
             "admin.people",

@@ -74,7 +74,8 @@ impl IdentityProvider for External {
                 Value::Null => self.trust_email,
                 _ => false,
             },
-            name: s("name"),
+            name: crate::oidc::person_name(&s),
+            picture: s("picture").filter(|u| u.len() <= 2048),
         })
     }
 }

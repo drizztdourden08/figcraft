@@ -105,7 +105,12 @@ impl Session {
             .iter()
             .map(|sv| json!({"name": sv.name, "url": sv.url, "signedIn": self.signed_in(&sv.url).map_or(Value::Null, SignedIn::json)}))
             .collect();
-        json!({"servers": list, "editable": editable()})
+        json!({"servers": list, "editable": editable(), "default": self.prefs.default_server, "startHome": self.prefs.open_server_home})
+    }
+
+    /// The server new files go to (`servers.setDefault`), when you are signed in there.
+    pub fn default_server(&self) -> Option<String> {
+        self.prefs.default_server.clone().filter(|sv| self.signed_in(sv).is_some())
     }
 }
 
@@ -144,6 +149,13 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     list.retain(|sv| sv.url != url);
     let removed = list.len() != before;
     s.set_servers(list);
+    // Nothing goes to, or opens at, a server you no longer use.
+    if s.prefs.default_server.as_deref() == Some(url.as_str()) {
+        s.prefs.default_server = None;
+    }
+    if s.prefs.open_server_home.as_deref() == Some(url.as_str()) {
+        s.prefs.open_server_home = None;
+    }
     let mut v = s.servers_json();
     v["removed"] = json!(removed);
     Ok(v)
@@ -160,6 +172,37 @@ fn move_to(s: &mut Session, p: &Value) -> Result<Value> {
     let to = usize::try_from(to).unwrap_or(usize::MAX).min(list.len());
     list.insert(to, item);
     s.set_servers(list);
+    Ok(s.servers_json())
+}
+
+/// The server `p` names (`server`: a URL, or null for none), which must be one you use.
+fn chosen(s: &Session, cmd: &str, p: &Value) -> Result<Option<String>> {
+    match p.get("server") {
+        None => Err(bad(cmd, "give `server` (a server in the list), or null for none")),
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(url)) if url.trim().is_empty() => Ok(None),
+        Some(Value::String(url)) => {
+            let url = server_key(url);
+            if !s.servers().iter().any(|sv| sv.url == url) {
+                return Err(bad(cmd, "that server isn't in the list: add it first (servers.add)"));
+            }
+            Ok(Some(url))
+        }
+        Some(_) => Err(bad(cmd, "`server` is a server's address, or null")),
+    }
+}
+
+fn set_default(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "servers.setDefault";
+    s.prefs.default_server = chosen(s, CMD, p)?;
+    s.live.unsaved = true;
+    Ok(s.servers_json())
+}
+
+fn set_start_home(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "servers.setStartHome";
+    s.prefs.open_server_home = chosen(s, CMD, p)?;
+    s.live.unsaved = true;
     Ok(s.servers_json())
 }
 
@@ -193,7 +236,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "servers.list",
             "Servers",
-            "{} → {servers: [{name, url, signedIn: {server, account, name, email, admin, expires} | null}], editable}: the remote servers you use, in order (the home screen has a section for each; the first is where join codes are asked)",
+            "{} → {servers: [{name, url, signedIn: {server, account, name, email, admin, expires} | null}], editable, default (where new files go: the + tab and File ▸ New make them on its root; null: on this computer), startHome (the server whose home the desktop app opens at start; null: none)}: the remote servers you use, in order (the home screen has a section for each; the first is where join codes are asked)",
             false,
             list
         ),
@@ -217,6 +260,20 @@ pub fn specs() -> Vec<CommandSpec> {
             "{url, to (0: first)} → servers.list's answer: puts the server at another place in the list",
             false,
             move_to
+        ),
+        spec!(
+            "servers.setDefault",
+            "Default server for new files",
+            "{server (a server in the list) | null} → servers.list's answer: new files (the + tab, File ▸ New, File ▸ Save of an untitled file) go to that server's root as you, when you are signed in there; null: they stay on this computer",
+            false,
+            set_default
+        ),
+        spec!(
+            "servers.setStartHome",
+            "Open server at start",
+            "{server (a server in the list) | null} → servers.list's answer: the desktop app opens that server's home when it starts; null: the usual home",
+            false,
+            set_start_home
         ),
         spec!(
             "account.check",

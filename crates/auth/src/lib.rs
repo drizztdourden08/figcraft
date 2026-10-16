@@ -31,7 +31,7 @@ pub mod provider;
 pub mod registry;
 pub mod wire;
 
-pub use config::{AuthConfig, E2eConfig, ProviderConfig};
+pub use config::{AuthConfig, E2eConfig, FileAccess, ProviderConfig};
 pub use policy::Policy;
 pub use provider::{AuthError, DeviceStart, Fetch, FetchError, Identity, IdentityProvider, loopback_redirect};
 pub use wire::{AuthMode, DeviceCode, E2eMode, Flow, Me, ProviderInfo, ServerAbout, ServerInfo, SignIn, SignInReply};

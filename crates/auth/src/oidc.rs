@@ -278,7 +278,7 @@ fn web_client(cfg: &ProviderConfig) -> Result<Option<WebClient>, String> {
 
 /// The identity in a checked token's claims. Without an `email_verified` claim the email counts
 /// as verified only when the provider is configured with `trust_email`.
-fn identity(provider: &str, claims: &Value, trust_email: bool) -> Identity {
+pub(crate) fn identity(provider: &str, claims: &Value, trust_email: bool) -> Identity {
     let s = |k: &str| claims[k].as_str().map(str::trim).filter(|v| !v.is_empty()).map(String::from);
     let verified = match &claims["email_verified"] {
         Value::Bool(b) => *b,
@@ -292,8 +292,22 @@ fn identity(provider: &str, claims: &Value, trust_email: bool) -> Identity {
         subject: s("sub").unwrap_or_default(),
         email: s("email").map(|e| e.to_ascii_lowercase()),
         email_verified: verified,
-        name: s("name").or_else(|| s("preferred_username")),
+        name: person_name(&s),
+        picture: s("picture").filter(|u| u.len() <= 2048),
     }
+}
+
+/// What someone is called, from their claims: `name`, else `given_name` and `family_name`
+/// together, else `preferred_username` (never the email: apps fall back to it themselves).
+pub(crate) fn person_name(s: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    if let Some(n) = s("name") {
+        return Some(n);
+    }
+    let parts: Vec<String> = [s("given_name"), s("family_name")].into_iter().flatten().collect();
+    if !parts.is_empty() {
+        return Some(parts.join(" "));
+    }
+    s("preferred_username").or_else(|| s("nickname"))
 }
 
 /// An error answer from a token endpoint: its `error` code.

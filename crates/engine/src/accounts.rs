@@ -15,7 +15,9 @@
 //!
 //! On such a server a file has members with a role (owner, editor, viewer):
 //! `collab.members`, `collab.invite`, `collab.setRole` and `collab.removeMember` manage them for
-//! the file in front; `account.files` lists yours.
+//! the file in front; `account.files` lists yours. Most servers with accounts give everyone on
+//! them every file instead (`[auth] file_access = "everyone"`, see [`crate::team`]): there the
+//! server refuses those four, and admins add people to the server.
 
 use figcraft_collab::message::{AccountReply, AccountReq, Invited, Member, MyFile, Role};
 use serde::{Deserialize, Serialize};
@@ -650,7 +652,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "collab.invite",
             "Invite to file",
-            "{email, role? (owner | editor | viewer; default editor), file?, server?} → {invited, role}: lets someone into the file in front (or `file` on `server`) by email (owners): at once if they signed in to the server before, else when they first do",
+            "{email, role? (owner | editor | viewer; default editor), file?, server?} → {invited, role}: lets someone into the file in front (or `file` on `server`) by email (owners): at once if they signed in to the server before, else when they first do. Only on servers whose files have members (`account.people`'s fileAccess \"members\"): where everyone is in every file the server refuses, and admins add people to the server (`admin.allowEmail`, `admin.createUser`)",
             false,
             invite
         ),

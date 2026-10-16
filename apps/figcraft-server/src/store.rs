@@ -1599,8 +1599,7 @@ impl Backend for Store {
         // A file whose changes must be signed takes them from its editors only: a share link
         // (or an admin who isn't in the file) only views it.
         let editor = who.is_some_and(|w| {
-            self.people(file)
-                .and_then(|p| p.role(&w.account))
+            self.role_in(file, &w.account)
                 .is_some_and(|r| matches!(r, figcraft_collab::message::Role::Owner | figcraft_collab::message::Role::Editor))
         });
         if self.signatures_required(file) && !editor {
@@ -1844,7 +1843,11 @@ impl Backend for Store {
             | Admin::CreateUser { .. }
             | Admin::ResetPassword { .. }
             | Admin::RemoveUser { .. }
-            | Admin::Users) => self.admin_people(req),
+            | Admin::Users
+            | Admin::AllowEmail { .. }
+            | Admin::DisallowEmail { .. }
+            | Admin::Allowed
+            | Admin::SetAdmin { .. }) => self.admin_people(req),
             // The hub removes people itself (it knows who is connected); it never asks the store.
             Admin::RemovePeer { .. } => failed("removing someone from a file is done by the server's hub".into()),
             Admin::Remove { file } => {

@@ -81,15 +81,24 @@ fn network(e: ureq::Error) -> FetchError {
 }
 
 fn answer(r: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Vec<u8>, FetchError> {
+    answer_capped(r, MAX_BODY)
+}
+
+/// An answer of at most `max` bytes (a larger one is an error).
+fn answer_capped(r: Result<ureq::http::Response<ureq::Body>, ureq::Error>, max: u64) -> Result<Vec<u8>, FetchError> {
     let mut r = r.map_err(network)?;
     let status = r.status().as_u16();
-    let body = r.body_mut().with_config().limit(MAX_BODY).read_to_vec().map_err(network)?;
+    let body = r.body_mut().with_config().limit(max).read_to_vec().map_err(network)?;
     if (200..300).contains(&status) { Ok(body) } else { Err(FetchError::Status { status, body }) }
 }
 
 impl Fetch for Https {
     fn get(&self, url: &str) -> Result<Vec<u8>, FetchError> {
         answer(self.agent.get(url).header("accept", "application/json").call())
+    }
+
+    fn get_image(&self, url: &str, max: usize) -> Result<Vec<u8>, FetchError> {
+        answer_capped(self.agent.get(url).header("accept", "image/png, image/jpeg").call(), max as u64)
     }
 
     fn post_form(&self, url: &str, form: &[(&str, &str)]) -> Result<Vec<u8>, FetchError> {

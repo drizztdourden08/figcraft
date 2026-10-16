@@ -35,6 +35,25 @@ impl Policy {
         Policy { admins: clean(admins, false), allow_emails: clean(allow_emails, false), allow_domains: clean(allow_domains, true) }
     }
 
+    /// This policy with the emails admins allowed from the app (`allowed`, lowercase) added to
+    /// the allow-list, and `admins` (lowercase emails) to the admins: what the server goes by.
+    /// With both of the settings' allow-lists empty, a non-empty `allowed` turns the server from
+    /// letting in anyone a provider vouches for to letting in only those emails (and admins).
+    pub fn with_allowed(&self, allowed: &[String], admins: &[String]) -> Policy {
+        let mut p = self.clone();
+        for e in allowed {
+            if !p.allow_emails.contains(e) {
+                p.allow_emails.push(e.clone());
+            }
+        }
+        for e in admins {
+            if !p.admins.contains(e) {
+                p.admins.push(e.clone());
+            }
+        }
+        p
+    }
+
     /// Nobody is restricted (both allow-lists empty): anyone a provider vouches for may sign in.
     pub fn open(&self) -> bool {
         self.allow_emails.is_empty() && self.allow_domains.is_empty()
@@ -54,7 +73,7 @@ impl Policy {
         if self.allow_emails.contains(&email) || self.allow_domains.iter().any(|d| d == domain) {
             Ok(Admitted { admin })
         } else {
-            Err(format!("{email} isn't allowed on this server: ask its operator"))
+            Err(format!("{email} isn't allowed on this server: ask one of its admins to add you"))
         }
     }
 }

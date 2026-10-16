@@ -2,10 +2,15 @@
 //! (owner, editor, viewer) and emails invited before their person signed in here, kept in the
 //! file's `meta.json`; and the requests of account connections (your files, publishing, members,
 //! invites, and, on a server that also takes links, the links of the files you own).
+//!
+//! With `[auth] file_access = "everyone"` (the default) everyone allowed on the server is in every
+//! file: a file's members only say who owns it (whoever published it) and who an admin gave
+//! another role; everyone else is an editor. Per-file invites and member changes are refused
+//! there ([`EVERYONE`]): admins add people to the server instead (see `team`).
 
 use std::collections::HashMap;
 
-use figcraft_auth::{Gate, Person};
+use figcraft_auth::{FileAccess, Gate, Person};
 use figcraft_collab::Change;
 use figcraft_collab::message::{
     AccountReply, AccountReq, Admin, AdminReply, Invited, Member, MyFile, OwnerlessFile, PersonInfo, Role, Secret, ServerStatus,
@@ -62,13 +67,31 @@ const NOT_IN: &str = "you aren't in this file: ask its owner to invite you";
 const OWNERS_ONLY: &str = "only the file's owners can do that";
 const NOBODY: &str = "nobody with that account is on this server";
 const NO_ACCOUNTS: &str = "this server has no accounts (people sign in only when its settings have [auth])";
+/// Why per-file invites and member changes are refused where everyone is in every file.
+pub const EVERYONE: &str = "this server gives everyone on it access to every file: ask an admin to add people to the server";
 
 impl Store {
+    /// Everyone on this server is in every file (`[auth] file_access = "everyone"`).
+    pub(crate) fn everyone(&self) -> bool {
+        self.accounts.mode().accounts() && self.accounts.file_access() == FileAccess::Everyone
+    }
+
+    /// `account`'s role in `file` as it stands (no invite taken): a member's role, else, where
+    /// everyone is in every file, an editor for anyone who signed in here.
+    pub(crate) fn role_in(&self, file: &str, account: &str) -> Option<Role> {
+        let p = self.people(file)?;
+        p.role(account).or_else(|| (self.everyone() && self.accounts.account(account).is_some()).then_some(Role::Editor))
+    }
+
     /// `who`'s role in `file`; an invite to their verified email becomes membership now.
     pub fn role_of(&mut self, file: &str, who: &Person) -> Result<Option<Role>, String> {
+        let everyone = self.everyone();
         let entry = self.entry(file)?;
         if let Some(r) = entry.meta.people.role(&who.account) {
             return Ok(Some(r));
+        }
+        if everyone {
+            return Ok(Some(Role::Editor));
         }
         let Some(mail) = who.email.as_deref() else { return Ok(None) };
         let Some(i) = entry.meta.people.invited.iter().position(|v| v.email == mail) else { return Ok(None) };
@@ -130,6 +153,9 @@ impl Store {
     }
 
     fn members(&mut self, file: &str, who: &Person) -> Result<AccountReply, String> {
+        if self.everyone() {
+            return Err(EVERYONE.into());
+        }
         if self.role_of(file, who)?.is_none() && !who.admin {
             return Err(NOT_IN.into());
         }
@@ -157,6 +183,9 @@ impl Store {
     }
 
     fn invite(&mut self, file: &str, who: &Person, mail: &str, role: Role) -> Result<(), String> {
+        if self.everyone() {
+            return Err(EVERYONE.into());
+        }
         self.owner(file, who)?;
         self.add_by_email(file, mail, role)
     }
@@ -189,6 +218,9 @@ impl Store {
     }
 
     fn set_role(&mut self, file: &str, who: &Person, account: &str, role: Role) -> Result<(), String> {
+        if self.everyone() {
+            return Err(EVERYONE.into());
+        }
         self.owner(file, who)?;
         self.change_role(file, account, role, false)
     }
@@ -221,6 +253,9 @@ impl Store {
 
     /// Take `account` out of `file` (an owner doing it, or them leaving).
     fn take_out(&mut self, file: &str, who: &Person, account: &str) -> Result<(), String> {
+        if self.everyone() {
+            return Err(EVERYONE.into());
+        }
         if account != who.account {
             self.owner(file, who)?;
         }
@@ -237,6 +272,9 @@ impl Store {
     }
 
     fn uninvite(&mut self, file: &str, who: &Person, mail: &str) -> Result<(), String> {
+        if self.everyone() {
+            return Err(EVERYONE.into());
+        }
         self.owner(file, who)?;
         let mail = mail.trim().to_ascii_lowercase();
         let entry = self.entry(file)?;
@@ -262,7 +300,7 @@ impl Store {
                     .file_ids()
                     .into_iter()
                     .filter_map(|id| {
-                        let role = self.people(&id)?.role(&who.account)?;
+                        let role = self.role_in(&id, &who.account)?;
                         Some(MyFile { info: self.file_info(&id, open)?, role })
                     })
                     .collect();
@@ -337,6 +375,13 @@ impl Store {
             | AccountReq::Browse
             | AccountReq::SetThumbnail { .. }
             | AccountReq::GetThumbnail { .. }) => self.folder_request(who, req, open),
+            AccountReq::Avatar { account } => match self.accounts.avatar(&account) {
+                Some((image, mime)) => AccountReply::Avatar { image, mime: mime.to_string() }.into(),
+                None => AccountReply::Avatar { image: Vec::new(), mime: String::new() }.into(),
+            },
+            AccountReq::Team => {
+                AccountReply::Team { file_access: self.accounts.file_access().id().to_string(), people: self.accounts.team(who.admin) }.into()
+            }
         }
     }
 
@@ -409,6 +454,14 @@ impl Store {
                 // again finishes the files left.
                 return failed(e);
             }
+            // Where everyone is in every file, every sealed file had their keys: a new epoch.
+            if !was_member
+                && self.everyone()
+                && known.is_some()
+                && let Err(e) = self.keys_forget(&id, account, None)
+            {
+                return failed(e);
+            }
         }
         if let Err(e) = self.accounts.remove_person(account) {
             return failed(e);
@@ -465,6 +518,13 @@ impl Store {
                 Err(e) => failed(e),
             },
             Admin::Users => self.accounts.users().map_or_else(failed, |u| AdminReply::Users(u).into()),
+            Admin::AllowEmail { email, admin } => done(self.accounts.allow_email(&email, admin)),
+            Admin::DisallowEmail { email } => match self.accounts.disallow_email(&email) {
+                Ok(ended) => Handled { ended: ended.into_iter().collect(), ..AdminReply::Done.into() },
+                Err(e) => failed(e),
+            },
+            Admin::Allowed => AdminReply::Allowed(self.accounts.allow_list()).into(),
+            Admin::SetAdmin { account, admin } => done(self.accounts.set_admin(&account, admin)),
             Admin::ServerStatus => {
                 let (people, sessions) = self.accounts.counts();
                 let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);

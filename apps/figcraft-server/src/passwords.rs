@@ -100,6 +100,7 @@ impl UserRec {
             email: self.email.clone(),
             email_verified: self.email_verified && self.email.is_some(),
             name: Some(if self.name.trim().is_empty() { self.username.clone() } else { self.name.clone() }),
+            picture: None,
         }
     }
 }

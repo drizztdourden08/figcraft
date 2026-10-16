@@ -425,6 +425,7 @@ fn every_command_survives_junk_params() {
             "file.open"
                 | "file.save"
                 | "file.saveAs"
+                | "file.saveLocally"
                 | "file.import"
                 | "file.export"
                 | "file.exportSvg"
