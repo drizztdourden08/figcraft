@@ -30,7 +30,8 @@ pub static MENU: &[MenuItem] = &[
     m!("File", "Place image…", "file.placeImage"),
     m!("File", SEP, ""),
     m!("File", "Save", "file.save"),
-    m!("File", "Save as…", "file.saveAs"),
+    // "Save as" of the reference: a copy on this computer (Save keeps a server's file there).
+    m!("File", "Save locally…", "file.saveAs"),
     m!("File", "Save to version history…", "file.saveVersion"),
     m!("File", "Show version history", "file.versionHistory"),
     // FigCraft's own: branches of the file.

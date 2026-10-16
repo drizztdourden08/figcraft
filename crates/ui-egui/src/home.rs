@@ -260,7 +260,7 @@ fn subheading(ui: &mut Ui, t: &Tokens, text: &str) {
 }
 
 /// A card with an icon tile, a title and a line under it; true when chosen.
-fn action_card(ui: &mut Ui, t: &Tokens, icon: Icon, title: &str, sub: &str) -> bool {
+pub(crate) fn action_card(ui: &mut Ui, t: &Tokens, icon: Icon, title: &str, sub: &str) -> bool {
     let (r, mut resp) = ui.allocate_exact_size(vec2(260.0, 72.0), Sense::click());
     a11y::button(&resp, title);
     // One line each inside the card; a long translation ends with an ellipsis, in full on hover.

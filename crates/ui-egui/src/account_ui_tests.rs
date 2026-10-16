@@ -130,20 +130,45 @@ fn a_servers_page_signs_in_lists_your_files_and_their_people() {
     let sign_in = crate::live_tests::texts(&shapes).into_iter().filter(|t| t.0 == "Sign in").map(|t| t.1).next().unwrap();
     h.click(sign_in);
     let shapes = h.frames(6);
-    for t in ["Signed in as Ann (ann@example.com)", "Sign out", "Files", "People", "Admin", "Recent", "All files", "Plan", "Folders", "Work"] {
+    for t in [
+        "Signed in as Ann (ann@example.com)",
+        "Sign out",
+        "Files",
+        "People",
+        "Settings",
+        "Admin",
+        "New design file",
+        "Recent",
+        "All files",
+        "Plan",
+        "Folders",
+        "Work",
+    ] {
         assert!(has_text(&shapes, t), "signed in, the page shows {t:?}");
     }
+    // Signed in with a token, not a password: no Account tab.
+    assert!(!has_text(&shapes, "Account"));
     assert!(!format!("{:?}", crate::account_ui::inspect(&h.app)).contains(TOKEN));
-    // The People tab: a file's people, and an owner's invite field.
+    // The People tab: everyone in your files, by name, without invites.
     click(&mut h, "People");
-    let shapes = click(&mut h, "Plan");
-    for t in ["Ann (you)", "Bob", "Invite"] {
+    let shapes = h.frames(6);
+    for t in ["Ann (you)", "Bob", "In 1 of your files"] {
         assert!(has_text(&shapes, t), "the people show {t:?}");
     }
+    assert!(!has_text(&shapes, "Invite"));
     assert!(wire.lock().unwrap().asked.iter().any(|r| matches!(r, NetRequest::Account { req: AccountReq::Members { file }, .. } if file == "f1")));
-    // The Admin tab: the server's people, no file management.
+    // Settings: this server for new files.
+    let shapes = click(&mut h, "Settings");
+    assert!(has_text(&shapes, "Use this server for new files") && has_text(&shapes, "Open this server's home when FigCraft starts"));
+    // The Admin tab: one page of sections.
     let shapes = click(&mut h, "Admin");
-    assert!(has_text(&shapes, "Ownership") && has_text(&shapes, "Status"));
+    for t in ["People on this server", "Invite people", "Sessions"] {
+        assert!(has_text(&shapes, t), "the admin tab shows {t:?}");
+    }
+    // Signed in with a password: the Account tab, with the password.
+    h.app.session.prefs.accounts[0].password = true;
+    let shapes = click(&mut h, "Account");
+    assert!(has_text(&shapes, "Change password") && has_text(&shapes, "Current password"));
     // Sign out: back to the ways in.
     let shapes = click(&mut h, "Sign out");
     assert!(h.app.session.signed_in(SERVER).is_none());

@@ -140,7 +140,12 @@ pub fn tab_bar(app: &mut FigApp, ui: &mut Ui) {
         }
         icons::paint(ui.painter(), nr.shrink(7.0), Icon::Plus, t.icon);
         if nresp.clicked() {
-            app.run("file.new", json!({}));
+            // New files go on the server chosen for them, at its top level, when you are signed in there.
+            let server = app.session.default_server().filter(|s| app.session.signed_in(s).is_some());
+            match server {
+                Some(server) => app.run("account.newFile", json!({"server": server, "name": tr("Untitled")})),
+                None => app.run("file.new", json!({})),
+            };
             app.ui.home = false;
         }
         // Right side: theme toggle (left of the window buttons).

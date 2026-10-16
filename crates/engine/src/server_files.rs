@@ -297,7 +297,7 @@ fn sign_up(s: &mut Session, p: &Value) -> Result<Value> {
         name: string(p, "name").unwrap_or_default(),
     };
     match s.sign_in_step(&server, req)? {
-        SignInReply::SignedIn(me) => Ok(json!({"status": "signedIn", "account": s.keep_sign_in(&server, me)})),
+        SignInReply::SignedIn(me) => Ok(json!({"status": "signedIn", "account": s.keep_sign_in_with(&server, me, true)})),
         SignInReply::Refused { reason } => Err(EngineError::Other(reason)),
         _ => Err(EngineError::Other("the server didn't make the account".into())),
     }

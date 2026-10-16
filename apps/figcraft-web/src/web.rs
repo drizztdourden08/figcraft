@@ -38,12 +38,18 @@ pub fn start() {
                         log::info!("figcraft-web: wgpu backend {:?}", rs.adapter.get_info().backend);
                     }
                     let reduce_motion = web_sys::window().and_then(|w| w.match_media("(prefers-reduced-motion: reduce)").ok().flatten());
-                    let mut session = Session::new();
+                    // Nothing open at first: the home screen (behind the sign-in on a server with
+                    // accounts), with the preferences this browser kept.
+                    let mut session = Session::empty();
+                    if let Some(prefs) = load_prefs() {
+                        session.prefs = prefs;
+                    }
                     // Live sessions: the browser joins sessions a desktop app hosts; whatever arrives
                     // on the socket wakes the page for a frame.
                     let ctx = cc.egui_ctx.clone();
                     session.live.install(Box::new(figcraft_collab_net::NetLink::new(std::sync::Arc::new(move || ctx.request_repaint()))));
-                    let fig = FigApp::new(session, Box::new(WebServices { reduce_motion, ctx: cc.egui_ctx.clone() }));
+                    let mut fig = FigApp::new(session, Box::new(WebServices { reduce_motion, ctx: cc.egui_ctx.clone() }));
+                    fig.ui.login_gate = true;
                     // Back from a provider's sign-in page (`?code=…&state=…`): finished on the first frame.
                     Ok(Box::new(WebShell { fig, back: figcraft_collab_net::redirect_back() }))
                 }),
@@ -56,6 +62,20 @@ pub fn start() {
             }
         }
     });
+}
+
+/// Where the browser keeps the preferences: the page's local storage.
+const PREFS_KEY: &str = "figcraft.prefs";
+
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.local_storage().ok().flatten())
+}
+
+/// The preferences this browser kept (with your sign-ins and this device's key), if any. A
+/// browser that keeps nothing (private windows, storage turned off) starts afresh each time.
+fn load_prefs() -> Option<figcraft_engine::Prefs> {
+    let text = local_storage()?.get_item(PREFS_KEY).ok().flatten()?;
+    serde_json::from_str(&text).map_err(|e| log::warn!("preferences: the kept ones can't be read ({e}); starting afresh")).ok()
 }
 
 fn query() -> String {
@@ -136,6 +156,18 @@ impl Services for WebServices {
     }
     fn reduce_motion(&self) -> bool {
         self.reduce_motion.as_ref().is_some_and(web_sys::MediaQueryList::matches)
+    }
+    /// Kept in the page's local storage: your sign-ins (session tokens) and this device's key
+    /// for encrypted files with them, so a reload keeps you signed in. Weaker than the desktop
+    /// app's keychain: anything running on this site, and anyone with this browser profile, can
+    /// read them (`docs/server-accounts.md`).
+    fn save_prefs(&mut self, prefs: &figcraft_engine::Prefs) {
+        let Some(storage) = local_storage() else { return };
+        let saved =
+            serde_json::to_string(prefs).map_err(|e| e.to_string()).and_then(|t| storage.set_item(PREFS_KEY, &t).map_err(|e| format!("{e:?}")));
+        if let Err(e) = saved {
+            log::warn!("preferences: not kept in this browser: {e}");
+        }
     }
     /// The browser's language (`navigator.language`).
     fn system_language(&self) -> Option<String> {

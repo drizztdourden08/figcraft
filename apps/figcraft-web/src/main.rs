@@ -6,7 +6,9 @@
 //!
 //! Differences from the desktop app:
 //! - no TCP control server (browsers can't listen on sockets);
-//! - no native file dialogs yet: the session starts with one new document;
+//! - no native file dialogs yet: the session starts on the home screen with nothing open, and a
+//!   server with accounts asks you to sign in before anything else (`FigApp`'s login gate);
+//! - the preferences (with your sign-ins) are kept in the page's local storage;
 //! - links open in a new browser tab;
 //! - live sessions: it joins sessions a desktop app hosts (File ▸ Join live session…) but can't
 //!   host one. A page served over `https://` can only reach sessions on the same computer

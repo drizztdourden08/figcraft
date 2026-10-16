@@ -527,6 +527,9 @@ pub struct UiState {
     pub admin: Option<admin_ui::AdminWindow>,
     /// The window was asked to close with unsaved changes: the question shows.
     pub confirm_close: bool,
+    /// Nothing is usable until you are signed in to the app's one server (the browser build a
+    /// server hosts): a full-window sign-in shows instead ([`account_ui::gate`]).
+    pub login_gate: bool,
 }
 
 impl Default for UiState {
@@ -611,6 +614,7 @@ impl Default for UiState {
             account: account_ui::AccountUi::default(),
             admin: None,
             confirm_close: false,
+            login_gate: false,
         }
     }
 }
@@ -663,7 +667,7 @@ impl FigApp {
     pub fn new(session: Session, services: Box<dyn Services>) -> Self {
         // The main window's panels open as wide as they were left.
         let (left_width, right_width) = session.prefs.panel_widths;
-        Self {
+        let mut app = Self {
             ui: UiState { left_width, right_width, ..UiState::default() },
             session,
             canvas: canvas::CanvasState::default(),
@@ -683,7 +687,17 @@ impl FigApp {
             waiting: Vec::new(),
             pending_dialog: None,
             ui_context: None,
+        };
+        // The home screen opens on the server chosen for it (Settings on its page; desktop); the
+        // browser build a server hosts, on that server's page.
+        if !figcraft_engine::servers::editable() && !app.session.servers().is_empty() {
+            app.ui.home_view.section = home::Section::Server(0);
+        } else if let Some(url) = app.session.start_home_server()
+            && let Some(i) = account_ui::home_servers(&app).iter().position(|s| s.url == url)
+        {
+            app.ui.home_view.section = home::Section::Server(i);
         }
+        app
     }
 
     /// Run a command, surfacing errors as a toast. Returns the result.
@@ -975,7 +989,7 @@ impl FigApp {
 
     pub fn save_as_dialog(&mut self) {
         let name = self.session.doc().map(|d| d.name.clone()).unwrap_or_else(|_| "Untitled".into());
-        self.pick_save(i18n::tr("Save as"), &format!("{name}.figcraft"), &["figcraft"], |app, p| {
+        self.pick_save(i18n::tr("Save locally"), &format!("{name}.figcraft"), &["figcraft"], |app, p| {
             let ps = p.to_string_lossy().to_string();
             if app.run("file.saveAs", json!({"path": ps})).is_some() {
                 app.toast(i18n::trf("Saved {name}", &[("name", &p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default())]));
@@ -983,15 +997,33 @@ impl FigApp {
         });
     }
 
+    /// File ▸ Save: a file on a server is kept there (a short note says so); a file saved on this
+    /// computer before is written again; a new file goes on the server for new files when there
+    /// is one you are signed in to; else Save locally asks where.
     pub fn save(&mut self) {
         // A branch tab saves its main file.
         let tab = figcraft_engine::branches::file_tab(&self.session);
-        if self.session.docs.get(tab).is_some_and(|d| d.path.is_some()) {
-            if self.run("file.save", json!({})).is_some() {
-                self.toast(i18n::tr("Saved"));
+        let on_server = self.session.live().account_file().is_some();
+        let has_path = self.session.docs.get(tab).is_some_and(|d| d.path.is_some());
+        let to_default = self.session.live().status == figcraft_engine::live::Status::Off
+            && self.session.default_server().is_some_and(|s| self.session.signed_in(&s).is_some());
+        if !(on_server || has_path || to_default) {
+            return self.save_as_dialog();
+        }
+        let Some(v) = self.run("file.save", json!({})) else { return };
+        match v["server"].as_str() {
+            Some(server) => {
+                let name = account_ui::server_name(self, server);
+                let said = if v["publishing"] == true {
+                    i18n::trf("Putting it on {server}…", &[("server", &name)])
+                } else if v["synced"] == true {
+                    i18n::trf("Saved to {server}", &[("server", &name)])
+                } else {
+                    i18n::trf("Not on {server} yet: it is saved there once the connection is back", &[("server", &name)])
+                };
+                self.toast(said);
             }
-        } else {
-            self.save_as_dialog();
+            None => self.toast(i18n::tr("Saved")),
         }
     }
 
@@ -1337,6 +1369,12 @@ impl FigApp {
         // The Inspect tab measures on hover without Alt.
         self.session.tool.redlines = self.ui.right_tab == RightTab::Inspect;
         self.end_pen_outside_design();
+        // The browser build a server with accounts hosts: signed in first, nothing else before.
+        if self.ui.login_gate && account_ui::gate(self, ui) {
+            dialogs::show(self, &ctx);
+            self.toast_ui(&ctx);
+            return;
+        }
         if self.ui.present.is_some() {
             present::show(self, ui);
             // What went wrong while presenting (a widget's plugin failing) shows over it.

@@ -1,19 +1,20 @@
-//! A server's admin tools, on its page of the home screen (for admins signed in there): the people who
-//! signed in there (end their sessions, take them off the server), the files and who is in them
-//! (change roles, add someone by email: how a file whose owner left gets one) and the server's
-//! status. Everything runs through the engine's `admin.*` commands in the background.
+//! A server's admin tools, on its page of the home screen (for admins signed in there), in one
+//! Admin tab of sections, each saying what it does: the people on the server (take one off),
+//! inviting people (usernames the server keeps; who may sign in otherwise), sessions (sign someone
+//! out everywhere), ownership recovery (the files and who is in them: change roles, add someone by
+//! email: how a file whose owner left gets one) and the server's status. Everything runs through
+//! the engine's `admin.*` commands in the background.
 //!
 //! Taking someone off the server who is the last owner of files asks first: make someone else
 //! owner of those files, or remove them anyway; files left without an owner are listed so each
 //! can be given one.
 
-use egui::{Context, RichText, Ui};
+use egui::{Context, RichText, Sense, Ui, vec2};
 use serde_json::{Value, json};
 
 use crate::FigApp;
 use crate::a11y;
-use crate::account_ui::{ROLES, role_label};
-use crate::dialogs::tab_strip;
+use crate::account_ui::{ROLES, person_avatar, person_name, role_label, section};
 use crate::i18n::{tr, trf, trn};
 use crate::theme::{Tokens, semibold};
 use crate::widgets;
@@ -33,27 +34,6 @@ const CHANGES: [&str; 7] = [
 ];
 const USERS: &str = "admin.users";
 
-/// The window's tabs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AdminTab {
-    #[default]
-    People,
-    Users,
-    Files,
-    Status,
-}
-
-impl AdminTab {
-    fn label(self) -> &'static str {
-        match self {
-            AdminTab::People => tr("People"),
-            AdminTab::Users => tr("Usernames"),
-            AdminTab::Files => tr("Ownership"),
-            AdminTab::Status => tr("Status"),
-        }
-    }
-}
-
 /// A person the server wouldn't remove (account, name): the last owner of these files (id, name).
 pub type LastOwner = (String, String, Vec<(String, String)>);
 
@@ -61,7 +41,6 @@ pub type LastOwner = (String, String, Vec<(String, String)>);
 #[derive(Default)]
 pub struct AdminWindow {
     pub server: String,
-    pub tab: AdminTab,
     pub people: Option<Value>,
     pub files: Option<Value>,
     pub status: Option<Value>,
@@ -137,29 +116,122 @@ fn load(app: &mut FigApp, ctx: &Context, cmd: &'static str) {
     );
 }
 
-/// A server's admin tools, on its page of the home screen (for admins signed in there): tabs for
-/// its people, its files and its status.
+/// A server's admin tools, on its page of the home screen (for admins signed in there): one
+/// section each for its people, inviting people, sessions, ownership recovery and its status.
 pub fn tools(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     if app.ui.admin.as_ref().is_none_or(|w| w.server != server) {
         app.ui.admin = Some(AdminWindow::new(server.to_string()));
     }
     // Usernames only where people sign in with a username and password.
-    let basic =
-        app.ui.account.servers.get(server).and_then(|st| st.info.as_ref()).is_some_and(|i| i["access"].as_str().is_some_and(|a| a.contains("basic")));
-    let tabs: Vec<AdminTab> =
-        [AdminTab::People].into_iter().chain(basic.then_some(AdminTab::Users)).chain([AdminTab::Files, AdminTab::Status]).collect();
-    let mut tab = app.ui.admin.as_ref().map(|w| w.tab).unwrap_or_default();
-    if !tabs.contains(&tab) {
-        tab = AdminTab::People;
+    let info = app.ui.account.servers.get(server).and_then(|st| st.info.clone()).unwrap_or_default();
+    let basic = info["access"].as_str().is_some_and(|a| a.contains("basic"));
+    section(
+        ui,
+        t,
+        tr("People on this server"),
+        tr("Everyone who has signed in here. Taking someone off ends their sessions and takes them out of every file."),
+        |ui| people(app, ui, t),
+    );
+    section(ui, t, tr("Invite people"), tr("Let new people in: they add this server in FigCraft and sign in to see their files."), |ui| {
+        invite(app, ui, t, &info, basic)
+    });
+    section(
+        ui,
+        t,
+        tr("Sessions"),
+        tr("Where people are signed in. Ending someone's sessions signs them out on every device; they can sign in again."),
+        |ui| sessions(app, ui, t),
+    );
+    section(
+        ui,
+        t,
+        tr("Ownership recovery"),
+        tr("Every file needs an owner. Give a file a new owner when its owner left, or change who is in it."),
+        |ui| {
+            let orphaned = app.ui.admin.as_ref().map(|w| w.orphaned.clone()).unwrap_or_default();
+            orphans(app, ui, t, &orphaned);
+            files(app, ui, t)
+        },
+    );
+    section(ui, t, tr("Server status"), tr("What the server runs, who gets in and how much room is left."), |ui| status(app, ui, t));
+}
+
+/// Inviting people: who may sign in with the server's single sign-on (set in its settings), and
+/// usernames the server keeps (where it has them).
+fn invite(app: &mut FigApp, ui: &mut Ui, t: &Tokens, info: &Value, basic: bool) {
+    let others: Vec<String> = info["providers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| !p["flows"].as_array().is_some_and(|f| f.iter().any(|x| x == "password")))
+        .filter_map(|p| p["label"].as_str().map(str::to_string))
+        .collect();
+    if !others.is_empty() {
+        ui.label(RichText::new(tr("Allow emails")).font(semibold(12.0)).color(t.text));
+        widgets::label(
+            ui,
+            &trf(
+                "People sign in with {providers}. The emails and domains allowed are in the server's settings (allow_emails, allow_domains); with both empty, anyone the provider vouches for gets in.",
+                &[("providers", &others.join(", "))],
+            ),
+            t.text_secondary,
+        );
     }
-    tab_strip(ui, t, &tabs, AdminTab::label, &mut tab);
-    with(app, |w| w.tab = tab);
-    ui.add_space(4.0);
-    match tab {
-        AdminTab::People => people(app, ui, t),
-        AdminTab::Users => users(app, ui, t),
-        AdminTab::Files => files(app, ui, t),
-        AdminTab::Status => status(app, ui, t),
+    if basic {
+        if !others.is_empty() {
+            ui.add_space(8.0);
+        }
+        ui.label(RichText::new(tr("Create usernames")).font(semibold(12.0)).color(t.text));
+        widgets::label(ui, tr("Make a username for someone: the server makes a first password, shown once, for you to give them."), t.text_secondary);
+        users(app, ui, t);
+    }
+}
+
+/// Everyone signed in somewhere: how many sessions, and ending them.
+fn sessions(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
+    let ctx = ui.ctx().clone();
+    let Some(people) = app.ui.admin.as_ref().and_then(|w| w.people.clone()) else {
+        ui.add(egui::Spinner::new().size(12.0));
+        return;
+    };
+    let server = app.ui.admin.as_ref().map(|w| w.server.clone()).unwrap_or_default();
+    let busy = busy(app);
+    let list: Vec<Value> =
+        people["people"].as_array().cloned().unwrap_or_default().into_iter().filter(|p| p["sessions"].as_u64().unwrap_or(0) > 0).collect();
+    if list.is_empty() {
+        widgets::label(ui, tr("Nobody is signed in right now."), t.text_secondary);
+    }
+    for p in &list {
+        let account = p["account"].as_str().unwrap_or_default().to_string();
+        let name = person_name(p["name"].as_str().unwrap_or_default(), p["email"].as_str());
+        let n = p["sessions"].as_u64().unwrap_or(0) as usize;
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+            person_avatar(app, ui, &server, &account, &name, r.center(), 11.0);
+            ui.scope(|ui| {
+                ui.set_width(260.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&name).font(semibold(11.0)).color(t.text));
+                    widgets::label(ui, &trn("{n} sessions", n, &[]), t.text_secondary);
+                });
+            });
+            if widgets::button(ui, tr("End sessions"), false, !busy)
+                .on_hover_text(tr("Signs them out everywhere; their account and files stay"))
+                .clicked()
+            {
+                let said = trf("{name} was signed out everywhere", &[("name", &name)]);
+                ask(
+                    app,
+                    &ctx,
+                    "admin.endSessions",
+                    json!({"account": account}),
+                    Box::new(move |app, ctx, _| {
+                        app.toast(said);
+                        load(app, ctx, PEOPLE);
+                    }),
+                );
+            }
+        });
     }
 }
 
@@ -259,54 +331,48 @@ fn busy(app: &FigApp) -> bool {
 fn people(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
     let ctx = ui.ctx().clone();
     let Some(w) = app.ui.admin.as_ref() else { return };
-    let (people, confirm, last_owner, orphaned) = (w.people.clone(), w.confirm.clone(), w.last_owner.clone(), w.orphaned.clone());
+    let (people, confirm, last_owner) = (w.people.clone(), w.confirm.clone(), w.last_owner.clone());
     if people.is_none() && !app.session.waiting_for(PEOPLE) {
         load(app, &ctx, PEOPLE);
     }
-    orphans(app, ui, t, &orphaned);
     let Some(people) = people else {
-        widgets::label(ui, tr("Asking the server…"), t.text_secondary);
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(12.0));
+            widgets::label(ui, tr("Asking the server…"), t.text_secondary);
+        });
         return;
     };
     let list = people["people"].as_array().cloned().unwrap_or_default();
     if list.is_empty() {
         widgets::label(ui, tr("Nobody has signed in here yet."), t.text_secondary);
     }
-    let me = app.session.signed_in(&app.ui.admin.as_ref().map(|w| w.server.clone()).unwrap_or_default()).map(|m| m.account.clone());
+    let server = app.ui.admin.as_ref().map(|w| w.server.clone()).unwrap_or_default();
+    let me = app.session.signed_in(&server).map(|m| m.account.clone());
     let busy = busy(app);
     for p in &list {
         let account = p["account"].as_str().unwrap_or_default().to_string();
-        let name = p["name"].as_str().unwrap_or_default().to_string();
         let email = p["email"].as_str().unwrap_or_default();
-        let sessions = p["sessions"].as_u64().unwrap_or(0) as usize;
+        let name = person_name(p["name"].as_str().unwrap_or_default(), Some(email));
         let owned = p["owned"].as_u64().unwrap_or(0) as usize;
         let you = me.as_deref() == Some(account.as_str());
         ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::hover());
+            person_avatar(app, ui, &server, &account, &name, r.center(), 15.0);
             ui.vertical(|ui| {
                 ui.set_width(300.0);
-                let title = if you { trf("{name} (you)", &[("name", &name)]) } else { name.clone() };
-                let admin = if p["admin"] == true { format!(" · {}", tr("Admin")) } else { String::new() };
-                ui.label(RichText::new(format!("{title}{admin}")).font(semibold(11.0)).color(t.text));
-                let detail = format!("{email} · {} · {}", trn("{n} sessions", sessions, &[]), trn("owns {n} files", owned, &[]));
-                widgets::label(ui, detail.trim_start_matches(" · "), t.text_secondary);
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.horizontal(|ui| {
+                    let title = if you { trf("{name} (you)", &[("name", &name)]) } else { name.clone() };
+                    ui.label(RichText::new(title).font(semibold(12.0)).color(t.text));
+                    if p["admin"] == true {
+                        ui.label(RichText::new(tr("Admin")).font(semibold(10.0)).color(crate::theme::ACCENT));
+                    }
+                });
+                // The email only as a small second line, with what they own.
+                let owns = trn("owns {n} files", owned, &[]);
+                let detail = if email.is_empty() { owns } else { format!("{email} · {owns}") };
+                widgets::label(ui, &detail, t.text_secondary);
             });
-            if widgets::button(ui, tr("End sessions"), false, !busy && sessions > 0)
-                .on_hover_text(tr("Signs them out everywhere; their account and files stay"))
-                .clicked()
-            {
-                let said = trf("{name} was signed out everywhere", &[("name", &name)]);
-                ask(
-                    app,
-                    &ctx,
-                    "admin.endSessions",
-                    json!({"account": account}),
-                    Box::new(move |app, ctx, _| {
-                        app.toast(said);
-                        with(app, |w| w.people = None);
-                        load(app, ctx, PEOPLE);
-                    }),
-                );
-            }
             if !you && widgets::button(ui, tr("Remove…"), false, !busy).clicked() {
                 with(app, |w| {
                     w.confirm = Some((account.clone(), name.clone()));
@@ -317,7 +383,6 @@ fn people(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
         if confirm.as_ref().is_some_and(|(a, _)| *a == account) {
             confirm_remove(app, ui, t, &account, &name, last_owner.as_ref().filter(|(a, ..)| *a == account).map(|(_, _, f)| f.clone()));
         }
-        ui.separator();
     }
 }
 
@@ -383,7 +448,6 @@ fn confirm_remove(app: &mut FigApp, ui: &mut Ui, t: &Tokens, account: &str, name
                 {
                     let file = file.clone();
                     with(app, |w| {
-                        w.tab = AdminTab::Files;
                         w.file = Some(file);
                         w.members = None;
                         w.add_role = 2;
@@ -411,7 +475,6 @@ fn orphans(app: &mut FigApp, ui: &mut Ui, t: &Tokens, orphaned: &[(String, Strin
             if widgets::button(ui, tr("Give it an owner"), false, true).clicked() {
                 let file = file.clone();
                 with(app, |w| {
-                    w.tab = AdminTab::Files;
                     w.file = Some(file);
                     w.members = None;
                     w.add_role = 2;
@@ -438,7 +501,8 @@ fn files(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
     }
     for f in &list {
         let id = f["file"].as_str().unwrap_or_default().to_string();
-        let name = f["name"].as_str().unwrap_or_default();
+        // A sealed file's name is sealed too: the server (and an admin) can't read it.
+        let name = f["name"].as_str().filter(|n| !n.starts_with("sealed:")).unwrap_or(tr("Encrypted file"));
         let updated = figcraft_engine::live::utc_date(f["updated"].as_u64().unwrap_or(0));
         let people = f["people"].as_u64().unwrap_or(0) as usize;
         let open = selected.as_deref() == Some(id.as_str());
@@ -482,14 +546,17 @@ fn members(app: &mut FigApp, ui: &mut Ui, t: &Tokens, file: &str) {
     for m in &list {
         let account = m["account"].as_str().unwrap_or_default().to_string();
         let role = m["role"].as_str().unwrap_or("editor");
-        let who = match m["email"].as_str() {
-            Some(e) => format!("{} · {e}", m["name"].as_str().unwrap_or_default()),
-            None => m["name"].as_str().unwrap_or_default().to_string(),
-        };
+        let email = m["email"].as_str().unwrap_or_default();
+        let who = person_name(m["name"].as_str().unwrap_or_default(), Some(email));
         ui.horizontal(|ui| {
             ui.scope(|ui| {
                 ui.set_width(300.0);
-                widgets::label(ui, &who, t.text);
+                ui.horizontal(|ui| {
+                    widgets::label(ui, &who, t.text);
+                    if !email.is_empty() {
+                        ui.label(RichText::new(email).font(crate::theme::regular(10.0)).color(t.text_tertiary));
+                    }
+                });
             });
             if widgets::button(ui, role_label(role), false, !busy).on_hover_text(tr("Change role")).clicked() {
                 with(app, |w| w.role_edit = if role_edit.as_deref() == Some(account.as_str()) { None } else { Some(account.clone()) });

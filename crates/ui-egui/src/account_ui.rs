@@ -19,7 +19,6 @@ use serde_json::{Value, json};
 
 use crate::FigApp;
 use crate::a11y;
-use crate::home::{FileRow, file_row};
 use crate::i18n::{tr, trf};
 use crate::icons::Icon;
 use crate::theme::{ACCENT, Tokens, regular, semibold};
@@ -36,7 +35,8 @@ const FOLDER_CHANGES: [&str; 4] = ["account.createFolder", "account.renameFolder
 const MEMBERS: &str = "collab.members";
 const DEVICES: &str = "account.devices";
 const DEVICE_CHANGES: [&str; 3] = ["account.revokeDevice", "account.recoveryKey", "account.recover"];
-const PEOPLE_CHANGE: [&str; 3] = ["collab.invite", "collab.setRole", "collab.removeMember"];
+const AVATAR: &str = "account.avatar";
+const NEW_FILE: &str = "account.newFile";
 
 /// Roles in the order the pickers show them (ids and labels).
 pub(crate) const ROLES: [&str; 3] = ["editor", "viewer", "owner"];
@@ -63,14 +63,21 @@ pub struct ServerState {
     pub files: Option<Value>,
     /// You were signed in there when its page last drew (a change loads the files again).
     was_signed_in: Option<bool>,
-    /// The file whose people show on the page, and them (`collab.members {file}`; null until
-    /// they arrive).
-    pub people: Option<(String, Value)>,
+    /// The frame its page last drew in: shown again after a gap, the files are asked for again
+    /// (the cards stay until the answer).
+    drawn: Option<u64>,
+    /// The files changed from here (a new file): asked for again when the page shows.
+    pub files_stale: bool,
+    /// The people of each of your files there (`collab.members {file}`; null while asked), from
+    /// which the People tab gathers who you work with.
+    pub members: BTreeMap<String, Value>,
     /// Your devices there (`account.devices`), asked once a run; a recovery key just made (shown
     /// this once).
     pub devices: Option<Value>,
     devices_asked: bool,
     pub recovery_key: Option<String>,
+    /// The recovery key just shown was saved somewhere (its confirmation is ticked).
+    pub recovery_saved: bool,
     /// The page's tab, and the folder the Files tab is in (`""`: the top).
     pub tab: ServerTab,
     pub folder: String,
@@ -90,14 +97,9 @@ pub struct AccountUi {
     /// Preferences ▸ Servers: the name and address of a server being added.
     pub new_name: String,
     pub new_url: String,
-    /// The Share popover's people of the file in front: (server, file) and `collab.members`.
-    pub popover_people: Option<((String, String), Value)>,
-    /// The frame the popover's People part last drew in (it asks again when it shows after a gap).
-    people_drawn: Option<u64>,
-    /// The member whose role is being changed (their account), and the invite being written.
-    pub role_edit: Option<String>,
-    pub invite_email: String,
-    pub invite_role: usize,
+    /// People's pictures by (server, account): `None` once asked when there is none (their
+    /// initials show).
+    pub avatars: BTreeMap<(String, String), Option<egui::TextureHandle>>,
     /// A folder being made, and one being renamed (its path and the name typed).
     pub new_folder: Option<String>,
     pub rename_folder: Option<(String, String)>,
@@ -178,6 +180,16 @@ pub fn tick(app: &mut FigApp, ctx: &Context) {
     }
 }
 
+/// Your files on `server` as last listed (`account.browse`), if they were.
+pub(crate) fn server_files(app: &mut FigApp, server: &str) -> Option<Value> {
+    app.ui.account.of(&figcraft_engine::accounts::server_key(server)).files.clone()
+}
+
+/// Ask for your files on `server` again (in the background; what was listed stays meanwhile).
+pub(crate) fn refresh_files(app: &mut FigApp, ctx: &Context, server: &str) {
+    load_files(app, ctx, &figcraft_engine::accounts::server_key(server));
+}
+
 fn load_files(app: &mut FigApp, ctx: &Context, server: &str) {
     let at = server.to_string();
     app.run_background(
@@ -194,12 +206,19 @@ fn load_files(app: &mut FigApp, ctx: &Context, server: &str) {
 /// again when you sign in.
 fn ensure(app: &mut FigApp, ctx: &Context, server: &str) {
     let signed = app.session.signed_in(server).is_some();
+    let frame = ctx.cumulative_frame_nr();
     let st = app.ui.account.of(server);
     let (checked, was) = (st.checked, st.was_signed_in);
     st.was_signed_in = Some(signed);
+    let back = st.drawn.replace(frame).is_some_and(|d| d.saturating_add(1) < frame);
+    if signed && checked && (back || st.files_stale) && !app.session.waiting_for(FILES) {
+        app.ui.account.of(server).files_stale = false;
+        load_files(app, ctx, server);
+    }
+    let st = app.ui.account.of(server);
     if !signed {
         st.files = None;
-        st.people = None;
+        st.members.clear();
         st.devices = None;
         st.devices_asked = false;
     }
@@ -428,6 +447,71 @@ pub fn sign_in_block(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     }
 }
 
+/// The browser build a server with accounts hosts, while you aren't signed in there: the whole
+/// window is its sign-in (the server's name and its ways in), and nothing else shows. True while
+/// it shows. A cached sign-in is checked with the server once (the app shows meanwhile); one the
+/// server no longer takes brings this back, as signing out does. A server without accounts (or
+/// none) has no gate.
+pub fn gate(app: &mut FigApp, ui: &mut Ui) -> bool {
+    let Some(server) = app.session.servers().first().map(|s| s.url.clone()) else { return false };
+    let ctx = ui.ctx().clone();
+    let known = info(app, &ctx, &server);
+    if known.as_ref().is_some_and(|i| !has_accounts(i)) {
+        return false;
+    }
+    if app.session.signed_in(&server).is_some() {
+        // Checked once; your files come with it.
+        ensure(app, &ctx, &server);
+        return false;
+    }
+    let t = Tokens::get(&ctx);
+    let name = server_name(app, &server);
+    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.canvas)).show(ui, |ui| {
+        let area = ui.max_rect();
+        let w = 400.0_f32.min(area.width() - 32.0);
+        let left = area.center().x - w / 2.0;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(left, area.min.y + 80.0), vec2(w, area.height() - 120.0))), |ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                egui::Frame::NONE
+                    .fill(t.panel)
+                    .stroke(egui::Stroke::new(1.0, t.border))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(28))
+                    .show(ui, |ui| {
+                        ui.set_width(w - 56.0);
+                        ui.spacing_mut().item_spacing.y = 10.0;
+                        ui.horizontal(|ui| {
+                            let (r, _) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::hover());
+                            crate::icons::paint(ui.painter(), r, Icon::Logo, ACCENT);
+                            ui.label(RichText::new("FigCraft").font(semibold(15.0)).color(t.text));
+                        });
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(&name).font(semibold(20.0)).color(t.text));
+                        if known.is_none() && app.session.waiting_for(INFO) {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Spinner::new().size(14.0));
+                                widgets::label(ui, &trf("Connecting to {server}…", &[("server", &name)]), t.text_secondary);
+                            });
+                            return;
+                        }
+                        if known.is_none() {
+                            widgets::label(ui, &trf("Couldn't reach {server}.", &[("server", &name)]), t.danger);
+                            if widgets::button(ui, tr("Try again"), true, true).clicked() {
+                                app.ui.account.of(&server).info_asked = false;
+                            }
+                            return;
+                        }
+                        widgets::label(ui, tr("Sign in to continue: your files and your team are on this server."), t.text_secondary);
+                        ui.add_space(4.0);
+                        sign_in_block(app, ui, &t, &server);
+                    });
+            });
+        });
+    });
+    true
+}
+
 /// A single sign-on button: a light surface, rounded, a plain key drawn in code (never a provider's
 /// logo) and "Sign in with …".
 fn sso_button(ui: &mut Ui, t: &Tokens, label: &str, enabled: bool) -> egui::Response {
@@ -539,13 +623,70 @@ fn subheading(ui: &mut Ui, t: &Tokens, text: &str) {
     ui.add_space(4.0);
 }
 
+/// Widest a section of a server's page gets.
+pub(crate) const SECTION_WIDTH: f32 = 720.0;
+
+/// One section of a server's page: a card with a heading, one sentence saying what it does, and
+/// `body`.
+pub(crate) fn section(ui: &mut Ui, t: &Tokens, title: &str, about: &str, body: impl FnOnce(&mut Ui)) {
+    ui.add_space(4.0);
+    egui::Frame::NONE
+        .fill(t.panel)
+        .stroke(egui::Stroke::new(1.0, t.border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(16))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width().min(SECTION_WIDTH));
+            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.label(RichText::new(title).font(semibold(13.0)).color(t.text));
+            widgets::label(ui, about, t.text_secondary);
+            ui.add_space(4.0);
+            body(ui);
+        });
+    ui.add_space(8.0);
+}
+
+/// A setting that is on or off: its title and what it does, and a switch at the right. True when
+/// it was switched.
+fn switch_row(ui: &mut Ui, t: &Tokens, on: bool, title: &str, about: &str, enabled: bool) -> bool {
+    let w = ui.available_width();
+    let galley = ui.painter().layout(about.to_string(), regular(11.0), t.text_secondary, (w - 64.0).max(80.0));
+    let h = (galley.size().y + 24.0).max(40.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, h), if enabled { Sense::click() } else { Sense::hover() });
+    a11y::checkbox(&resp, title, on);
+    if resp.hovered() && enabled {
+        ui.painter().rect_filled(rect.expand2(vec2(6.0, 2.0)), CornerRadius::same(6), t.hover);
+    }
+    let p = ui.painter();
+    p.text(rect.min + vec2(0.0, 4.0), egui::Align2::LEFT_TOP, title, semibold(12.0), if enabled { t.text } else { t.text_secondary });
+    p.galley(rect.min + vec2(0.0, 22.0), galley, t.text_secondary);
+    // The switch: a pill with a knob, the accent when on.
+    let track = Rect::from_center_size(pos2(rect.max.x - 18.0, rect.min.y + 14.0), vec2(32.0, 18.0));
+    let fill = if on && enabled {
+        ACCENT
+    } else if on {
+        t.border_strong
+    } else {
+        t.pressed
+    };
+    p.rect_filled(track, CornerRadius::same(9), fill);
+    let knob = if on { track.max.x - 9.0 } else { track.min.x + 9.0 };
+    p.circle_filled(pos2(knob, track.center().y), 7.0, egui::Color32::WHITE);
+    if resp.has_focus() {
+        p.rect_stroke(track, CornerRadius::same(9), egui::Stroke::new(2.0, t.focus), egui::StrokeKind::Outside);
+    }
+    resp.clicked()
+}
+
 /// The tabs of a server's page (with accounts, signed in).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ServerTab {
     #[default]
     Files,
     People,
-    Devices,
+    /// Signed in with a username and password: your password, devices and recovery.
+    Account,
+    Settings,
     Admin,
 }
 
@@ -554,7 +695,8 @@ impl ServerTab {
         match self {
             ServerTab::Files => tr("Files"),
             ServerTab::People => tr("People"),
-            ServerTab::Devices => tr("Account"),
+            ServerTab::Account => tr("Account"),
+            ServerTab::Settings => tr("Settings"),
             ServerTab::Admin => tr("Admin"),
         }
     }
@@ -568,9 +710,11 @@ pub fn server_name(app: &FigApp, server: &str) -> String {
 }
 
 /// The home screen's page for `server`, in `main`. A server with accounts: signing in, then tabs:
-/// Files (your files there as cards, in folders when the server keeps them, and putting an open
-/// file there), People (who is in each of your files), Devices (for sealed files) and Admin (for
-/// admins). Any server: the files you shared there from this computer.
+/// Files (your files there as cards, in folders when the server keeps them, a new file, and
+/// putting an open file there), People (who you work with there), Account (signed in with a
+/// password: your password, devices and recovery), Settings (this server and new files; devices
+/// and recovery for a single sign-on) and Admin (for admins). Any server: the files you shared
+/// there from this computer.
 pub fn page(app: &mut FigApp, ui: &mut Ui, main: Rect, t: &Tokens, server: &SavedServer) {
     let ctx = ui.ctx().clone();
     ui.painter().text(main.min, egui::Align2::LEFT_TOP, &server.name, semibold(18.0), t.text);
@@ -598,6 +742,16 @@ pub fn page(app: &mut FigApp, ui: &mut Ui, main: Rect, t: &Tokens, server: &Save
     });
 }
 
+/// You signed in to `server` with a username and password (its Account tab shows).
+fn password_sign_in(app: &FigApp, server: &str) -> bool {
+    app.session.signed_in(server).is_some_and(|m| m.password)
+}
+
+/// The server keeps sealed (end-to-end encrypted) files: devices and recovery keys matter there.
+fn sealing(app: &mut FigApp, server: &str) -> bool {
+    app.ui.account.of(server).info.as_ref().is_some_and(|i| i["e2e"].as_str().is_some_and(|m| m != "off"))
+}
+
 /// A server with accounts: the sign-in, or (signed in) who you are and the tabs.
 fn account_part(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str, links: bool) {
     let name = server_name(app, server);
@@ -621,14 +775,16 @@ fn account_part(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str, links: 
             });
         return;
     }
-    sign_in_block(app, ui, t, server);
-    let info = app.ui.account.of(server).info.clone().unwrap_or_default();
-    let sealing = info["e2e"].as_str().is_some_and(|m| m != "off");
-    let basic = info["access"].as_str().is_some_and(|a| a.contains("basic"));
+    // Behind the browser build's sign-in screen, you are always signed in here: Sign out is
+    // under Settings.
+    if !app.ui.login_gate {
+        sign_in_block(app, ui, t, server);
+    }
     let admin = app.session.signed_in(server).is_some_and(|m| m.admin);
     let tabs: Vec<ServerTab> = [ServerTab::Files, ServerTab::People]
         .into_iter()
-        .chain((sealing || basic).then_some(ServerTab::Devices))
+        .chain(password_sign_in(app, server).then_some(ServerTab::Account))
+        .chain([ServerTab::Settings])
         .chain(admin.then_some(ServerTab::Admin))
         .collect();
     let mut tab = app.ui.account.of(server).tab;
@@ -655,18 +811,82 @@ fn account_part(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str, links: 
             }
         }
         ServerTab::People => people_tab(app, ui, t, server),
-        ServerTab::Devices => {
-            if basic {
-                change_password(app, ui, t, server);
+        ServerTab::Account => account_tab(app, ui, t, server),
+        ServerTab::Settings => settings_tab(app, ui, t, server),
+        ServerTab::Admin => crate::admin_ui::tools(app, ui, t, server),
+    }
+}
+
+/// Signed in with a username and password: change it, the devices you use here, and recovering
+/// your account on a new device.
+fn account_tab(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
+    section(ui, t, tr("Change password"), tr("Choose a new password for signing in here. Your other devices stay signed in."), |ui| {
+        change_password(app, ui, t, server);
+    });
+    device_sections(app, ui, t, server);
+}
+
+/// Connected devices and Recover your account, where the server keeps encrypted files: on the
+/// Account tab, or on Settings for a single sign-on.
+fn device_sections(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
+    if !sealing(app, server) {
+        return;
+    }
+    section(
+        ui,
+        t,
+        tr("Connected devices"),
+        tr("The devices that open your encrypted files on this server. Revoke one you no longer use or have lost: its keys stop working."),
+        |ui| connected_devices(app, ui, t, server),
+    );
+    section(
+        ui,
+        t,
+        tr("Recover your account"),
+        tr("A recovery key lets a new device into your encrypted files when none of your other devices is at hand."),
+        |ui| recover_account(app, ui, t, server),
+    );
+}
+
+/// This server and new files: the + tab and Save put new files here; the home screen opens on
+/// this server's page (desktop). For a single sign-on, the devices and recovery too.
+fn settings_tab(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
+    let name = server_name(app, server);
+    let key = figcraft_engine::accounts::server_key(server);
+    let in_list = app.session.servers().iter().any(|s| s.url == key);
+    section(ui, t, tr("This server"), tr("How FigCraft uses this server on this computer."), |ui| {
+        let default = app.session.default_server().as_deref() == Some(key.as_str());
+        let about = trf("The + tab and Save put new files at the top of {server}, instead of on this computer.", &[("server", &name)]);
+        if switch_row(ui, t, default, tr("Use this server for new files"), &about, in_list) {
+            app.run("servers.setDefault", json!({"url": key, "on": !default}));
+        }
+        if !cfg!(target_arch = "wasm32") {
+            ui.add_space(4.0);
+            let start = app.session.start_home_server().as_deref() == Some(key.as_str());
+            let about = trf("FigCraft opens on the home page of {server} instead of your recent files.", &[("server", &name)]);
+            if switch_row(ui, t, start, tr("Open this server's home when FigCraft starts"), &about, in_list) {
+                app.run("servers.setStartHome", json!({"url": key, "on": !start}));
             }
-            devices(app, ui, t, server);
         }
-        ServerTab::Admin => {
-            ui.scope(|ui| {
-                ui.set_max_width(900.0);
-                crate::admin_ui::tools(app, ui, t, server);
-            });
+        if !in_list {
+            widgets::label(ui, tr("Add this server in Preferences ▸ Servers to use these."), t.text_secondary);
         }
+    });
+    // Signed in another way than a password: devices and recovery live here.
+    if !password_sign_in(app, server) {
+        device_sections(app, ui, t, server);
+    }
+    // Behind the browser build's sign-in screen: who you are, and signing out back to it.
+    if app.ui.login_gate
+        && let Some(me) = app.session.signed_in(server).cloned()
+    {
+        let who = trf("Signed in as {name}", &[("name", &person_name(&me.name, me.email.as_deref()))]);
+        section(ui, t, tr("Signing in"), &who, |ui| {
+            if widgets::button(ui, tr("Sign out"), false, !app.session.waiting_for(SIGN_OUT)).clicked() {
+                let ctx = ui.ctx().clone();
+                app.run_background(&ctx, SIGN_OUT, json!({"server": server}), Box::new(|app, _, _| app.toast(tr("Signed out"))));
+            }
+        });
     }
 }
 
@@ -718,10 +938,6 @@ fn files_tab(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
         .iter()
         .filter_map(|f| f.as_str().map(str::to_string))
         .collect();
-    if browse.is_some() && list.is_empty() && all.is_empty() {
-        widgets::label(ui, tr("No files here yet. Put an open file here, or open one someone invited you to."), t.text_secondary);
-        return;
-    }
     let folder_of = |f: &Value| f["folder"].as_str().unwrap_or_default().trim_matches('/').to_string();
     let mut open = None;
     // The folder you are in, and the way back up.
@@ -738,6 +954,20 @@ fn files_tab(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
             }
         }
     });
+    // A new file here: at the top, or in the folder you are in.
+    ui.add_space(6.0);
+    let about = if here.is_empty() { tr("Start from a blank canvas") } else { tr("Start from a blank canvas in this folder") };
+    if crate::home::action_card(ui, t, Icon::Plus, tr("New design file"), about)
+        && app.run(NEW_FILE, json!({"server": server, "folder": here, "name": tr("Untitled")})).is_some()
+    {
+        app.ui.home = false;
+        // It shows in the list once it is there.
+        app.ui.account.of(server).files_stale = true;
+    }
+    if browse.is_some() && list.is_empty() && all.is_empty() {
+        widgets::label(ui, tr("No files here yet: make one, or put an open file here."), t.text_secondary);
+        return;
+    }
     if here.is_empty() {
         // The server's order: what you opened or changed last first.
         let ids: Vec<String> = browse
@@ -917,12 +1147,6 @@ fn cards(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str, files: &[Value
                         chosen = Some(id.to_string());
                         ui.close();
                     }
-                    if crate::right::menu_item(ui, tr("People…"), "") {
-                        let st = app.ui.account.of(server);
-                        st.tab = ServerTab::People;
-                        st.people = Some((id.to_string(), Value::Null));
-                        ui.close();
-                    }
                     let current = f["folder"].as_str().unwrap_or_default().trim_matches('/').to_string();
                     let mut moved = None;
                     if !current.is_empty() && crate::right::menu_item(ui, tr("Move to All files"), "") {
@@ -948,14 +1172,13 @@ fn cards(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str, files: &[Value
 /// Changing your password, on a server where you sign in with one.
 fn change_password(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     let ctx = ui.ctx().clone();
-    subheading(ui, t, tr("Password"));
     let (old, new) = &mut app.ui.account.change;
     let a = ui.add(
-        egui::TextEdit::singleline(old).password(true).hint_text(tr("Current password")).desired_width(220.0).id(egui::Id::new(("pw_old", server))),
+        egui::TextEdit::singleline(old).password(true).hint_text(tr("Current password")).desired_width(240.0).id(egui::Id::new(("pw_old", server))),
     );
     a11y::text(&a, tr("Current password"), "");
     let b = ui
-        .add(egui::TextEdit::singleline(new).password(true).hint_text(tr("New password")).desired_width(220.0).id(egui::Id::new(("pw_new", server))));
+        .add(egui::TextEdit::singleline(new).password(true).hint_text(tr("New password")).desired_width(240.0).id(egui::Id::new(("pw_new", server))));
     a11y::text(&b, tr("New password"), "");
     let ready = !old.is_empty() && new.chars().count() >= 10;
     widgets::label(ui, tr("At least 10 characters, not your username."), t.text_secondary);
@@ -968,7 +1191,6 @@ fn change_password(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
             Box::new(|app, _, _| app.toast(tr("Password changed"))),
         );
     }
-    subheading(ui, t, tr("Devices"));
 }
 
 /// People whose devices changed on `server` since this app last saw them (`account.status` ›
@@ -988,11 +1210,10 @@ fn key_changes(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
         .account
         .servers
         .get(server)
-        .and_then(|st| st.people.as_ref())
-        .and_then(|(_, v)| v["members"].as_array().cloned())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|m| Some((m["account"].as_str()?.to_string(), m["name"].as_str()?.to_string())))
+        .into_iter()
+        .flat_map(|st| st.members.values())
+        .flat_map(|v| v["members"].as_array().cloned().unwrap_or_default())
+        .filter_map(|m| Some((m["account"].as_str()?.to_string(), person_name(m["name"].as_str()?, m["email"].as_str()))))
         .collect();
     for c in changes {
         let account = c["account"].as_str().unwrap_or_default().to_string();
@@ -1027,47 +1248,136 @@ fn key_changes(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     }
 }
 
-/// Who is in each of your files on `server`: a row per file; its people open under it.
+/// How a person shows: their name, never an email (a name that is an email, or none, shows the
+/// part of the email before the @, in words).
+pub(crate) fn person_name(name: &str, email: Option<&str>) -> String {
+    let name = name.trim();
+    if !name.is_empty() && !name.contains('@') {
+        return name.to_string();
+    }
+    let from = if name.contains('@') { name } else { email.unwrap_or_default() };
+    let local = from.split('@').next().unwrap_or_default();
+    let words: Vec<String> = local
+        .split(['.', '_', '-', '+'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+        })
+        .collect();
+    if words.is_empty() { tr("Someone").to_string() } else { words.join(" ") }
+}
+
+/// A person's colour: the same every time for the same account.
+pub(crate) fn person_color(account: &str) -> egui::Color32 {
+    let h = account.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
+    crate::live::people(h)
+}
+
+/// A person's picture in a circle of radius `r` at `center` (`account.avatar`, asked once where
+/// the app has the command), else their initials in their colour.
+pub(crate) fn person_avatar(app: &mut FigApp, ui: &Ui, server: &str, account: &str, name: &str, center: egui::Pos2, r: f32) {
+    let key = (server.to_string(), account.to_string());
+    if !app.ui.account.avatars.contains_key(&key) && figcraft_engine::find_command(AVATAR).is_some() && !app.session.waiting_for(AVATAR) {
+        app.ui.account.avatars.insert(key.clone(), None);
+        let at = key.clone();
+        app.run_background(
+            ui.ctx(),
+            AVATAR,
+            json!({"server": server, "account": account}),
+            Box::new(move |app, ctx, v| {
+                let texture = v["data"].as_str().and_then(|b| {
+                    use base64::Engine as _;
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(b).ok()?;
+                    let image = image::load_from_memory(&bytes).ok()?.thumbnail(96, 96).to_rgba8();
+                    let size = [image.width() as usize, image.height() as usize];
+                    let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+                    Some(ctx.load_texture(format!("avatar-{}-{}", at.0, at.1), color, egui::TextureOptions::LINEAR))
+                });
+                app.ui.account.avatars.insert(at, texture);
+            }),
+        );
+    }
+    let rect = Rect::from_center_size(center, vec2(2.0 * r, 2.0 * r));
+    match app.ui.account.avatars.get(&key).cloned().flatten() {
+        Some(texture) => {
+            egui::Image::from_texture(&texture).corner_radius(CornerRadius::same(r.min(127.0) as u8)).paint_at(ui, rect);
+        }
+        None => crate::live::avatar(ui.painter(), center, r, name, person_color(account)),
+    }
+}
+
+/// Who you work with on `server`: everyone in your files there, each with their picture or
+/// initials and their name, and how many of your files they are in.
 fn people_tab(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
+    let ctx = ui.ctx().clone();
     key_changes(app, ui, t, server);
     let files = app.ui.account.of(server).files.clone();
     let list = files.as_ref().and_then(|f| f["files"].as_array().cloned()).unwrap_or_default();
     if list.is_empty() {
-        widgets::label(ui, tr("No files here yet. Put an open file here, or open one someone invited you to."), t.text_secondary);
+        widgets::label(ui, tr("Nobody yet: the people in your files on this server show here."), t.text_secondary);
         return;
     }
-    ui.scope(|ui| {
-        ui.set_max_width(720.0);
-        for f in &list {
-            let (id, name) = (f["file"].as_str().unwrap_or_default(), f["name"].as_str().unwrap_or_default());
-            let open = app.ui.account.of(server).people.as_ref().is_some_and(|(f, _)| f == id);
-            let detail = role_label(f["role"].as_str().unwrap_or_default());
-            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::hover());
-            let resp = ui.interact(r, ui.id().with(("people_file", id)), Sense::click());
-            a11y::button(&resp, name);
-            let row = FileRow { mark: Some((Icon::LiveShared, ACCENT)), name, ink: t.text, detail, detail_size: 11.0, detail_ink: t.text_secondary };
-            file_row(ui, t, r, &resp, &row);
-            if resp.clicked() {
-                app.ui.account.of(server).people = if open { None } else { Some((id.to_string(), Value::Null)) };
-                app.ui.account.role_edit = None;
-            }
-            if open {
-                ui.indent(("people_of", id), |ui| people_block(app, ui, t, (server, id), false));
-            }
+    // Each file's people, asked one at a time.
+    let missing = list.iter().filter_map(|f| f["file"].as_str()).find(|id| !app.ui.account.of(server).members.contains_key(*id)).map(str::to_string);
+    if let Some(file) = missing.filter(|_| !app.session.waiting_for(MEMBERS)) {
+        app.ui.account.of(server).members.insert(file.clone(), Value::Null);
+        let at = server.to_string();
+        app.run_background(
+            &ctx,
+            MEMBERS,
+            json!({"server": server, "file": file}),
+            Box::new(move |app, _, v| {
+                app.ui.account.of(&at).members.insert(file, v);
+            }),
+        );
+    }
+    let loading = app.session.waiting_for(MEMBERS);
+    let me = app.session.signed_in(server).map(|m| m.account.clone()).unwrap_or_default();
+    // Everyone, by account: their name and the files they are in.
+    let mut people: BTreeMap<String, (String, usize)> = BTreeMap::new();
+    for v in app.ui.account.of(server).members.values() {
+        for m in v["members"].as_array().into_iter().flatten() {
+            let account = m["account"].as_str().unwrap_or_default().to_string();
+            let name = person_name(m["name"].as_str().unwrap_or_default(), m["email"].as_str());
+            people.entry(account).or_insert((name, 0)).1 += 1;
+        }
+    }
+    let mut order: Vec<(String, (String, usize))> = people.into_iter().collect();
+    // You first, then by name.
+    order.sort_by(|a, b| (a.0 != me).cmp(&(b.0 != me)).then_with(|| a.1.0.to_lowercase().cmp(&b.1.0.to_lowercase())));
+    ui.horizontal(|ui| {
+        widgets::label(ui, &crate::i18n::trn("{n} people in your files here", order.len(), &[]), t.text_secondary);
+        if loading {
+            ui.add(egui::Spinner::new().size(12.0));
+        } else if ui.link(tr("Refresh")).clicked() {
+            app.ui.account.of(server).members.clear();
+        }
+    });
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(12.0, 12.0);
+        for (account, (name, n)) in &order {
+            let (rect, resp) = ui.allocate_exact_size(vec2(240.0, 60.0), Sense::hover());
+            let shown = if *account == me { trf("{name} (you)", &[("name", name)]) } else { name.clone() };
+            a11y::status(&resp, &shown, "");
+            let p = ui.painter();
+            p.rect_filled(rect, CornerRadius::same(8), t.panel);
+            p.rect_stroke(rect, CornerRadius::same(8), egui::Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+            person_avatar(app, ui, server, account, name, pos2(rect.min.x + 30.0, rect.center().y), 18.0);
+            let w = rect.width() - 70.0;
+            let line = widgets::elide_font(ui, &shown, w, semibold(12.0));
+            ui.painter().text(pos2(rect.min.x + 58.0, rect.center().y - 8.0), egui::Align2::LEFT_CENTER, line, semibold(12.0), t.text);
+            let detail = crate::i18n::trn("In {n} of your files", *n, &[]);
+            ui.painter().text(pos2(rect.min.x + 58.0, rect.center().y + 9.0), egui::Align2::LEFT_CENTER, detail, regular(11.0), t.text_secondary);
         }
     });
 }
 
-/// Your devices on `server` (for end-to-end encrypted files): this one, the others and your
-/// recovery key, each revocable; making a recovery key (shown once), and using one on a device
-/// that has no access yet.
-fn devices(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
+/// Your devices on `server` (for end-to-end encrypted files): this one marked, the others and
+/// your recovery key, each revocable.
+fn connected_devices(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     let ctx = ui.ctx().clone();
-    // Only a server that keeps sealed files has devices.
-    let sealing = app.ui.account.of(server).info.as_ref().is_some_and(|i| i["e2e"].as_str().is_some_and(|m| m != "off"));
-    if !sealing {
-        return;
-    }
     let st = app.ui.account.of(server);
     let (list, asked) = (st.devices.clone(), st.devices_asked);
     if list.is_none() && !asked && !app.session.waiting_for(DEVICES) {
@@ -1076,7 +1386,10 @@ fn devices(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     }
     let Some(v) = list else {
         if app.session.waiting_for(DEVICES) {
-            widgets::label(ui, tr("Asking the server…"), t.text_secondary);
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(12.0));
+                widgets::label(ui, tr("Asking the server…"), t.text_secondary);
+            });
         } else if asked {
             // It failed (the reason was shown): ask again on request.
             ui.horizontal(|ui| {
@@ -1099,14 +1412,22 @@ fn devices(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
     let mut revoke = None;
     for d in v["devices"].as_array().cloned().unwrap_or_default() {
         let id = d["id"].as_str().unwrap_or_default().to_string();
-        let name = if d["recovery"] == true { tr("Recovery key").to_string() } else { d["name"].as_str().unwrap_or_default().to_string() };
+        let recovery = d["recovery"] == true;
+        let name = if recovery { tr("Recovery key").to_string() } else { d["name"].as_str().unwrap_or_default().to_string() };
         let seen = figcraft_engine::live::utc_date(d["seen"].as_u64().unwrap_or(0));
         let day = seen.get(..10).unwrap_or(&seen).to_string();
+        let this = d["thisDevice"] == true;
         ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+            crate::icons::paint(ui.painter(), r.shrink(2.0), if recovery { Icon::Lock } else { Icon::Online }, if this { ACCENT } else { t.icon });
             ui.scope(|ui| {
-                ui.set_width(300.0);
-                let label = if d["thisDevice"] == true { trf("{name} (this device)", &[("name", &name)]) } else { name.clone() };
-                widgets::label(ui, &label, t.text);
+                ui.set_width(280.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&name).font(regular(12.0)).color(t.text));
+                    if this {
+                        ui.label(RichText::new(tr("This device")).font(semibold(10.0)).color(ACCENT));
+                    }
+                });
             });
             ui.scope(|ui| {
                 ui.set_width(150.0);
@@ -1132,25 +1453,40 @@ fn devices(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
             }),
         );
     }
+}
+
+/// Making a recovery key (shown once, with Copy and a confirmation), and using one on a device
+/// that has no access yet.
+fn recover_account(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
+    let ctx = ui.ctx().clone();
+    let busy = DEVICE_CHANGES.iter().any(|c| app.session.waiting_for(c));
     // A recovery key just made: shown this once.
     if let Some(key) = app.ui.account.of(server).recovery_key.clone() {
         egui::Frame::NONE.fill(t.field).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
             widgets::label(ui, tr("Your recovery key. Write it down or keep it in a password manager: it is shown only this once."), t.text);
-            ui.label(RichText::new(&key).font(egui::FontId::monospace(14.0)).color(t.text));
             ui.horizontal(|ui| {
+                ui.label(RichText::new(&key).font(egui::FontId::monospace(14.0)).color(t.text));
                 if widgets::button(ui, tr("Copy"), false, true).clicked() {
                     app.services.clipboard_set_text(&key);
                     app.toast(tr("Recovery key copied"));
                 }
-                if widgets::button(ui, tr("I saved it"), true, true).clicked() {
-                    app.ui.account.of(server).recovery_key = None;
-                }
             });
+            let saved = app.ui.account.of(server).recovery_saved;
+            if widgets::checkbox(ui, saved, tr("I saved my recovery key somewhere safe")) {
+                app.ui.account.of(server).recovery_saved = !saved;
+            }
+            if widgets::button(ui, tr("Done"), true, saved).clicked() {
+                let st = app.ui.account.of(server);
+                st.recovery_key = None;
+                st.recovery_saved = false;
+            }
         });
         return;
     }
-    let hint = tr("Lets a new device into your encrypted files when no other device is at hand");
-    if widgets::button(ui, tr("Make a recovery key"), false, !busy).on_hover_text(hint).clicked() {
+    ui.label(RichText::new(tr("Make a recovery key")).font(semibold(12.0)).color(t.text));
+    widgets::label(ui, tr("Make one now, while this device opens your files, and keep it somewhere safe."), t.text_secondary);
+    if widgets::button(ui, tr("Make a recovery key"), false, !busy).clicked() {
         let at = server.to_string();
         app.run_background(
             &ctx,
@@ -1165,18 +1501,20 @@ fn devices(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str) {
             }),
         );
     }
+    ui.add_space(8.0);
+    ui.label(RichText::new(tr("Use a recovery key")).font(semibold(12.0)).color(t.text));
+    widgets::label(ui, tr("On a new device: enter your recovery key to open your encrypted files here."), t.text_secondary);
     ui.horizontal(|ui| {
         let field = ui.add(
             egui::TextEdit::singleline(&mut app.ui.account.recovery_typed)
                 .password(true)
                 .hint_text(tr("Recovery key"))
-                .desired_width(220.0)
+                .desired_width(240.0)
                 .id(egui::Id::new(("recovery_key", server))),
         );
         a11y::text(&field, tr("Recovery key"), "");
         let filled = !app.ui.account.recovery_typed.trim().is_empty();
-        let hint = tr("On a device without access to your encrypted files");
-        if widgets::button(ui, tr("Use a recovery key"), false, filled && !busy).on_hover_text(hint).clicked() {
+        if widgets::button(ui, tr("Use a recovery key"), false, filled && !busy).clicked() {
             let key = std::mem::take(&mut app.ui.account.recovery_typed);
             app.run_background(
                 &ctx,
@@ -1260,150 +1598,6 @@ fn put_here(app: &mut FigApp, ui: &mut Ui, t: &Tokens, server: &str, accounts: b
     }
 }
 
-/// The people of `file` (server, id): members and their roles, invites; owners change roles,
-/// remove people and invite by email. `front`: the file in front (the Share popover); else one
-/// named on a server's page.
-pub fn people_block(app: &mut FigApp, ui: &mut Ui, t: &Tokens, (server, file): (&str, &str), front: bool) {
-    let ctx = ui.ctx().clone();
-    let key = (server.to_string(), file.to_string());
-    let params = if front { json!({}) } else { json!({"server": server, "file": file}) };
-    let shown = if front {
-        app.ui.account.popover_people.as_ref().filter(|(k, _)| *k == key).map(|(_, v)| v.clone())
-    } else {
-        app.ui.account.of(server).people.as_ref().filter(|(f, v)| f == file && !v.is_null()).map(|(_, v)| v.clone())
-    };
-    if shown.is_none() && !app.session.waiting_for(MEMBERS) {
-        load_people(app, &ctx, key.clone(), params.clone(), front);
-    }
-    let Some(v) = shown else {
-        widgets::label(ui, tr("Asking the server…"), t.text_secondary);
-        return;
-    };
-    let me = app.session.signed_in(server).map(|m| m.account.clone()).unwrap_or_default();
-    let members = v["members"].as_array().cloned().unwrap_or_default();
-    let owner = members.iter().any(|m| m["account"] == me.as_str() && m["role"] == "owner");
-    let busy = PEOPLE_CHANGE.iter().any(|c| app.session.waiting_for(c));
-    let mut change: Option<(&str, Value)> = None;
-    let with = |mut v: Value| {
-        if let (Some(o), Some(p)) = (v.as_object_mut(), params.as_object()) {
-            o.extend(p.clone());
-        }
-        v
-    };
-    for m in &members {
-        let account = m["account"].as_str().unwrap_or_default().to_string();
-        let role = m["role"].as_str().unwrap_or("editor");
-        let name = m["name"].as_str().unwrap_or_default();
-        let shown = if account == me { trf("{name} (you)", &[("name", &name)]) } else { name.to_string() };
-        let editing = app.ui.account.role_edit.as_deref() == Some(account.as_str());
-        ui.horizontal(|ui| {
-            let w = (ui.available_width() - 74.0).min(320.0);
-            let line = widgets::elide(ui, &shown, w);
-            let r = ui.allocate_exact_size(vec2(w, 22.0), Sense::hover()).0;
-            ui.painter().text(pos2(r.min.x, r.center().y), egui::Align2::LEFT_CENTER, line, regular(11.0), t.text);
-            if let Some(email) = m["email"].as_str() {
-                ui.interact(r, ui.id().with(("member", &account)), Sense::hover()).on_hover_text(email);
-            }
-            if owner && account != me {
-                if widgets::button(ui, role_label(role), false, !busy).on_hover_text(tr("Change role or remove")).clicked() {
-                    app.ui.account.role_edit = if editing { None } else { Some(account.clone()) };
-                }
-            } else {
-                widgets::label(ui, role_label(role), t.text_secondary);
-            }
-        });
-        if editing {
-            ui.horizontal(|ui| {
-                let labels: Vec<&str> = ROLES.iter().map(|r| role_label(r)).collect();
-                let at = ROLES.iter().position(|r| *r == role).unwrap_or(0);
-                if let Some(i) = widgets::segmented_text(ui, &labels, at)
-                    && i != at
-                {
-                    change = Some(("collab.setRole", with(json!({"account": account, "role": ROLES.get(i).copied().unwrap_or("editor")}))));
-                }
-                if widgets::button(ui, tr("Remove"), false, true).on_hover_text(tr("Takes them out of the file at once")).clicked() {
-                    change = Some(("collab.removeMember", with(json!({"account": account}))));
-                }
-            });
-        }
-    }
-    for i in v["invited"].as_array().cloned().unwrap_or_default() {
-        let email = i["email"].as_str().unwrap_or_default().to_string();
-        ui.horizontal(|ui| {
-            let line = trf("{email} · invited", &[("email", &email)]);
-            widgets::label(ui, &widgets::elide(ui, &line, (ui.available_width() - 80.0).min(320.0)), t.text_secondary);
-            if owner && widgets::button(ui, tr("Take back"), false, !busy).clicked() {
-                change = Some(("collab.removeMember", with(json!({"email": email}))));
-            }
-        });
-    }
-    if owner {
-        ui.horizontal(|ui| {
-            let resp = widgets::text_input(ui, egui::Id::new(("people_invite", file)), &mut app.ui.account.invite_email, 196.0, tr("Email"));
-            a11y::text(&resp, tr("Invite by email"), &app.ui.account.invite_email);
-            let filled = app.ui.account.invite_email.contains('@');
-            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (widgets::button(ui, tr("Invite"), true, filled && !busy).clicked() || enter) && filled {
-                let role = ROLES.get(app.ui.account.invite_role).copied().unwrap_or("editor");
-                change = Some(("collab.invite", with(json!({"email": app.ui.account.invite_email.trim(), "role": role}))));
-            }
-        });
-        ui.scope(|ui| {
-            ui.set_max_width(300.0);
-            let labels: Vec<&str> = ROLES.iter().map(|r| role_label(r)).collect();
-            if let Some(i) = widgets::segmented_text(ui, &labels, app.ui.account.invite_role) {
-                app.ui.account.invite_role = i;
-            }
-        });
-    }
-    if let Some((cmd, p)) = change {
-        let invite = cmd == "collab.invite";
-        app.ui.account.role_edit = None;
-        app.run_background(
-            &ctx,
-            cmd,
-            p,
-            Box::new(move |app, ctx, _| {
-                if invite {
-                    app.ui.account.invite_email.clear();
-                    app.toast(tr("Invited"));
-                }
-                load_people(app, ctx, key, params, front);
-            }),
-        );
-    }
-}
-
-fn load_people(app: &mut FigApp, ctx: &Context, key: (String, String), params: Value, front: bool) {
-    app.run_background(
-        ctx,
-        MEMBERS,
-        params,
-        Box::new(move |app, _, v| {
-            if front {
-                app.ui.account.popover_people = Some((key, v));
-            } else if let Some(st) = app.ui.account.servers.get_mut(&key.0)
-                && st.people.as_ref().is_some_and(|(f, _)| *f == key.1)
-            {
-                st.people = Some((key.1, v));
-            }
-        }),
-    );
-}
-
-/// The Share popover's People: for the file in front on a server where you are signed in, who is
-/// in it (asked again when the popover shows after a gap). Nothing for other files.
-pub fn people_section(app: &mut FigApp, ui: &mut Ui, t: &Tokens) {
-    let Some((server, file)) = app.session.people_file() else { return };
-    let frame = ui.ctx().cumulative_frame_nr();
-    if app.ui.account.people_drawn.replace(frame).is_none_or(|d| d.saturating_add(1) < frame) {
-        app.ui.account.popover_people = None;
-    }
-    ui.separator();
-    ui.label(RichText::new(tr("People")).font(semibold(12.0)).color(t.text));
-    people_block(app, ui, t, (&server, &file), true);
-}
-
 /// What `ui.inspect` says about servers and accounts (never a token).
 pub fn inspect(app: &FigApp) -> Value {
     let pending = match &app.session.accounts.pending {
@@ -1428,6 +1622,5 @@ pub fn inspect(app: &FigApp) -> Value {
         "servers": servers,
         "pending": pending,
         "signInWindow": app.ui.account.window.as_ref().map(|(s, _)| s.clone()),
-        "people": app.ui.account.popover_people.as_ref().map(|(_, v)| v["members"].as_array().map_or(0, Vec::len)),
     })
 }
