@@ -62,15 +62,16 @@ you turned accounts on are in the same position.
 - **The server must be able to reach the provider over HTTPS.** It fetches the issuer's discovery
   document and keys, and exchanges sign-in codes, itself. The systemd unit shipped in
   `packaging/server/figcraft-server.service` allows network only to this machine
-  (`IPAddressAllow=localhost`, `IPAddressDeny=any`), which blocks that. With an OpenID Connect
-  issuer elsewhere, lift it with a drop-in (an `external` verifier on the same machine needs no
-  change):
+  (`IPAddressAllow=localhost`, `IPAddressDeny=any`) as long as there are no accounts. **After
+  setting `auth.mode`, run `install.sh` again** (with the same options): it sees accounts in
+  `server.toml` and writes the drop-in
+  `/etc/systemd/system/figcraft-server.service.d/outbound.conf`, which clears both settings and
+  restarts the server (it removes the drop-in again if you turn accounts off). Without
+  `install.sh`, write the same drop-in yourself:
 
   ```sh
   sudo systemctl edit figcraft-server
   ```
-
-  and add
 
   ```ini
   [Service]
@@ -79,10 +80,27 @@ you turned accounts on are in the same position.
   ```
 
   (an empty value clears the list). Any outbound firewall must let the server reach the issuer on
-  port 443.
+  port 443. A sign-in that fails with `Operation not permitted` in the log means the limit is still
+  in place.
 - The server checks the provider's certificate against Mozilla's list of root authorities built
-  into it, so the issuer (or verifier) needs a certificate from a public authority such as Let's
-  Encrypt. A verifier on the same machine can use plain `http://127.0.0.1:…` instead.
+  into it, so an issuer (or verifier) with a certificate from a public authority such as Let's
+  Encrypt just works. For an issuer behind a **private authority** (a company CA), give the server
+  that authority's certificate as a PEM file in `FIGCRAFT_CA_FILE`, as for the app; it is trusted
+  in addition to the built-in list:
+
+  ```sh
+  sudo install -m 644 company-ca.pem /etc/figcraft-server/ca.pem
+  sudo systemctl edit figcraft-server     # add the two lines below
+  ```
+
+  ```ini
+  [Service]
+  Environment=FIGCRAFT_CA_FILE=/etc/figcraft-server/ca.pem
+  ```
+
+  (In Docker: `-e FIGCRAFT_CA_FILE=/ca.pem -v /etc/figcraft-server/ca.pem:/ca.pem:ro`.) A file the
+  server can't read, or one without a certificate, stops it at startup with the reason. A verifier
+  on the same machine can use plain `http://127.0.0.1:…` instead.
 - The server's clock must be right (`timedatectl` shows whether it is synchronised): sign-ins are
   checked against their expiry with 120 seconds of leeway.
 
@@ -108,7 +126,8 @@ hands it to the server; the server exchanges it, checks the ID token (its signat
 issuer's published keys, issuer, audience, expiry) and keeps the client secret, which never leaves
 the server. So you register a **desktop (native) application** with the issuer, one that allows a
 loopback redirect on any port. The device flow (a code typed on another device, for
-`figcraft-cli` and agents) is offered when you ask for it and the issuer has a device endpoint.
+`figcraft-cli` and agents) is offered only when `flows` lists `"device"`, and needs the issuer's
+device endpoint.
 
 **External verifier** (`external`): people paste a token (a password, an API key, a one-time code
 from your SSO); the server POSTs it to your `verify_url` and your service answers who it is. Any
@@ -149,7 +168,9 @@ fn main() -> Result<(), String> {
 `kind = "directory"` in `[[auth.provider]]` then builds it. A factory gets that provider's settings
 (the same keys as below: unknown keys are still errors, so reuse `verify_url`, `issuer`,
 `client_id` and the others) and the server's HTTPS client. Methods it doesn't implement answer
-`AuthError::Unsupported`.
+`AuthError::Unsupported`. A factory must not use the network while building (only when the
+provider is used): settings are checked by building every provider with a client that refuses all
+requests (`Registry::check`, which `Config::check_with(&registry)` runs).
 
 ## Step by step
 
@@ -161,6 +182,9 @@ sudo -u figcraft figcraft-server --config /etc/figcraft-server/server.toml check
 sudo systemctl restart figcraft-server
 journalctl -u figcraft-server -n 20
 ```
+
+The first time you turn accounts on, run `install.sh` again instead of the restart (or add the
+drop-in by hand), so the server may reach the provider: see [Before you start](#before-you-start).
 
 Keep secrets out of `server.toml` (which is readable by everyone on the machine): write them to a
 file only the server can read and name it with `client_secret_file`:
@@ -243,7 +267,7 @@ authorization code flow with PKCE and accepts a loopback redirect on any port
 (`http://127.0.0.1/`; RFC 8252), note its client ID (and secret, if it has one), and give the
 server the issuer URL: the address whose `/.well-known/openid-configuration` describes it, which
 must name the same issuer. The ID token must carry `email` and `email_verified` for allow-lists and
-admins to work. Notes per issuer:
+admins to work (or see `trust_email` below). Notes per issuer:
 
 - **Authentik**: an *OAuth2/OpenID Provider* with client type *Public* (or *Confidential* with a
   secret) and an application using it. The issuer is
@@ -253,10 +277,15 @@ admins to work. Notes per issuer:
   **Allow public client flows** on for the device flow. Use **your tenant's issuer**,
   `https://login.microsoftonline.com/<tenant id>/v2.0`. The multi-tenant `common` and
   `organizations` endpoints don't work: their tokens' issuer names each person's own tenant, so it
-  never matches the discovery document's. Entra's ID tokens don't include `email_verified`, so the
-  server treats their emails as unverified: allow-lists and `admins` don't match anyone. Limit who
-  signs in in Entra itself (a single-tenant app, with **Assignment required** on its enterprise
-  application) and leave `allow_emails` and `allow_domains` empty.
+  never matches the discovery document's. Entra's ID tokens don't include `email_verified`, so by
+  default the server treats their emails as unverified: allow-lists, `admins` and invites don't
+  match anyone. With a **single-tenant** app on your own tenant, set `trust_email = true` on the
+  provider: its emails then count as verified. Only do that when every account in the tenant is
+  yours (Entra lets an account's email be set to an address that wasn't checked, so on a tenant you
+  don't fully control someone could claim another person's address and pass the allow-lists or
+  become an admin). Either way, also limit who signs in in Entra itself (**Assignment required** on
+  its enterprise application). Ask for the `email` claim if your tokens lack it (**Token
+  configuration ▸ Add optional claim ▸ ID ▸ email**).
 - **Okta**: an *OIDC* app integration of type *Native Application* with *Authorization Code* (and
   *Device Authorization* if wanted), *Require PKCE*, and a loopback sign-in redirect URI. The issuer
   is your authorization server: `https://<org>.okta.com/oauth2/default` (or
@@ -281,6 +310,7 @@ label = "Microsoft"
 issuer = "https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0"
 client_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 flows = ["browser", "device"]
+trust_email = true                # single-tenant only: Entra sends no email_verified
 ```
 
 ### An external verifier
@@ -299,66 +329,18 @@ anything else, or no answer in 15 seconds: the verifier is unavailable
 ```
 
 - `subject` must never change for a person and never be reused: memberships hang on it.
-- `email` counts for allow-lists, admins and invites only with `"email_verified": true`.
+- `email` counts for allow-lists, admins and invites only with `"email_verified": true` (or, when
+  your verifier only ever answers with checked emails, set `trust_email = true` on the provider:
+  an answer without `email_verified` then counts as verified).
 - The server sends tokens of up to 8 KiB, reads answers of up to 1 MiB, and shows people at most 200
   characters of `error`.
 - `verify_url` is `https://…`, or `http://127.0.0.1:…`, `http://localhost:…` or `http://[::1]:…`
   for a verifier on the same machine (allowed by the shipped systemd unit as is).
 
-An **example** verifier (Python 3, standard library only) that knows a fixed list of tokens by
-their SHA-256: a starting point, not something to run as is.
-
-```python
-#!/usr/bin/env python3
-# EXAMPLE ONLY: a verifier for figcraft-server's `external` provider. It knows a fixed list of
-# tokens (by their SHA-256) and answers who each one is. Replace the lookup with your own.
-import hashlib
-import hmac
-import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-# SHA-256 (hex) of each token you handed out -> who it is.
-# Make a token:  python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
-# Its hash:      printf %s 'THE-TOKEN' | sha256sum
-PEOPLE = {
-    "0000000000000000000000000000000000000000000000000000000000000000": {
-        "subject": "ann", "email": "ann@example.com", "email_verified": True, "name": "Ann",
-    },
-}
-
-
-class Verify(BaseHTTPRequestHandler):
-    def do_POST(self):
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 16384:
-                raise ValueError("size")
-            token = str(json.loads(self.rfile.read(length)).get("token", ""))
-        except (ValueError, AttributeError):
-            return self.answer(400, {"error": "bad request"})
-        digest = hashlib.sha256(token.encode()).hexdigest()
-        who = None
-        for known, person in PEOPLE.items():
-            if hmac.compare_digest(known, digest):
-                who = person
-        if who is None:
-            return self.answer(401, {"error": "that token isn't valid"})
-        self.answer(200, who)
-
-    def answer(self, status, body):
-        data = json.dumps(body).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def log_message(self, *args):
-        pass  # don't log requests (they hold tokens)
-
-
-ThreadingHTTPServer(("127.0.0.1", 8787), Verify).serve_forever()
-```
+An **example** verifier (Python 3, standard library only) is in
+[`examples/auth-verifier/`](../examples/auth-verifier/): it knows a fixed list of tokens by their
+SHA-256, a starting point to replace with a question to your own directory, not something to run as
+is. Its README shows how to make tokens and try it by hand.
 
 ```toml
 [[auth.provider]]
@@ -405,21 +387,31 @@ client_secret_file = "/etc/figcraft-server/google.secret"  # or client_secret = 
 scopes = ["openid", "email", "profile"]   # the default; must include "openid"
 params = [["prompt", "select_account"]]   # default none: extra parameters for the sign-in page
 flows = ["browser"]                 # default ["browser"]; "device" adds the device flow
+trust_email = false                 # default false: count emails as verified when the issuer doesn't say (see below)
 
 [[auth.provider]]
 id = "tokens"
 kind = "external"
 label = "Company token"
 verify_url = "http://127.0.0.1:8787/verify"   # external only, required: https://, or http:// on this machine
+trust_email = false                 # as above, for answers without "email_verified"
 
 [e2e]
 mode = "off"                        # the only value accepted for now
 ```
 
 Which keys each kind reads: `oidc` reads `label`, `preset`, `issuer`, `client_id`,
-`client_secret` or `client_secret_file`, `scopes`, `params` and `flows`; `external` reads `label`
-and `verify_url`. Keys a kind doesn't read are ignored. A kind of your own reads what its factory
-reads.
+`client_secret` or `client_secret_file`, `scopes`, `params`, `flows` and `trust_email`; `external`
+reads `label`, `verify_url` and `trust_email`. Keys a kind doesn't read are ignored. A kind of your
+own reads what its factory reads. These settings exist only in the file: unlike the server's other
+settings they have no command-line flags.
+
+**`trust_email`** makes an email from that provider count as verified when the provider doesn't
+say (no `email_verified` claim or field); an explicit `false` still counts as unverified. Turn it on
+only for a provider that hands out nothing but emails it has checked: a single-tenant Microsoft
+Entra ID whose accounts are all yours, or a verifier backed by your own directory. With any other
+provider, someone could sign in with an address that isn't theirs and so pass the allow-lists,
+receive invites meant for that address, or become an admin.
 
 `figcraft-server check` reports:
 
@@ -428,15 +420,17 @@ reads.
   two providers with one id, a provider without a `kind`, an entry of `admins` or `allow_emails`
   that isn't an email address;
 - `open_publish` with an accounts mode;
-- an `[e2e]` mode other than `"off"` (sealed files aren't available yet).
+- an `[e2e]` mode other than `"off"` (sealed files aren't available yet);
+- each provider, built without the network: an unknown `kind` or `preset`, a missing `issuer` or
+  `client_id`, an `issuer` that isn't `https://`, a secret file it can't read, both
+  `client_secret` and `client_secret_file`, an unknown flow, `scopes` without `openid`, or a
+  `verify_url` that isn't `https://` (or `http://` on this machine).
 
-It doesn't build the providers yet: an unknown `kind` or `preset`, a missing `issuer` or
-`client_id`, a secret file the server can't read, both `client_secret` and `client_secret_file`, an
-unknown flow, `scopes` without `openid`, or a `verify_url` that isn't `https://` stop the server
-when it starts, with the reason in its log (`journalctl -u figcraft-server`). Run `check` as the
-`figcraft` user, then restart and read the log's first lines. The issuer itself is first contacted
-when an app asks what the server accepts, not at startup; see
-[Troubleshooting](#troubleshooting).
+Run `check` as the `figcraft` user (as above), so it reads the secret files with the server's
+rights. The issuer itself is first contacted when an app asks what the server accepts, not by
+`check` or at startup; see [Troubleshooting](#troubleshooting). (A server build with kinds of its
+own checks them with `Config::check_with(&registry)`; the stock `figcraft-server check` knows only
+`oidc` and `external`.)
 
 ## Who may sign in
 
@@ -556,10 +550,12 @@ anyone sign in as someone. Emails and names are personal data: treat the directo
 `provider google: the sign-in service couldn't be reached: …`.** The server couldn't fetch
 `<issuer>/.well-known/openid-configuration`. From the server, try
 `curl -sS https://accounts.google.com/.well-known/openid-configuration | head -c 200`. If that
-works but the server still fails, the systemd unit's `IPAddressDeny` is blocking it (see
-[Before you start](#before-you-start)). Otherwise check DNS, any outbound firewall, and that the
-issuer's certificate comes from a public authority. A wrong `issuer` gives `HTTP 404`. The server
-tries again on the next request.
+works but the server still fails with `Operation not permitted` (the log says the system refused
+the connection), the systemd unit's network limit is still in place: run `install.sh` again, or add
+the drop-in (see [Before you start](#before-you-start)). Otherwise check DNS, any outbound
+firewall, and the issuer's certificate: one from a private authority needs `FIGCRAFT_CA_FILE`
+(`invalid peer certificate: UnknownIssuer` in the log). A wrong `issuer` gives `HTTP 404`. The
+server tries again on the next request.
 
 **`… names another issuer (…)`**: the discovery document's `issuer` differs from the one you
 configured. Use exactly the issuer it names (a trailing `/` doesn't matter; `/realms/…`, a tenant id
@@ -590,8 +586,8 @@ default has it).
 
 **`… isn't allowed on this server: ask its operator`**: the person's verified email isn't in
 `allow_emails` and its domain isn't in `allow_domains`. Add them and restart. **`… your sign-in
-didn't give a verified one`**: the provider sent no verified email (Entra ID never does; in
-Keycloak, mark the email verified).
+didn't give a verified one`**: the provider sent no verified email (Entra ID never says: see
+`trust_email` in [The settings](#the-settings); in Keycloak, mark the email verified).
 
 **People were signed out after you changed the settings**: every use of a session checks the
 allow-lists again, so narrowing them ends the sessions of people no longer on them. Their files
@@ -600,9 +596,12 @@ and memberships are kept; they get back in once allowed again.
 **`this server has no sign-in called "…"`**: the app asked for a provider id that is no longer
 configured (renamed or removed). Restore it, or have people sign in again with another.
 
-**The server doesn't start**: `journalctl -u figcraft-server -n 20` shows why, for example
+**`check` (or the server) refuses the settings**: the message says why, for example
 ``provider "google": can't read `client_secret_file` /etc/figcraft-server/google.secret: Permission
-denied`` (make it owned by `figcraft`), `unknown preset` or `unknown kind`.
+denied`` (make it owned by `figcraft`, and run `check` as `figcraft`), `unknown preset` or
+`unknown kind`. **The server doesn't start** with ``can't read the certificates in
+FIGCRAFT_CA_FILE``: the file named there is missing, unreadable by `figcraft`, or not a PEM
+certificate. `journalctl -u figcraft-server -n 20` shows the reason.
 
 **`you aren't in this file: ask its owner to invite you`**: the person is signed in but not a
 member. An owner (or an admin) invites them; with `accounts+links`, a share link also works.

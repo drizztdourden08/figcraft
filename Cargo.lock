@@ -1652,6 +1652,7 @@ dependencies = [
 name = "figcraft-server"
 version = "0.6.0"
 dependencies = [
+ "base64 0.22.1",
  "crc32fast",
  "ctrlc",
  "env_logger",
@@ -1671,6 +1672,7 @@ dependencies = [
  "tungstenite",
  "ureq",
  "wat",
+ "webpki-root-certs",
  "zip",
 ]
 
@@ -5196,6 +5198,15 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "url",
  "web-sys",
+]
+
+[[package]]
+name = "webpki-root-certs"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

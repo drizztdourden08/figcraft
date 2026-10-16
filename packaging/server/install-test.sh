@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Checks install.sh's Caddyfile handling without installing anything (no root, no network):
 # a Caddyfile with other sites is never replaced, only gains one import line, and stays the same
-# however often install.sh runs. Run by the packaging lint workflow.
+# however often install.sh runs. Also how it tells that server.toml turns accounts on (which lifts
+# the systemd unit's network limit). Run by the packaging lint workflow.
 #
 # Usage: packaging/server/install-test.sh
 set -euo pipefail
@@ -39,5 +40,17 @@ main "$WORK/none" >"$WORK/ours1"
 main "$WORK/ours1" >"$WORK/ours2"
 cmp -s "$WORK/ours1" "$WORK/ours2" || fail "our own Caddyfile stays the same"
 
-if [ "$FAILED" = 0 ]; then echo "install.sh Caddyfile handling: ok"; fi
+# Accounts in server.toml: the server may reach identity providers.
+accounts() { printf '%b' "$1" >"$WORK/server.toml"; bash "$HERE/install.sh" --accounts-on "$WORK/server.toml"; }
+accounts 'listen = "127.0.0.1:47900"\n[auth]\nmode = "accounts"\n' || fail "[auth] mode = accounts"
+accounts '[auth]\nadmins = ["a@b.c"]\nmode="accounts+links" # teams\n[[auth.provider]]\nid = "g"\n' || fail "accounts+links, no spaces, a comment"
+accounts "[ auth ]\n\tmode = 'accounts'\n" || fail "single quotes, spaces and tabs"
+accounts 'auth.mode = "accounts"\n' || fail "a dotted key at the top"
+accounts 'listen = "127.0.0.1:47900"\n' && fail "no [auth]: no accounts"
+accounts '[auth]\nmode = "links"\n' && fail "links mode: no accounts"
+accounts '# mode = "accounts"\n[auth]\n# mode = "accounts"\nmode = "links"\n' && fail "comments don't count"
+accounts '[e2e]\nmode = "accounts"\n' && fail "another section's mode doesn't count"
+accounts '[auth]\nmode = "links"\n[[auth.provider]]\nmode = "accounts"\n' && fail "a provider's key doesn't count"
+
+if [ "$FAILED" = 0 ]; then echo "install.sh Caddyfile handling and accounts detection: ok"; fi
 exit "$FAILED"

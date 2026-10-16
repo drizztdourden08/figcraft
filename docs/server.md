@@ -305,7 +305,13 @@ client_secret_file = "/etc/figcraft-server/google.secret"
 - **Your own kind**: a server build can register an `IdentityProvider` implementation
   (`figcraft_server::start_with` with a `figcraft_auth::registry::Registry`).
 
-Emails count only when the provider verified them. People and their sessions are kept in
+Emails count only when the provider verified them (`trust_email = true` on a provider counts its
+emails as verified when it doesn't say, as with Entra ID: only for an issuer that hands out nothing
+but checked emails). `figcraft-server check` builds every provider without the network, so a wrong
+kind, preset, missing key or unreadable `client_secret_file` shows there. The server reaches the
+providers over HTTPS itself (trusting Mozilla's roots plus `FIGCRAFT_CA_FILE`, as the app does):
+`install.sh` lifts the systemd unit's network limit when `server.toml` has accounts (run it again
+after turning them on). People and their sessions are kept in
 `<data>/accounts/` (session tokens only as hashes); members and invites in each file's
 `meta.json`. `accounts+links` keeps share links working beside accounts (owners make them from
 their account). `open_publish` can't be combined with accounts.
@@ -676,7 +682,13 @@ runs it as that user, restarts it if it fails, stops it gracefully, and locks it
 privileges, a read-only system with only the data directory writable, no capabilities, private
 `/tmp` and devices, a system-call filter, memory caps (60% of the machine slows it down, 75%
 stops and restarts it, so only this service is hit) and network only to this machine (the proxy;
-remove `IPAddressAllow`/`IPAddressDeny` to listen on a network address without one).
+remove `IPAddressAllow`/`IPAddressDeny` to listen on a network address without one). A server with
+[accounts](#accounts-sign-in) must reach its identity providers, so the limit is cleared by a
+drop-in, `/etc/systemd/system/figcraft-server.service.d/outbound.conf` (`install.sh` writes it when
+`server.toml` turns accounts on and removes it when they are off; by hand: see
+[`server-accounts.md`](server-accounts.md#before-you-start)). It isn't simply dropped: for a server
+without accounts nothing outbound is the safer default, and provider addresses (behind CDNs) can't
+be listed in advance.
 
 ```sh
 sudo cp figcraft-server.service /etc/systemd/system/
@@ -812,7 +824,9 @@ sudo systemctl start figcraft-server
   so can its operator.
 - **The machine**: the data directory is made readable by the server's account only and the server
   key is written owner-only from the start; the systemd unit caps memory and network
-  (`MemoryHigh`, `MemoryMax`, `IPAddressAllow=localhost`); `install.sh` builds as an unprivileged
+  (`MemoryHigh`, `MemoryMax`, `IPAddressAllow=localhost`; with accounts, outbound network is opened
+  for the identity providers); `install.sh` builds as an unprivileged
   user, runs the binary only as the server's account, never replaces someone else's Caddyfile and
   never cuts off SSH or other services when it turns `ufw` on.
-- **Not there yet**: user accounts, per-person permissions, audit logs, end-to-end encryption.
+- **Not there yet**: signing in from the app (the server side of [accounts](#accounts-sign-in) is
+  done), audit logs, end-to-end encryption.

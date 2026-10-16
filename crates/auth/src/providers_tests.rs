@@ -378,3 +378,103 @@ fn registry_takes_kinds_of_your_own() {
     assert!(r.kinds().contains(&"mine"));
     assert_eq!(r.build(&cfg, fake).unwrap().verify_token("x").unwrap().subject, "x");
 }
+
+#[test]
+fn trust_email_counts_an_unsaid_email_as_verified() {
+    let key = Key::es();
+    let token = |verified: Option<Value>| {
+        let mut c = claims("u-1");
+        match verified {
+            Some(v) => c["email_verified"] = v,
+            None => {
+                c.as_object_mut().unwrap().remove("email_verified");
+            }
+        }
+        key.sign("k1", &c)
+    };
+    let fake = Arc::new(Fake::default());
+    issuer(&fake, &[("k1", &key)]);
+    // Entra ID sends no `email_verified`: unverified unless the provider is trusted.
+    let plain = crate::oidc::Oidc::new(&oidc_cfg(), fake.clone()).unwrap();
+    assert!(!plain.check_id_token(&token(None)).unwrap().email_verified);
+    let trusted = crate::oidc::Oidc::new(&ProviderConfig { trust_email: true, ..oidc_cfg() }, fake.clone()).unwrap();
+    assert!(trusted.check_id_token(&token(None)).unwrap().email_verified);
+    // An explicit "not verified" is never overridden.
+    assert!(!trusted.check_id_token(&token(Some(json!(false)))).unwrap().email_verified);
+    assert!(!trusted.check_id_token(&token(Some(json!("false")))).unwrap().email_verified);
+    assert!(plain.check_id_token(&token(Some(json!(true)))).unwrap().email_verified);
+
+    // The same for an external verifier that leaves `email_verified` out.
+    let url = "https://verify.test/check";
+    let cfg = ProviderConfig { id: "corp".into(), kind: "external".into(), verify_url: url.into(), ..ProviderConfig::default() };
+    let ask = |cfg: &ProviderConfig, answer: Value| {
+        let fake = Arc::new(Fake::default());
+        fake.post(url, Ok(answer));
+        build(cfg, &fake).verify_token("t").unwrap().email_verified
+    };
+    let trusted_cfg = ProviderConfig { trust_email: true, ..cfg.clone() };
+    assert!(!ask(&cfg, json!({"subject": "s", "email": "a@b.c"})));
+    assert!(ask(&trusted_cfg, json!({"subject": "s", "email": "a@b.c"})));
+    assert!(!ask(&trusted_cfg, json!({"subject": "s", "email": "a@b.c", "email_verified": false})));
+    // The setting reads from server.toml.
+    let parsed: ProviderConfig = toml::from_str("id = \"entra\"\nkind = \"oidc\"\ntrust_email = true\n").unwrap();
+    assert!(parsed.trust_email);
+}
+
+#[test]
+fn registry_checks_settings_without_the_network() {
+    let r = Registry::builtin();
+    let oidc = |c: ProviderConfig| ProviderConfig { id: "p".into(), kind: "oidc".into(), ..c };
+    // Good settings pass, and building asks nothing of the network.
+    let fake = Arc::new(Fake::default());
+    let good = oidc(ProviderConfig { preset: "google".into(), client_id: "x".into(), ..ProviderConfig::default() });
+    assert!(r.check(&good).is_ok());
+    r.build(&good, fake.clone()).unwrap();
+    let ext = ProviderConfig { id: "e".into(), kind: "external".into(), verify_url: "https://v.test/".into(), ..ProviderConfig::default() };
+    assert!(r.check(&ext).is_ok());
+    r.build(&ext, fake.clone()).unwrap();
+    assert!(fake.asked.lock().unwrap().is_empty() && fake.sent.lock().unwrap().is_empty());
+
+    let secret = std::env::temp_dir().join(format!("figcraft-auth-secret-{}", std::process::id()));
+    std::fs::write(&secret, "s3cret\n").unwrap();
+    let secret_file = secret.display().to_string();
+    assert!(
+        r.check(&oidc(ProviderConfig {
+            issuer: ISSUER.into(),
+            client_id: "x".into(),
+            client_secret_file: secret_file.clone(),
+            ..ProviderConfig::default()
+        }))
+        .is_ok()
+    );
+    std::fs::remove_file(&secret).unwrap();
+
+    let bad: &[(ProviderConfig, &str)] = &[
+        (ProviderConfig { kind: "carrier-pigeon".into(), ..good.clone() }, "unknown kind"),
+        (ProviderConfig { preset: "microsoft".into(), ..good.clone() }, "unknown preset"),
+        (oidc(ProviderConfig { client_id: "x".into(), ..ProviderConfig::default() }), "issuer"),
+        (oidc(ProviderConfig { issuer: "http://insecure.test".into(), client_id: "x".into(), ..ProviderConfig::default() }), "https"),
+        (oidc(ProviderConfig { issuer: ISSUER.into(), ..ProviderConfig::default() }), "client_id"),
+        (
+            oidc(ProviderConfig { issuer: ISSUER.into(), client_id: "x".into(), client_secret_file: secret_file, ..ProviderConfig::default() }),
+            "client_secret_file",
+        ),
+        (
+            oidc(ProviderConfig {
+                issuer: ISSUER.into(),
+                client_id: "x".into(),
+                client_secret: "a".into(),
+                client_secret_file: "b".into(),
+                ..ProviderConfig::default()
+            }),
+            "not both",
+        ),
+        (oidc(ProviderConfig { issuer: ISSUER.into(), client_id: "x".into(), flows: vec!["magic".into()], ..ProviderConfig::default() }), "flow"),
+        (ProviderConfig { verify_url: "http://v.test/".into(), ..ext.clone() }, "verify_url"),
+        (ProviderConfig { verify_url: String::new(), ..ext }, "verify_url"),
+    ];
+    for (cfg, why) in bad {
+        let e = r.check(cfg).unwrap_err();
+        assert!(e.contains(why), "{cfg:?}: {e}");
+    }
+}

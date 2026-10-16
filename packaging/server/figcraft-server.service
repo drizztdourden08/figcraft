@@ -27,8 +27,15 @@ UMask=0077
 # rest of the machine.
 MemoryHigh=60%
 MemoryMax=75%
-# It talks only to the proxy on this machine (listen = "127.0.0.1:47900"). Listening on a network
-# address without a proxy in front needs these two lines removed.
+# Network only to this machine: the proxy in front (listen = "127.0.0.1:47900") and nothing
+# outbound, so a compromised server can't reach anything else. Two cases need these lifted:
+# - accounts ([auth] mode "accounts" or "accounts+links"): the server itself fetches the identity
+#   provider's discovery document and keys and exchanges sign-in codes over HTTPS, at addresses
+#   that change (issuers sit behind CDNs), so it needs outbound network. install.sh sees accounts
+#   in server.toml and writes the drop-in figcraft-server.service.d/outbound.conf, which clears
+#   both lines (and removes it again when accounts are off); by hand, see docs/server-accounts.md.
+#   An outbound firewall can still narrow it to port 443.
+# - listening on a network address without a proxy in front: remove both lines.
 IPAddressAllow=localhost
 IPAddressDeny=any
 

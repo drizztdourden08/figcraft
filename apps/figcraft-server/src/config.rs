@@ -3,6 +3,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+use figcraft_auth::registry::Registry;
 use figcraft_auth::{AuthConfig, E2eConfig, E2eMode};
 use figcraft_collab_net::{Endpoint, NetLimits};
 use serde::Deserialize;
@@ -167,8 +168,15 @@ impl Config {
         p.parse().map(Some).map_err(|_| "`trusted_proxy` must be an IP address, like 127.0.0.1".to_string())
     }
 
-    /// Check everything (before starting).
+    /// Check everything (before starting), with the built-in provider kinds.
     pub fn check(&self) -> Result<(), String> {
+        self.check_with(&Registry::builtin())
+    }
+
+    /// [`check`](Self::check), building each `[[auth.provider]]` with `registry`'s kinds (without
+    /// the network): an unknown kind or preset, missing keys, an unreadable `client_secret_file`…
+    /// are found here, not when the server starts.
+    pub fn check_with(&self, registry: &Registry) -> Result<(), String> {
         self.auth.check()?;
         if self.e2e.mode()? != E2eMode::Off {
             return Err("`e2e.mode`: sealed files aren't available in this version yet; leave it \"off\"".into());
@@ -226,6 +234,9 @@ impl Config {
         }
         if self.max_plugins > 10_000 || self.max_plugins_mb > 1 << 20 {
             return Err("`max_plugins` is at most 10000 and `max_plugins_mb` at most 1048576".into());
+        }
+        for p in &self.auth.provider {
+            registry.check(p)?;
         }
         Ok(())
     }
