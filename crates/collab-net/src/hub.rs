@@ -78,11 +78,14 @@ pub struct Handled {
     pub removed: Option<String>,
     /// An address was blocked ([`ip_key`]): its connections are dropped.
     pub blocked: Option<IpAddr>,
+    /// Accounts whose sessions ended (an admin ended them or removed the person): every
+    /// connection signed in as one of them is closed (in files, account and managing connections).
+    pub ended: Vec<String>,
 }
 
 impl From<AdminReply> for Handled {
     fn from(reply: AdminReply) -> Self {
-        Self { reply, revoked: None, removed: None, blocked: None }
+        Self { reply, revoked: None, removed: None, blocked: None, ended: Vec::new() }
     }
 }
 
@@ -1158,8 +1161,8 @@ enum Kind {
     Joined { file: String, id: u32, link: Option<String>, account: Option<String> },
     /// Someone's account connection (their files and who gets into them).
     Account { person: Person },
-    /// Managing the server's files.
-    Managing,
+    /// Managing the server's files: with the key, or as `account` (an admin).
+    Managing { account: Option<String> },
     /// Using `file`'s team library through link `link` of `access` (revoking it disconnects).
     Library { file: String, access: Access, link: Option<String> },
     /// Using the plugin directory; `publisher`: with the server's key.
@@ -1228,6 +1231,9 @@ pub const STOPPED: &str = "Sharing was stopped: the link you joined with no long
 /// What someone removed from a file is told: the session's end for them (they keep their copy;
 /// nothing retries).
 pub const REMOVED: &str = "You were removed from this session. Your copy stays open";
+
+/// What someone whose sessions an admin ended is told (they keep their copy; nothing retries).
+pub const SIGNED_OUT: &str = "You were signed out of this server. Your copy stays open";
 
 /// Why a removed person's address can't join the file again.
 const BARRED: &str = "you were removed from this session";
@@ -1322,7 +1328,7 @@ impl<B: Backend> Hub<B> {
                 let Some(c) = self.conns.get(&conn) else { return };
                 let ip = c.ip;
                 // The operator (with the server key) isn't held to the limits on addresses.
-                if !matches!(c.kind, Kind::Managing) && !self.backend.message(ip, &msg) {
+                if !matches!(c.kind, Kind::Managing { .. }) && !self.backend.message(ip, &msg) {
                     log::info!("event=refused ip={ip} reason=messages_per_address");
                     return self.kick(&[conn], "too many messages from your address: wait a minute and try again");
                 }
@@ -1388,7 +1394,7 @@ impl<B: Backend> Hub<B> {
                 ClientMsg::Ping => self.answer(conn, &ServerMsg::Pong),
                 _ => self.kick(&[conn], "only publishing and managing your own files are spoken on this connection"),
             },
-            Some(Kind::Managing) => match msg {
+            Some(Kind::Managing { .. }) => match msg {
                 ClientMsg::Admin(Admin::RemovePeer { file, client }) => {
                     let reply = self.removed_reply(&file, client);
                     self.answer(conn, &ServerMsg::Admin(Box::new(reply)));
@@ -1578,7 +1584,9 @@ impl<B: Backend> Hub<B> {
             return refuse(&c.out, &why);
         }
         log::info!("live session: connection {conn} manages files");
-        self.take_in(conn, c, Kind::Managing, &ServerMsg::Admin(Box::new(AdminReply::Ready)));
+        // Signed in (an admin, or someone who also has the key): ending their sessions closes this too.
+        let account = c.person.as_ref().map(|p| p.account.clone());
+        self.take_in(conn, c, Kind::Managing { account }, &ServerMsg::Admin(Box::new(AdminReply::Ready)));
     }
 
     fn open_library(&mut self, conn: u64, o: OpenLibrary, c: Pending) {
@@ -1666,6 +1674,30 @@ impl<B: Backend> Hub<B> {
     fn handled(&mut self, conn: u64, handled: Handled) {
         self.answer(conn, &ServerMsg::Admin(Box::new(handled.reply)));
         self.disconnect(handled.revoked, handled.removed, handled.blocked, &[]);
+        self.sign_out(&handled.ended);
+    }
+
+    /// Close every connection signed in as one of `accounts` (their sessions ended): people in
+    /// files are told, as when a host stops (they keep their copy; nothing retries).
+    fn sign_out(&mut self, accounts: &[String]) {
+        if accounts.is_empty() {
+            return;
+        }
+        let of = |c: &Conn| match &c.kind {
+            Kind::Joined { account: Some(a), .. } | Kind::Managing { account: Some(a) } => accounts.contains(a),
+            Kind::Account { person } => accounts.contains(&person.account),
+            _ => false,
+        };
+        let joined: Vec<u64> = self.conns.iter().filter(|(_, c)| of(c) && matches!(c.kind, Kind::Joined { .. })).map(|(k, _)| *k).collect();
+        let others: Vec<u64> = self.conns.iter().filter(|(_, c)| of(c) && !matches!(c.kind, Kind::Joined { .. })).map(|(k, _)| *k).collect();
+        for conn in &joined {
+            if let Some(c) = self.conns.get(conn) {
+                let _ = c.out.tx.try_send(Out::Close(CloseCode::Away, SIGNED_OUT.into()));
+            }
+            self.gone(*conn);
+        }
+        self.kick(&others, SIGNED_OUT);
+        log::info!("event=signed_out accounts={} connections={}", accounts.len(), joined.len() + others.len());
     }
 
     /// Disconnect whoever joined with a revoked link, everyone in a removed file, a blocked

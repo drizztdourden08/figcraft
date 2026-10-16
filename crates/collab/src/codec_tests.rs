@@ -4,9 +4,10 @@ use figcraft_doc::{Document, NodeId, NodeKind};
 
 use crate::change::{Change, Json, Prop};
 use crate::message::{
-    Accepted, Access, Admin, AdminReply, CatchUp, ClientMsg, EditingText, FileInfo, FileRow, FileUsage, Hello, HostInfo, LibraryReply, LibraryReq,
-    LinkInfo, Manage, NewLink, OpenHosting, OpenLibrary, OpenPlugins, PROTOCOL, Peer, PluginEntry, PluginReply, PluginReq, Presence, Processed,
-    ReportInfo, Resume, ServerMsg, Signal, Usage, WIRE_VERSION, decode, decode_json, encode, encode_json,
+    Accepted, Access, Admin, AdminReply, CatchUp, ClientMsg, EditingText, FileInfo, FileRow, FileUsage, Hello, HostInfo, Invited, LibraryReply,
+    LibraryReq, LinkInfo, Manage, Member, NewLink, OpenHosting, OpenLibrary, OpenPlugins, OwnerlessFile, PROTOCOL, Peer, PersonInfo, PluginEntry,
+    PluginReply, PluginReq, Presence, Processed, ReportInfo, Resume, Role, ServerMsg, ServerStatus, Signal, Usage, WIRE_VERSION, decode, decode_json,
+    encode, encode_json,
 };
 use crate::sim::Rng;
 use crate::{Error, Replica, diff};
@@ -76,6 +77,13 @@ fn samples() -> (Vec<ClientMsg>, Vec<ServerMsg>) {
         ClientMsg::Admin(Admin::Unblock { ip: "2001:db8::".into() }),
         ClientMsg::Admin(Admin::Blocked),
         ClientMsg::Admin(Admin::RemovePeer { file: "f".into(), client: 7 }),
+        ClientMsg::Admin(Admin::People),
+        ClientMsg::Admin(Admin::RemovePerson { account: "a1".into(), force: true }),
+        ClientMsg::Admin(Admin::EndSessions { account: "a1".into() }),
+        ClientMsg::Admin(Admin::FileMembers { file: "f".into() }),
+        ClientMsg::Admin(Admin::SetFileRole { file: "f".into(), account: "a1".into(), role: Role::Owner }),
+        ClientMsg::Admin(Admin::AddFileMember { file: "f".into(), email: "ann@example.com".into(), role: Role::Viewer }),
+        ClientMsg::Admin(Admin::ServerStatus),
         ClientMsg::Report { reason: "Spam ☕".into() },
     ];
     let snapshot = Replica::new(Document::new("Snap")).snapshot().unwrap();
@@ -178,6 +186,31 @@ fn samples() -> (Vec<ClientMsg>, Vec<ServerMsg>) {
         })),
         ServerMsg::Reported { error: None },
         ServerMsg::Reported { error: Some("too many reports".into()) },
+        ServerMsg::Admin(Box::new(AdminReply::People(vec![PersonInfo {
+            account: "a1".into(),
+            provider: "google".into(),
+            email: Some("ann@example.com".into()),
+            name: "Ann ☕".into(),
+            created: 1,
+            seen: 2,
+            sessions: 3,
+            admin: true,
+            owned: 4,
+        }]))),
+        ServerMsg::Admin(Box::new(AdminReply::PersonRemoved { orphaned: vec![OwnerlessFile { id: "f".into(), name: "Café".into() }] })),
+        ServerMsg::Admin(Box::new(AdminReply::LastOwner { files: vec![OwnerlessFile { id: "f".into(), name: "Café".into() }] })),
+        ServerMsg::Admin(Box::new(AdminReply::FileMembers {
+            members: vec![Member { account: "a1".into(), name: "Ann".into(), email: None, role: Role::Editor }],
+            invited: vec![Invited { email: "bo@example.com".into(), role: Role::Viewer }],
+        })),
+        ServerMsg::Admin(Box::new(AdminReply::ServerStatus(ServerStatus {
+            version: "0.6.0".into(),
+            info: figcraft_auth::ServerInfo::default(),
+            people: 1,
+            sessions: 2,
+            files: 3,
+            free_bytes: Some(4),
+        }))),
     ];
     (client, server)
 }

@@ -109,6 +109,8 @@ pub fn start_with(cfg: &Config, registry: &Registry) -> Result<Running, String> 
 #[cfg(test)]
 mod accounts_tests;
 #[cfg(test)]
+mod admin_tests;
+#[cfg(test)]
 mod background_tests;
 #[cfg(test)]
 mod cli_tests;

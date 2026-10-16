@@ -280,6 +280,74 @@ pub enum Admin {
     /// can't join the file again while its session lasts. With the server key, or on an open
     /// hosting connection with `file`'s owner token. Servers older than this request can't read it.
     RemovePeer { file: String, client: u32 },
+    /// On a server with accounts: everyone who has signed in ([`AdminReply::People`]). With the
+    /// server key or as an admin, like every request below. Servers older than these requests
+    /// can't read them.
+    People,
+    /// Take someone off the server: their sessions end (every connection signed in as them is
+    /// closed), they leave every file and their pending invites go, and their account is
+    /// forgotten (signing in again makes a new one, if the allow-lists still let them in). Refused
+    /// with [`AdminReply::LastOwner`] while they are the last owner of a file, unless `force`: then
+    /// such files are left with no owner (only admins and the server key manage them, until an
+    /// admin makes someone owner) and listed in [`AdminReply::PersonRemoved`].
+    RemovePerson { account: String, force: bool },
+    /// End every session of `account` (they must sign in again; whatever they had open is closed).
+    /// Their account and files stay. [`AdminReply::Done`].
+    EndSessions { account: String },
+    /// Who is in any file, and who is invited ([`AdminReply::FileMembers`]).
+    FileMembers { file: String },
+    /// Give `account` (someone who signed in here) `role` in `file`, adding them when they aren't
+    /// in it: how an admin recovers a file whose owner left. A file that has an owner keeps one.
+    SetFileRole { file: String, account: String, role: Role },
+    /// Let an email into `file` with `role`, as its owners' invites do: someone who signed in here
+    /// with it becomes a member at once, anyone else when they first sign in.
+    AddFileMember { file: String, email: String, role: Role },
+    /// The server's version, sign-in settings and counts ([`AdminReply::ServerStatus`]).
+    ServerStatus,
+}
+
+/// Someone who signed in on a server with accounts, as its admins see them ([`Admin::People`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonInfo {
+    /// The server's id for them.
+    pub account: String,
+    /// The sign-in they used (its id in the server's settings).
+    pub provider: String,
+    /// Verified only (lowercase).
+    pub email: Option<String>,
+    pub name: String,
+    /// When they first and last signed in (seconds since 1970).
+    pub created: u64,
+    pub seen: u64,
+    /// Sessions not expired (signed-in devices).
+    pub sessions: u32,
+    /// Their email is in the server's `admins`.
+    pub admin: bool,
+    /// Files they own.
+    pub owned: u32,
+}
+
+/// A file someone removed was the last owner of ([`AdminReply::LastOwner`],
+/// [`AdminReply::PersonRemoved`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerlessFile {
+    pub id: String,
+    pub name: String,
+}
+
+/// What a server is and holds ([`Admin::ServerStatus`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerStatus {
+    /// The server's version (`figcraft-server` package version).
+    pub version: String,
+    /// Who gets in, the sign-ins offered, whether files are sealed (what `Info` answers).
+    pub info: ServerInfo,
+    /// People who signed in, their sessions not expired, files kept.
+    pub people: u32,
+    pub sessions: u32,
+    pub files: u32,
+    /// Free bytes on the data directory's disk, where that can be told.
+    pub free_bytes: Option<u64>,
 }
 
 /// The most files one [`Admin::Owned`] asks about.
@@ -371,6 +439,24 @@ pub enum AdminReply {
     /// The answer to [`Admin::Owned`], one per pair asked about, in order. `None`: no file of that
     /// id is managed by that token here (removed, expired, or never there).
     Owned(Vec<Option<OwnedFile>>),
+    /// The answer to [`Admin::People`].
+    People(Vec<PersonInfo>),
+    /// [`Admin::RemovePerson`] was done; `orphaned`: the files left with no owner (with `force`).
+    PersonRemoved {
+        orphaned: Vec<OwnerlessFile>,
+    },
+    /// [`Admin::RemovePerson`] was refused: they are the last owner of these files (make someone
+    /// else owner first, or ask again with `force`).
+    LastOwner {
+        files: Vec<OwnerlessFile>,
+    },
+    /// The answer to [`Admin::FileMembers`].
+    FileMembers {
+        members: Vec<Member>,
+        invited: Vec<Invited>,
+    },
+    /// The answer to [`Admin::ServerStatus`].
+    ServerStatus(ServerStatus),
 }
 
 /// A file with what its operator moderates by.

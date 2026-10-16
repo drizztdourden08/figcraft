@@ -129,6 +129,13 @@ fn the_new_messages_go_last_on_the_wire() {
     assert_eq!(tag(encode(&Admin::Code { file: String::new(), token: String::new() }).unwrap()), 12);
     assert_eq!(tag(encode(&AdminReply::Blocked(Vec::new())).unwrap()), 10);
     assert_eq!(tag(encode(&AdminReply::Code { code: String::new() }).unwrap()), 11);
+    // Managing people (accounts) came after everything before it.
+    assert_eq!(tag(encode(&Admin::RemovePeer { file: String::new(), client: 0 }).unwrap()), 14);
+    assert_eq!(tag(encode(&Admin::People).unwrap()), 15);
+    assert_eq!(tag(encode(&Admin::ServerStatus).unwrap()), 21);
+    assert_eq!(tag(encode(&AdminReply::Owned(Vec::new())).unwrap()), 12);
+    assert_eq!(tag(encode(&AdminReply::People(Vec::new())).unwrap()), 13);
+    assert_eq!(tag(encode(&AdminReply::LastOwner { files: Vec::new() }).unwrap()), 15);
 }
 
 #[test]

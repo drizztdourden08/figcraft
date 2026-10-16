@@ -309,6 +309,31 @@ Emails count only when the provider verified them. People and their sessions are
 `meta.json`. `accounts+links` keeps share links working beside accounts (owners make them from
 their account). `open_publish` can't be combined with accounts.
 
+### Managing people
+
+The operator (with the server key) and admins (signed in, their email in `admins`, no key needed)
+manage who is on the server. From the command line, like the other commands (through the running
+server, or on the stopped data directory):
+
+| Command | What it does |
+|---|---|
+| `figcraft-server status` | Version, access mode, sealing, sign-ins offered, people, sessions, files, free disk space |
+| `figcraft-server people [list]` | Everyone who signed in: account id, provider, email, name, sessions, files owned, last seen, admin |
+| `figcraft-server people end-sessions ACCOUNT` | Sign them out everywhere: their session tokens stop working and their open connections close |
+| `figcraft-server people remove ACCOUNT [--force]` | Take them off the server: signed out, out of every file, pending invites to their email dropped, account forgotten |
+| `figcraft-server members FILE` | Any file's members and invites |
+| `figcraft-server members add FILE EMAIL ROLE` | Let an email in as `owner`, `editor` or `viewer` (a member at once if they signed in here, else invited) |
+| `figcraft-server members role FILE ACCOUNT ROLE` | Give someone who signed in here a role in a file, adding them if needed |
+
+Removing someone who is the **last owner** of a file is refused, listing those files: make someone
+else owner first (`members role FILE ACCOUNT owner`). With `--force` they are removed anyway and
+those files are left **with no owner**: nothing is deleted, other members keep their roles, and
+only admins and the key manage the file until an admin gives it an owner. Removing isn't a ban:
+someone the allow-lists still admit can sign in again (as a new account, in no file); narrow
+`allow_emails`/`allow_domains` to keep them out. Admins will do the same from the app; it sends
+the same managing requests (`People`, `RemovePerson`, `EndSessions`, `FileMembers`,
+`SetFileRole`, `AddFileMember`, `ServerStatus`), which servers older than them can't read.
+
 ## Configuration
 
 Every flag is also a key of a TOML file given with `--config server.toml` (flags win; unknown keys

@@ -3,10 +3,12 @@
 //! file's `meta.json`; and the requests of account connections (your files, publishing, members,
 //! invites, and, on a server that also takes links, the links of the files you own).
 
-use figcraft_auth::Person;
+use std::collections::HashMap;
+
+use figcraft_auth::{Gate, Person};
 use figcraft_collab::Change;
-use figcraft_collab::message::{AccountReply, AccountReq, Invited, Member, MyFile, Role};
-use figcraft_collab_net::hub::{AccountHandled, Admission, OpenFile};
+use figcraft_collab::message::{AccountReply, AccountReq, Admin, AdminReply, Invited, Member, MyFile, OwnerlessFile, PersonInfo, Role, ServerStatus};
+use figcraft_collab_net::hub::{AccountHandled, Admission, Handled, OpenFile};
 use serde::{Deserialize, Serialize};
 
 use super::Store;
@@ -56,6 +58,8 @@ fn email(s: &str) -> Option<String> {
 
 const NOT_IN: &str = "you aren't in this file: ask its owner to invite you";
 const OWNERS_ONLY: &str = "only the file's owners can do that";
+const NOBODY: &str = "nobody with that account is on this server";
+const NO_ACCOUNTS: &str = "this server has no accounts (people sign in only when its settings have [auth])";
 
 impl Store {
     /// `who`'s role in `file`; an invite to their verified email becomes membership now.
@@ -122,7 +126,13 @@ impl Store {
         if self.role_of(file, who)?.is_none() && !who.admin {
             return Err(NOT_IN.into());
         }
-        let people = self.people(file).cloned().unwrap_or_default();
+        let (members, invited) = self.member_list(file)?;
+        Ok(AccountReply::Members { members, invited })
+    }
+
+    /// A file's members (with their names and emails) and invites.
+    fn member_list(&mut self, file: &str) -> Result<(Vec<Member>, Vec<Invited>), String> {
+        let people = self.entry(file)?.meta.people.clone();
         let members = people
             .members
             .iter()
@@ -136,11 +146,17 @@ impl Store {
                 }
             })
             .collect();
-        Ok(AccountReply::Members { members, invited: people.invited })
+        Ok((members, people.invited))
     }
 
     fn invite(&mut self, file: &str, who: &Person, mail: &str, role: Role) -> Result<(), String> {
         self.owner(file, who)?;
+        self.add_by_email(file, mail, role)
+    }
+
+    /// Let an email in with a role: whoever signed in here with it becomes a member now, anyone
+    /// else is invited.
+    fn add_by_email(&mut self, file: &str, mail: &str, role: Role) -> Result<(), String> {
         let mail = email(mail).ok_or("that isn't an email address")?;
         let known = self.accounts.by_email(&mail);
         let entry = self.entry(file)?;
@@ -167,14 +183,32 @@ impl Store {
 
     fn set_role(&mut self, file: &str, who: &Person, account: &str, role: Role) -> Result<(), String> {
         self.owner(file, who)?;
+        self.change_role(file, account, role, false)
+    }
+
+    /// Give a member `role` (a file keeps its last owner); `add`: someone who signed in here but
+    /// isn't in the file becomes a member (admins recovering a file).
+    fn change_role(&mut self, file: &str, account: &str, role: Role, add: bool) -> Result<(), String> {
+        let known = add && self.accounts.account(account).is_some();
         let entry = self.entry(file)?;
         let p = &mut entry.meta.people;
         let owners = p.owners();
-        let m = p.members.iter_mut().find(|m| m.account == account).ok_or("they aren't in this file")?;
-        if m.role == Role::Owner && role != Role::Owner && owners == 1 {
-            return Err("a file keeps at least one owner".into());
+        match p.members.iter_mut().find(|m| m.account == account) {
+            Some(m) => {
+                if m.role == Role::Owner && role != Role::Owner && owners == 1 {
+                    return Err("a file keeps at least one owner".into());
+                }
+                m.role = role;
+            }
+            None if known => {
+                if p.members.len() + p.invited.len() >= MAX_MEMBERS {
+                    return Err(format!("a file has at most {MAX_MEMBERS} people"));
+                }
+                p.members.push(MemberRec { account: account.to_string(), role });
+            }
+            None if add => return Err("nobody with that account has signed in here".into()),
+            None => return Err("they aren't in this file".into()),
         }
-        m.role = role;
         self.save_meta(file)
     }
 
@@ -274,5 +308,122 @@ impl Store {
     /// May `who` manage the server without its key? Admins may, on a server with accounts.
     pub fn admin_may_manage(&self, who: Option<&Person>) -> bool {
         who.is_some_and(|w| w.admin) && self.accounts.mode().accounts()
+    }
+
+    /// Everyone who has signed in, as admins see them.
+    pub fn people_info(&self) -> Vec<PersonInfo> {
+        let mut owned: HashMap<&str, u32> = HashMap::new();
+        for e in self.files.values() {
+            for m in e.meta.people.members.iter().filter(|m| m.role == Role::Owner) {
+                *owned.entry(m.account.as_str()).or_default() += 1;
+            }
+        }
+        self.accounts
+            .people_with_sessions()
+            .into_iter()
+            .map(|(a, sessions)| PersonInfo {
+                admin: self.accounts.is_admin(&a),
+                owned: owned.get(a.id.as_str()).copied().unwrap_or(0),
+                sessions: u32::try_from(sessions).unwrap_or(u32::MAX),
+                account: a.id,
+                provider: a.provider,
+                email: a.email,
+                name: a.name,
+                created: a.created,
+                seen: a.seen,
+            })
+            .collect()
+    }
+
+    /// The files `account` is the only owner of.
+    fn sole_owner_of(&self, account: &str) -> Vec<OwnerlessFile> {
+        self.files
+            .iter()
+            .filter(|(_, e)| e.meta.people.role(account) == Some(Role::Owner) && e.meta.people.owners() == 1)
+            .map(|(id, e)| OwnerlessFile { id: id.clone(), name: e.meta.name.clone() })
+            .collect()
+    }
+
+    /// Take someone off the server ([`Admin::RemovePerson`]): out of every file (and their
+    /// pending invites), then their account and sessions.
+    fn remove_person(&mut self, account: &str, force: bool) -> Handled {
+        let failed = |reason: String| Handled::from(AdminReply::Failed { reason });
+        let known = self.accounts.account(account);
+        let files = self.files_where(|p| p.role(account).is_some());
+        if known.is_none() && files.is_empty() {
+            return failed(NOBODY.into());
+        }
+        let blocking = self.sole_owner_of(account);
+        if !blocking.is_empty() && !force {
+            return AdminReply::LastOwner { files: blocking }.into();
+        }
+        let mail = known.as_ref().and_then(|a| a.email.clone());
+        for id in self.file_ids() {
+            let Ok(entry) = self.entry(&id) else { continue };
+            let p = &mut entry.meta.people;
+            let before = (p.members.len(), p.invited.len());
+            p.members.retain(|m| m.account != account);
+            if let Some(mail) = &mail {
+                p.invited.retain(|v| v.email != *mail);
+            }
+            if (p.members.len(), p.invited.len()) != before
+                && let Err(e) = self.save_meta(&id)
+            {
+                // Nothing is half done for the person: they are still on the server, and asking
+                // again finishes the files left.
+                return failed(e);
+            }
+        }
+        if let Err(e) = self.accounts.remove_person(account) {
+            return failed(e);
+        }
+        for f in &blocking {
+            log::warn!("event=file_ownerless file={} account={account}", f.id);
+        }
+        Handled { ended: vec![account.to_string()], ..AdminReply::PersonRemoved { orphaned: blocking }.into() }
+    }
+
+    /// The people and file members requests of [`Admin`] (with the server key or as an admin).
+    pub fn admin_people(&mut self, req: Admin) -> Handled {
+        let failed = |reason: String| Handled::from(AdminReply::Failed { reason });
+        let done = |r: Result<(), String>| r.map_or_else(failed, |()| AdminReply::Done.into());
+        if !self.accounts.mode().accounts() && !matches!(req, Admin::ServerStatus) {
+            return failed(NO_ACCOUNTS.into());
+        }
+        match req {
+            Admin::People => AdminReply::People(self.people_info()).into(),
+            Admin::RemovePerson { account, force } => self.remove_person(&account, force),
+            Admin::EndSessions { account } => {
+                if self.accounts.account(&account).is_none() {
+                    return failed(NOBODY.into());
+                }
+                match self.accounts.end_sessions(&account) {
+                    Ok(n) => {
+                        log::info!("event=sessions_ended account={account} sessions={n}");
+                        Handled { ended: vec![account], ..AdminReply::Done.into() }
+                    }
+                    Err(e) => failed(e),
+                }
+            }
+            Admin::FileMembers { file } => {
+                self.member_list(&file).map_or_else(failed, |(members, invited)| AdminReply::FileMembers { members, invited }.into())
+            }
+            Admin::SetFileRole { file, account, role } => done(self.change_role(&file, &account, role, true)),
+            Admin::AddFileMember { file, email, role } => done(self.add_by_email(&file, &email, role)),
+            Admin::ServerStatus => {
+                let (people, sessions) = self.accounts.counts();
+                let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+                AdminReply::ServerStatus(ServerStatus {
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    info: self.accounts.info(),
+                    people: count(people),
+                    sessions: count(sessions),
+                    files: count(self.len()),
+                    free_bytes: crate::disk::free_bytes(&self.root),
+                })
+                .into()
+            }
+            _ => failed("that isn't a request about people".into()),
+        }
     }
 }

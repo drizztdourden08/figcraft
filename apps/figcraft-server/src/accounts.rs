@@ -98,6 +98,20 @@ impl Accounts {
     pub fn open(data: &Path, cfg: &AuthConfig, e2e: E2eMode, registry: &Registry, fetch: Arc<dyn Fetch>) -> Result<Accounts, String> {
         cfg.check()?;
         let providers = cfg.provider.iter().map(|p| Ok((p.id.clone(), registry.build(p, fetch.clone())?))).collect::<Result<Vec<_>, String>>()?;
+        Self::with_providers(data, cfg, e2e, providers)
+    }
+
+    /// Who has signed in on a stopped server's data directory, for the command line: the
+    /// providers that can be built with the built-in kinds (nobody signs in through it).
+    pub fn offline(data: &Path, cfg: &AuthConfig, e2e: E2eMode) -> Result<Accounts, String> {
+        cfg.check()?;
+        let registry = Registry::builtin();
+        let fetch: Arc<dyn Fetch> = Arc::new(crate::fetch::Https::new());
+        let providers = cfg.provider.iter().filter_map(|p| Some((p.id.clone(), registry.build(p, fetch.clone()).ok()?))).collect();
+        Self::with_providers(data, cfg, e2e, providers)
+    }
+
+    fn with_providers(data: &Path, cfg: &AuthConfig, e2e: E2eMode, providers: Vec<(String, Box<dyn IdentityProvider>)>) -> Result<Accounts, String> {
         let dir = data.join(DIR);
         let people: Vec<Account> = read(&dir.join(PEOPLE))?;
         let sessions: Vec<Session> = read(&dir.join(SESSIONS))?;
@@ -166,7 +180,7 @@ impl Accounts {
     }
 
     fn person(&self, a: &Account) -> Person {
-        let admin = a.email.as_ref().is_some_and(|e| self.policy.admins.contains(e));
+        let admin = self.is_admin(a);
         Person { account: a.id.clone(), name: a.name.clone(), email: a.email.clone(), admin }
     }
 
@@ -278,11 +292,50 @@ impl Accounts {
         Ok((Me { account: account.id, name: account.name, email: account.email, admin: person.admin, session: String::new(), expires }, person))
     }
 
-    /// End every session of `account` (removed by the operator).
-    pub fn end_sessions(&self, account: &str) -> Result<(), String> {
+    /// End every session of `account` (an admin or the operator did): how many there were.
+    pub fn end_sessions(&self, account: &str) -> Result<usize, String> {
         let mut s = self.state();
+        let before = s.sessions.len();
         s.sessions.retain(|x| x.account != account);
-        self.save_sessions(&s)
+        let ended = before - s.sessions.len();
+        if ended > 0 {
+            self.save_sessions(&s)?;
+        }
+        Ok(ended)
+    }
+
+    /// Forget `account`: its sessions end and its record goes. `None`: nobody had that id.
+    pub fn remove_person(&self, account: &str) -> Result<Option<Account>, String> {
+        let mut s = self.state();
+        let Some(i) = s.people.iter().position(|a| a.id == account) else { return Ok(None) };
+        let gone = s.people.remove(i);
+        let before = s.sessions.len();
+        s.sessions.retain(|x| x.account != account);
+        self.save_people(&s)?;
+        if s.sessions.len() != before {
+            self.save_sessions(&s)?;
+        }
+        log::info!("event=person_removed account={account}");
+        Ok(Some(gone))
+    }
+
+    /// Is this person an admin (their verified email is in `admins`)?
+    pub fn is_admin(&self, a: &Account) -> bool {
+        a.email.as_ref().is_some_and(|e| self.policy.admins.contains(e))
+    }
+
+    /// Everyone who has signed in, each with their sessions not expired.
+    pub fn people_with_sessions(&self) -> Vec<(Account, usize)> {
+        let s = self.state();
+        let t = now();
+        s.people.iter().map(|a| (a.clone(), s.sessions.iter().filter(|x| x.account == a.id && x.expires > t).count())).collect()
+    }
+
+    /// People who signed in, and sessions not expired.
+    pub fn counts(&self) -> (usize, usize) {
+        let s = self.state();
+        let t = now();
+        (s.people.len(), s.sessions.iter().filter(|x| x.expires > t).count())
     }
 
     fn refused(e: AuthError) -> (SignInReply, Option<Person>) {
