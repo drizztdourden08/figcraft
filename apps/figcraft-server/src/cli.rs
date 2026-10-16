@@ -1,5 +1,5 @@
 //! The command line: `figcraft-server` serves; `key`, `files`, `links`, `plugins`, `people`,
-//! `members` and `status` manage the data directory. When a server is running on the directory they ask it (so revoking a link
+//! `users`, `members` and `status` manage the data directory. When a server is running on the directory they ask it (so revoking a link
 //! disconnects whoever joined with it at once); otherwise they change the directory themselves.
 
 use std::fmt::Write as _;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use figcraft_collab::message::{
     Access, Admin, AdminReply, FileRow, Invited, LinkInfo, Member, NewLink, PersonInfo, PluginEntry, PluginReply, PluginReq, ReportInfo, Role,
-    ServerStatus,
+    ServerStatus, UserInfo,
 };
 use figcraft_collab_net::hub::Backend;
 use figcraft_collab_net::{Endpoint, Invite, manage};
@@ -52,12 +52,18 @@ With accounts ([auth]):
   figcraft-server members FILE                   a file's members and invites
   figcraft-server members add FILE EMAIL ROLE    let an email in as owner, editor or viewer
   figcraft-server members role FILE ACCOUNT ROLE give someone who signed in a role (adds them if needed)
+With basic accounts ([[auth.provider]] kind = \"password\"):
+  figcraft-server users [list]                   the usernames: email, name, account, temporary or locked
+  figcraft-server users add USERNAME [--email E] [--name N]  add someone: prints a password made for
+                                                 them (shown once; they change it after signing in)
+  figcraft-server users reset USERNAME           a new temporary password (shown once); signs them out
+  figcraft-server users remove USERNAME          they can't sign in any more (signed out; files stay)
 
 Options (also keys of the --config TOML file):
   --listen ADDR       where to listen (default 127.0.0.1:47900; 0.0.0.0:47900 for every network)
   --data DIR          the data directory (default ./figcraft-data)
   --public-url URL    how links name the server behind a reverse proxy (wss://host/path/)
-  --config FILE       settings: listen, data, public_url, max_files, max_file_mb, max_links,
+  --config FILE       settings: listen, data, name, public_url, max_files, max_file_mb, max_links,
                       max_connections, max_people, compact_after, compact_mb, max_plugins,
                       max_plugin_mb, max_plugins_mb; for a public server: open_publish,
                       operator_contact, terms_url, trusted_proxy, idle_days, max_total_mb,
@@ -108,6 +114,10 @@ pub enum Command {
     Members { file: String },
     AddMember { file: String, email: String, role: Role },
     SetRole { file: String, account: String, role: Role },
+    Users,
+    AddUser { username: String, email: Option<String>, name: String },
+    ResetPassword { username: String },
+    RemoveUser { username: String },
     Help,
     Version,
 }
@@ -133,6 +143,8 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut version = None;
     let mut sort = Sort::Id;
     let mut force = false;
+    let mut email = None;
+    let mut name = String::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = |name: &str| it.next().cloned().ok_or_else(|| format!("{name} needs a value"));
@@ -151,6 +163,8 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             "--label" => label = value("--label")?,
             "--rotate" => rotate = true,
             "--force" => force = true,
+            "--email" => email = Some(value("--email")?),
+            "--name" => name = value("--name")?,
             "--sort" => {
                 sort = match value("--sort")?.as_str() {
                     "size" => Sort::Size,
@@ -188,6 +202,10 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         ["members", "add", file, email, role] => Command::AddMember { file: file.to_string(), email: email.to_string(), role: role_arg(role)? },
         ["members", "role", file, account, role] => Command::SetRole { file: file.to_string(), account: account.to_string(), role: role_arg(role)? },
         ["members", file] | ["members", "list", file] => Command::Members { file: file.to_string() },
+        ["users"] | ["users", "list"] => Command::Users,
+        ["users", "add", username] => Command::AddUser { username: username.to_string(), email, name },
+        ["users", "reset", username] => Command::ResetPassword { username: username.to_string() },
+        ["users", "remove", username] => Command::RemoveUser { username: username.to_string() },
         _ => return Err(format!("unknown command `{}`", words.join(" "))),
     };
     config.check()?;
@@ -330,6 +348,28 @@ pub fn run(cli: &Cli) -> Result<String, String> {
                 other => unexpected(other),
             }
         }
+        Command::Users => match admin(cfg, Admin::Users)? {
+            AdminReply::Users(users) => Ok(users_table(&users)),
+            other => unexpected(other),
+        },
+        Command::AddUser { username, email, name } => {
+            match admin(cfg, Admin::CreateUser { username: username.clone(), email: email.clone(), name: name.clone(), password: None })? {
+                AdminReply::User { username, password } => Ok(password_text(&format!("Added {username}."), &username, password.map(|p| p.0))),
+                other => unexpected(other),
+            }
+        }
+        Command::ResetPassword { username } => match admin(cfg, Admin::ResetPassword { username: username.clone() })? {
+            AdminReply::User { username, password } => {
+                Ok(password_text(&format!("New password for {username}: they were signed out everywhere."), &username, password.map(|p| p.0)))
+            }
+            other => unexpected(other),
+        },
+        Command::RemoveUser { username } => match admin(cfg, Admin::RemoveUser { username: username.clone() })? {
+            AdminReply::Done => Ok(format!(
+                "Removed {username}: they can't sign in any more and were signed out (their account and files stay: `figcraft-server people remove ACCOUNT` takes those).\n"
+            )),
+            other => unexpected(other),
+        },
         Command::Plugins => match directory(cfg, PluginReq::List { query: String::new() })? {
             PluginReply::List(entries) => Ok(plugins_table(&entries)),
             other => unexpected_plugins(other),
@@ -530,6 +570,42 @@ fn people_table(people: &[PersonInfo]) -> String {
             p.owned,
             day(p.seen),
             if p.admin { "yes" } else { "" }
+        );
+    }
+    out
+}
+
+/// What `users add` and `users reset` print: the password made, shown once.
+fn password_text(head: &str, username: &str, password: Option<String>) -> String {
+    let mut out = format!("{head}\n");
+    if let Some(p) = password {
+        let _ = writeln!(out, "Their password (shown only now: the server keeps only a hash):");
+        let _ = writeln!(out, "  {p}");
+        let _ = writeln!(out, "Give it to {username} privately; they sign in with it and change it (FigCraft: account.changePassword).");
+    }
+    out
+}
+
+fn users_table(users: &[UserInfo]) -> String {
+    if users.is_empty() {
+        return "No usernames yet (add one with `figcraft-server users add USERNAME --email E --name N`).\n".into();
+    }
+    let mut out = String::from("USERNAME              EMAIL                           NAME                  ACCOUNT           CHANGED     STATE\n");
+    for u in users {
+        let state = match (u.locked, u.temporary) {
+            (l, _) if l > 0 => format!("locked {}m", l.div_ceil(60)),
+            (_, true) => "temporary".to_string(),
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "{:<20}  {:<30}  {:<20}  {:<16}  {:<10}  {}",
+            elide(&u.username, 20),
+            elide(u.email.as_deref().unwrap_or("-"), 30),
+            elide(&u.name, 20),
+            u.account.as_deref().unwrap_or("-"),
+            day(u.changed),
+            state
         );
     }
     out

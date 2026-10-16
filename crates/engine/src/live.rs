@@ -41,7 +41,7 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-pub use figcraft_auth::{Flow, Me, ServerInfo, SignIn, SignInReply};
+pub use figcraft_auth::{Flow, Me, ServerAbout, ServerInfo, SignIn, SignInReply};
 use figcraft_collab::Client;
 use figcraft_collab::code::{self, Code};
 pub use figcraft_collab::message::Signal;
@@ -357,8 +357,8 @@ pub enum NetRequest {
     /// Ask the server at `server` about its hosting and, with a file's owner token, manage that
     /// file ([`LiveLink::hosting`]).
     Hosting { server: String, file: String, owner: String, req: Option<Admin> },
-    /// What the server at `server` accepts: who may get in, how to sign in, whether files are
-    /// sealed ([`LiveLink::accounts`]).
+    /// What the server at `server` says about itself: its name, who may get in, how to sign in,
+    /// whether files are sealed ([`LiveLink::accounts`]).
     Info { server: String },
     /// One sign-in step with the server at `server` ([`LiveLink::accounts`]).
     SignIn { server: String, req: SignIn },
@@ -426,7 +426,7 @@ pub enum NetReply {
     Upload(std::result::Result<Published, String>),
     /// What the server says about its hosting, and its answer to the request, if one was sent.
     Hosting(std::result::Result<(HostInfo, Option<AdminReply>), String>),
-    Info(std::result::Result<ServerInfo, String>),
+    Info(std::result::Result<ServerAbout, String>),
     SignIn(std::result::Result<SignInReply, String>),
     Account(std::result::Result<AccountReply, String>),
 }
@@ -779,6 +779,10 @@ impl Lives {
         self.sessions.values_mut()
     }
 
+    pub(crate) fn sessions(&self) -> impl Iterator<Item = &Live> {
+        self.sessions.values()
+    }
+
     /// The session the tab of document `tab` shows (`None`: no document is open): the one that
     /// syncs it, else the latest join started from it.
     fn shown(&self, tab: Option<u64>) -> Option<SessionId> {
@@ -1007,8 +1011,10 @@ impl Session {
     /// Take in what happened in every session (the UI calls it every frame; the network wakes the
     /// UI when something arrives). Returns whether anything changed.
     pub fn live_poll(&mut self) -> bool {
-        // Keys of sealed files, now and then (in the background).
+        // Keys of sealed files, and previews of the files open on servers, now and then (in the
+        // background).
         self.keys_tick();
+        self.thumbs_tick();
         let Some(link) = self.live.link.as_mut() else { return false };
         let events = link.poll();
         if events.is_empty() {
@@ -1125,6 +1131,10 @@ impl Session {
                     && let Some(s) = crate::accounts::server_of(&p.edit)
                 {
                     self.keys_after_publish(&s);
+                }
+                // And its preview goes to the server.
+                if let Some(s) = crate::accounts::server_of(&p.edit) {
+                    self.thumbs_after_publish(&s, &p.file);
                 }
             }
             Event::Shared(Ok(links)) => {

@@ -46,6 +46,7 @@ pub mod plugins;
 pub mod proto_run;
 pub mod rename;
 pub mod rotation_origin;
+pub mod server_files;
 pub mod shape_handles;
 pub mod shapebuilder;
 pub mod snap;

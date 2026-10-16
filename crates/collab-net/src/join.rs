@@ -317,6 +317,7 @@ pub(crate) fn take(m: ServerMsg, cfg: &GuestConfig, inbox: &Inbox, seen: &mut Se
         | ServerMsg::Plugins(_)
         | ServerMsg::Resolved { .. }
         | ServerMsg::Info(_)
+        | ServerMsg::About(_)
         | ServerMsg::Account(_) => {}
         // Opened above (`crate::sealing::incoming`).
         ServerMsg::SealedWelcome { .. }

@@ -273,9 +273,13 @@ Publishing makes an edit link and a view link labelled `Published (edit)` and `P
 
 ## Accounts (sign-in)
 
-By default people get into files with share links and join codes. With `[auth]` they can sign in
-instead, through **identity providers**, and each file has **members** with a role: owner (manages
-who gets in), editor or viewer. The design is in [`accounts-and-e2e.md`](accounts-and-e2e.md).
+By default a server is **open**: people get into files with share links and join codes, nobody
+signs in (`mode = "links"`, also spelled `"open"`). With `[auth]` they can sign in instead, with a
+username and password the server keeps (**basic** accounts, `kind = "password"`) or through
+**identity providers** (**SSO**: Google, Keycloak…), and each file has **members** with a role:
+owner (manages who gets in), editor or viewer. Give the server a `name = "…"` (top level of
+`server.toml`, at most 80 characters) and apps show it instead of its address when you haven't
+named it yourself. The design is in [`accounts-and-e2e.md`](accounts-and-e2e.md).
 Setting one up, provider by provider: [`server-accounts.md`](server-accounts.md).
 
 ```toml
@@ -302,6 +306,14 @@ client_secret_file = "/etc/figcraft-server/google.secret"
 - **`external`** asks a verifier you run who a pasted token is: `verify_url` receives
   `{"provider", "token"}` and answers `{"subject", "email"?, "email_verified"?, "name"?}` (200), or
   401/403 with `{"error"}`.
+- **`password`** keeps usernames and passwords on the server itself (Argon2id hashes in
+  `<data>/accounts/passwords.json`): no provider to register. Admins add people with
+  `figcraft-server users add USERNAME --email E --name N` (a password made for them is printed
+  once), `users reset`, `users remove`, `users list`; people change their password from the app;
+  `allow_signup = true` lets people make their own account. Passwords are taken only over TLS
+  (through the reverse proxy) or from the server's own machine, and wrong ones lock the username
+  (5 in a row) or the address (20) out for 15 minutes. See
+  [`server-accounts.md`](server-accounts.md#basic-accounts-usernames-and-passwords).
 - **Your own kind**: a server build can register an `IdentityProvider` implementation
   (`figcraft_server::start_with` with a `figcraft_auth::registry::Registry`).
 
@@ -331,6 +343,10 @@ server, or on the stopped data directory):
 | `figcraft-server members FILE` | Any file's members and invites |
 | `figcraft-server members add FILE EMAIL ROLE` | Let an email in as `owner`, `editor` or `viewer` (a member at once if they signed in here, else invited) |
 | `figcraft-server members role FILE ACCOUNT ROLE` | Give someone who signed in here a role in a file, adding them if needed |
+| `figcraft-server users [list]` | Basic accounts: every username, its email, name, account, whether its password is temporary or locked out |
+| `figcraft-server users add USERNAME [--email E] [--name N]` | Add someone who signs in with a username and password: prints the password made for them, once |
+| `figcraft-server users reset USERNAME` | A new temporary password (printed once); signs them out everywhere and lifts a lockout |
+| `figcraft-server users remove USERNAME` | They can't sign in any more and are signed out; their account and files stay (`people remove` takes those) |
 
 Removing someone who is the **last owner** of a file is refused, listing those files: make someone
 else owner first (`members role FILE ACCOUNT owner`). With `--force` they are removed anyway and
@@ -422,7 +438,8 @@ behaves as before (blocked addresses, report rates and the limits on
 <data>/LOCK                    held while the server (or a command) uses the directory
 <data>/server.json             where the running server listens (read by the commands)
 <data>/server.key              the server key
-<data>/files/<id>/meta.json    the file's name, when it was created and last changed
+<data>/files/<id>/meta.json    the file's name, when it was created and last changed (with
+                               accounts: its members, invites, folder and when its preview was set)
 <data>/files/<id>/links.json   its links: id, access, label, created, SHA-256 of the token, and for
                                a link with a join code its stretched hash and the wrapped token
 <data>/files/<id>/snapshot.bin its state at the last compaction (with a checksum)
@@ -432,6 +449,14 @@ behaves as before (blocked addresses, report rates and the limits on
 <data>/files/<id>/usage.json   which files use that library's components, as their apps report it
 <data>/files/<id>/keyring.json a sealed file's key wrapped to each member device (servers with
                                accounts: ciphertext only)
+<data>/files/<id>/thumbnail.bin its preview (servers with accounts): a PNG of at most 256 KiB,
+                               or for a sealed file that PNG sealed by the app (unreadable here)
+<data>/accounts/               who signed in, their sessions (hashes), devices, recovery copies and,
+                               with basic accounts, passwords.json (usernames and Argon2id hashes):
+                               see server-accounts.md
+<data>/folders.json            empty folders people made (servers with accounts; a file's folder is
+                               the "folder" of its meta.json)
+<data>/recents.json            when each person last opened each file (servers with accounts)
 <data>/plugins/index.json      the plugin directory: every version kept (manifest fields, size, SHA-256)
 <data>/plugins/<sha256>.bin    a plugin bundle, named by the SHA-256 of its bytes
 <data>/blocked.json            the addresses the operator blocked

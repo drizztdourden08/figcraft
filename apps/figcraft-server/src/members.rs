@@ -7,7 +7,9 @@ use std::collections::HashMap;
 
 use figcraft_auth::{Gate, Person};
 use figcraft_collab::Change;
-use figcraft_collab::message::{AccountReply, AccountReq, Admin, AdminReply, Invited, Member, MyFile, OwnerlessFile, PersonInfo, Role, ServerStatus};
+use figcraft_collab::message::{
+    AccountReply, AccountReq, Admin, AdminReply, Invited, Member, MyFile, OwnerlessFile, PersonInfo, Role, Secret, ServerStatus,
+};
 use figcraft_collab_net::hub::{AccountHandled, Admission, Handled, OpenFile};
 use serde::{Deserialize, Serialize};
 
@@ -326,6 +328,15 @@ impl Store {
             | AccountReq::GetRecovery
             | AccountReq::DevicesOf { .. }) => self.key_request(who, req),
             AccountReq::EditorKeys { file } => self.editor_keys(who, &file, open).map_or_else(failed, Into::into),
+            AccountReq::ChangePassword { old, new } => done(self.accounts.change_password(who, &old.0, &new.0)),
+            req @ (AccountReq::Folders
+            | AccountReq::CreateFolder { .. }
+            | AccountReq::RenameFolder { .. }
+            | AccountReq::RemoveFolder { .. }
+            | AccountReq::MoveFile { .. }
+            | AccountReq::Browse
+            | AccountReq::SetThumbnail { .. }
+            | AccountReq::GetThumbnail { .. }) => self.folder_request(who, req, open),
         }
     }
 
@@ -402,6 +413,7 @@ impl Store {
         if let Err(e) = self.accounts.remove_person(account) {
             return failed(e);
         }
+        self.forget_folders_of(account);
         for f in &blocking {
             log::warn!("event=file_ownerless file={} account={account}", f.id);
         }
@@ -435,6 +447,24 @@ impl Store {
             }
             Admin::SetFileRole { file, account, role } => done(self.change_role(&file, &account, role, true)),
             Admin::AddFileMember { file, email, role } => done(self.add_by_email(&file, &email, role)),
+            Admin::CreateUser { username, email, name, password } => {
+                match self.accounts.create_user(&username, email.as_deref(), &name, password.as_ref().map(|p| p.0.as_str())) {
+                    Ok(made) => AdminReply::User { username: username.trim().to_ascii_lowercase(), password: made.map(Secret) }.into(),
+                    Err(e) => failed(e),
+                }
+            }
+            Admin::ResetPassword { username } => match self.accounts.reset_password(&username) {
+                Ok((made, account)) => Handled {
+                    ended: account.into_iter().collect(),
+                    ..AdminReply::User { username: username.trim().to_ascii_lowercase(), password: Some(Secret(made)) }.into()
+                },
+                Err(e) => failed(e),
+            },
+            Admin::RemoveUser { username } => match self.accounts.remove_user(&username) {
+                Ok(account) => Handled { ended: account.into_iter().collect(), ..AdminReply::Done.into() },
+                Err(e) => failed(e),
+            },
+            Admin::Users => self.accounts.users().map_or_else(failed, |u| AdminReply::Users(u).into()),
             Admin::ServerStatus => {
                 let (people, sessions) = self.accounts.counts();
                 let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);

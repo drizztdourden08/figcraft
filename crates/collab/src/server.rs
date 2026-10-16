@@ -773,6 +773,7 @@ impl<S: Synced> SessionServer<S> {
             | ClientMsg::OpenHosting(_)
             | ClientMsg::Resolve(_)
             | ClientMsg::Info
+            | ClientMsg::About
             | ClientMsg::SignIn(_)
             | ClientMsg::OpenAccount(_)
             | ClientMsg::Account(_)

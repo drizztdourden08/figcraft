@@ -69,6 +69,20 @@ pub trait IdentityProvider: Send + Sync {
     fn verify_token(&self, _token: &str) -> Result<Identity, AuthError> {
         Err(AuthError::Unsupported)
     }
+
+    /// A username and password (the `password` flow: the server's own accounts, or a directory
+    /// such as LDAP a kind of your own asks). Wrong ones are [`AuthError::Refused`]; the server
+    /// counts them against the username and the address (and locks both out for a while). Never
+    /// log the password.
+    fn verify_password(&self, _username: &str, _password: &str) -> Result<Identity, AuthError> {
+        Err(AuthError::Unsupported)
+    }
+
+    /// Make an account with this username and password (the `signUp` flow, when the provider lets
+    /// people sign up), then who it is. `email` isn't verified.
+    fn sign_up(&self, _username: &str, _password: &str, _email: Option<&str>, _name: &str) -> Result<Identity, AuthError> {
+        Err(AuthError::Unsupported)
+    }
 }
 
 /// The HTTPS requests providers make, supplied by the server (this crate opens no sockets).

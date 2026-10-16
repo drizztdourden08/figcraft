@@ -34,7 +34,7 @@ pub mod wire;
 pub use config::{AuthConfig, E2eConfig, ProviderConfig};
 pub use policy::Policy;
 pub use provider::{AuthError, DeviceStart, Fetch, FetchError, Identity, IdentityProvider};
-pub use wire::{AuthMode, DeviceCode, E2eMode, Flow, Me, ProviderInfo, ServerInfo, SignIn, SignInReply};
+pub use wire::{AuthMode, DeviceCode, E2eMode, Flow, Me, ProviderInfo, ServerAbout, ServerInfo, SignIn, SignInReply};
 
 /// Someone a connection was signed in as: what a host's backend admits by.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,15 +47,47 @@ pub struct Person {
     pub admin: bool,
 }
 
+/// Where a sign-in step came from: what a host needs to hold back password guessing and to take
+/// passwords only over a private channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Origin {
+    /// The client's address (behind the trusted proxy: the one it forwarded).
+    pub ip: std::net::IpAddr,
+    /// The connection came from this machine, or through the trusted reverse proxy (which
+    /// terminates TLS): a password sent on it wasn't on the network in the clear. The server
+    /// itself speaks plain `ws://`, so any other connection is in the clear.
+    pub private: bool,
+}
+
+impl Origin {
+    /// A step from this machine (tests, the command line).
+    pub fn local() -> Origin {
+        Origin { ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), private: true }
+    }
+}
+
 /// What a host asks before a connection's first message (`Hello`, `Manage`…): what it accepts,
 /// and who a sign-in is. Called from the connection's own thread (providers are slow), never the
 /// hub's.
 pub trait Gate: Send + Sync {
-    /// What this host accepts (the answer to `Info`).
+    /// What this host accepts (the answer to `Info`: only the flows older apps read, see
+    /// [`ServerInfo::for_older_apps`]).
     fn info(&self) -> ServerInfo;
 
     /// A sign-in step: the reply, and the person when it signed the connection in.
     fn sign_in(&self, req: SignIn) -> (SignInReply, Option<Person>);
+
+    /// What this host says about itself (the answer to `About`): its name and everything it
+    /// accepts.
+    fn about(&self) -> ServerAbout {
+        ServerAbout { name: String::new(), info: self.info(), version: String::new() }
+    }
+
+    /// [`sign_in`](Self::sign_in), knowing where the step came from (hosts that take passwords
+    /// need it).
+    fn sign_in_from(&self, req: SignIn, _from: Origin) -> (SignInReply, Option<Person>) {
+        self.sign_in(req)
+    }
 }
 
 /// Today's behaviour: share links only, nobody signs in, nothing sealed.

@@ -28,7 +28,12 @@ is built** (signatures switched on, see *Editor signatures*): on a server with a
 a sealed file's owners and editors sign every batch, the server lists their devices
 (`AccountReq::EditorKeys`) and marks the file as requiring signatures, every app refuses a batch
 that isn't signed by one of those devices, and safety numbers cover other people, with a warning
-when their devices change. Sections say what is built as the implementation lands. Builds on
+when their devices change. **Step 12 is built** (server side, protocol and engine; the app's
+screens come next): **basic accounts** (`kind = "password"`: usernames and Argon2id password hashes
+the server keeps, admins adding people and resetting passwords, people changing theirs, optional
+self sign-up, lockouts against guessing, passwords only over TLS), the server's **name** (`About`),
+**folders**, **recent files** and **previews** of server files (see *Basic accounts, folders and
+previews*). Sections say what is built as the implementation lands. Builds on
 [`collab-protocol.md`](collab-protocol.md)
 (live sessions) and [`server.md`](server.md) (running `figcraft-server`).
 
@@ -144,6 +149,7 @@ that isn't theirs.
 
 | Kind | Flows | How the server checks |
 |---|---|---|
+| `password` (built into the server, step 12) | `password`, and `signUp` with `allow_signup` | Its own usernames: Argon2id hashes in `accounts/passwords.json`, compared in constant time; wrong passwords lock the username and the address out for a while (see *Basic accounts, folders and previews*) |
 | `oidc` | `browser` (authorization code + PKCE, loopback redirect) by default; `device` (RFC 8628) only when `flows` lists it, and the issuer has a device endpoint | Discovery document → token endpoint → ID token signature against the issuer's keys (cached, refetched when a key id is new), `iss`, `aud`, `exp`, `nbf`, `iat`; `email_verified` (or `trust_email`) for allow-lists |
 | `oidc` + `preset = "google"` or `"gitlab"` | The same | The same code; the preset only fills the issuer and the label |
 | `external` | `token` | POSTs `{"provider": …, "token": …}` to `verify_url`, expects `{"subject", "email"?, "email_verified"?, "name"?}` (200) or a refusal (401/403 with an optional `{"error"}`); reference verifier in [`examples/auth-verifier/`](../examples/auth-verifier/) |
@@ -460,11 +466,15 @@ keep talking to each other on everything they knew.
 | Direction | Message | |
 |---|---|---|
 | C → S | `Info` | What this server accepts |
-| S → C | `Info(ServerInfo)` | Auth mode, providers and their flows, e2e mode, protocol |
+| S → C | `Info(ServerInfo)` | Auth mode, providers and their flows, e2e mode, protocol (only the flows older apps read: `Password` and `SignUp` are left out) |
+| C → S | `About` (step 12) | What the server says about itself |
+| S → C | `About(ServerAbout)` | Its name, the whole `ServerInfo` (every flow), its version; older servers refuse `About`: ask `Info` |
 | C → S | `SignIn(SignIn)` | `Session`, `Code`, `DeviceStart`, `DevicePoll`, `Token`, `SignOut` |
 | S → C | `SignedIn(Me)` / `Device(DeviceCode)` / `SignInPending` | |
 | C → S | `OpenAccount` then `Account(AccountReq)` | Files, publish, members, invites, devices, keyrings, recovery (step 9: see *Sealed files with accounts*) |
 | S → C | `Account(AccountReply)` | |
+| C → S | `SignIn::Password`, `SignIn::SignUp`, `AccountReq::ChangePassword`, `Admin::CreateUser`/`ResetPassword`/`RemoveUser`/`Users` | Basic accounts (step 12) |
+| C → S | `AccountReq::Folders`/`CreateFolder`/`RenameFolder`/`RemoveFolder`/`MoveFile`/`Browse`/`SetThumbnail`/`GetThumbnail` | Folders, recent files and previews (step 12) |
 | C ↔ S | `SealedChanges`, `SealedWelcome`, `SealedReject`, `SealedPresence`, `SealedSignal` | The sealed counterparts of the session messages |
 | C ↔ S | `SealedChange::Signature` (the last change of a sealed batch) | An editor device's signature of the batch (step 10) |
 | C → S | `Admin::PublishSealed`, `AccountReq::PublishSealed`, `…::RenameSealed` | Publish or rename a sealed file |
@@ -707,6 +717,87 @@ is added (safety numbers let people check, and apps warn when someone's devices 
 members who haven't picked up a new epoch are sealed with the old one (readable by the person
 taken out, should they get the server's data).
 
+### Basic accounts, folders and previews (built, step 12)
+
+**Three kinds of server**, as apps show them (`ServerInfo::access()`, `account.info`'s `access`):
+**open** (`auth.mode = "links"`, also spelled `"open"`: nobody signs in, a share link or a join code
+is the access: every server before accounts), **basic** (usernames and passwords the server keeps)
+and **SSO** (an identity provider: Google, Keycloak, an `external` verifier…), or basic and SSO
+together. No new mode: basic accounts are a provider kind, so `accounts` and `accounts+links` work
+with them as with any provider.
+
+**Basic accounts** (`[[auth.provider]] kind = "password"`, at most one per server; it takes only
+`id`, `label` and `allow_signup`). The server builds it itself (its usernames live in the data
+directory), so it isn't in the `Registry`. Any provider may offer the password flow: the trait
+gained `verify_password(username, password)` and `sign_up(username, password, email, name)`, both
+`Unsupported` by default, so a kind of your own (an LDAP directory, say) offers `Flow::Password` and
+gets the same lockouts.
+
+- **Wire** (appended): `Flow::Password { label }`, `Flow::SignUp`; `SignIn::Password { provider,
+  username, password }`, `SignIn::SignUp { provider, username, password, email?, name }`; `Debug`
+  of `SignIn` leaves every secret out (the token, code, verifier and password). Apps from before
+  them can't decode those flows, so the server's answer to `Info` leaves them out
+  (`ServerInfo::for_older_apps`; the provider stays listed with no flow, which older apps report as
+  not usable from them) and only `About` carries them.
+- **Identity**: `(provider id, username)`; the username is lowercase, 1–64 letters, digits, `.`,
+  `-`, `_` or `@`. An email an admin gave counts as verified (allow-lists, admins and invites go by
+  it); one typed when signing up doesn't, so a server whose allow-lists aren't empty refuses
+  sign-ups (an admin adds those people).
+- **Hashes**: Argon2id (RustCrypto's `argon2`), 19 MiB, 2 passes, 1 lane (OWASP's recommendation),
+  a 128-bit salt, kept as a PHC-style string that records its parameters; compared in constant
+  time; an unknown username is checked against a dummy hash so it takes as long.
+- **Guessing**: 5 wrong passwords in a row lock a username out for 15 minutes, 20 from one address
+  (an IPv6 /64) lock the address out; an address tries at most 10 a minute and signs up at most 5
+  times an hour. In memory, like join codes' counters. A wrong username and a wrong password say the
+  same.
+- **Rules**: 10 to 256 characters, no control characters, not the username. Generated passwords
+  (an admin adding someone without one, or resetting) are 20 characters from a look-alike-free
+  alphabet (about 100 bits), shown once and marked temporary until changed.
+- **Only over a private channel**: the hub tells the gate where a step came from
+  (`Gate::sign_in_from(req, Origin { ip, private })`, `private` when the connection is from the
+  server's own machine or through `trusted_proxy`, which terminates TLS); the server refuses a
+  password on any other connection, since it speaks plain `ws://` itself. The app refuses to send
+  one to a `ws://` address on another machine (`manage::PASSWORD_IN_CLEAR`).
+- **Management**: `Admin::CreateUser { username, email?, name, password? }` (a password made when
+  none is given) and `Admin::ResetPassword { username }` answer `AdminReply::User { username,
+  password? }` (shown once; a reset ends the person's sessions and lifts their lockout);
+  `Admin::RemoveUser` ends their sessions and the password (their account and files stay until
+  `Admin::RemovePerson`, which also takes the username); `Admin::Users` lists `UserInfo`.
+  `AccountReq::ChangePassword { old, new }` (a wrong `old` counts like a wrong sign-in). Passwords
+  travel as `Secret`, whose `Debug` shows nothing. CLI: `figcraft-server users [list|add|reset|remove]`.
+- **Engine**: `account.signIn {username, password}` (the `password` flow; never echoed),
+  `account.signUp`, `account.changePassword`.
+
+**The server's name**: `name = "…"` in `server.toml` (at most 80 characters), in `ServerAbout`
+(`ClientMsg::About` → `ServerMsg::About`, appended; `ServerInfo` itself is unchanged so older apps
+decode `Info` as before). Apps show the name people gave a server first, then this, then its
+address. `account.info` returns it as `name`.
+
+**Folders**: a file has **one** folder (`meta.json`'s `folder`, names joined by `/`, at most 8 deep,
+64 characters a name, 256 in all), the same for everyone in it; owners and editors move it
+(`MoveFile`). Folders aren't objects of their own: a folder exists while a file is in it (or
+below), and a person sees the folders of the files they're in with their parents. An empty folder
+someone made (`CreateFolder`) is theirs (`folders.json`): others see it once a file they're in is
+put there. `RenameFolder` moves the files in it that you may edit (and your own empty folders);
+`RemoveFolder` removes your empty folders, only when no file you're in is in it. Folder names are
+plain text on the server, also for sealed files.
+
+**Recent files**: when someone signed in joins a file, the server notes when (`recents.json`, the
+newest 100 per person, written at most once a minute per file and person). `AccountReq::Browse`
+answers `AccountReply::Browse { files: [FileEntry { info, role, folder, sealed, thumbnail: when it
+was set?, opened: when you last opened it? }], folders }`; `AccountReq::Files` stays as it was.
+
+**Previews**: `AccountReq::SetThumbnail { file, image }` (owners and editors; at most 256 KiB): a
+PNG for a plain file, and for a sealed file the PNG sealed for slot `Meta { what: "thumbnail" }`
+with the file's key: the server keeps it as it comes (`thumbnail.bin`), checking only that it is a
+PNG (plain) or a sealed value (sealed). `GetThumbnail` (everyone in the file) answers
+`AccountReply::Thumbnail { image, set }`. The app renders the first page at 256 pixels on its
+longest side and sends it after publishing to a server it is signed in to, and every two minutes
+for a file it edits there when the document changed (`account.uploadThumbnail` sends one now);
+`account.thumbnail` gives it back as base64 PNG (opened with the key kept here for a sealed file,
+else no picture). `account.browse`, `account.folders`, `account.createFolder`,
+`account.renameFolder`, `account.removeFolder` and `account.moveFile` are the rest.
+
 ## Crates
 
 | Crate | Layer | Holds |
@@ -745,3 +836,5 @@ members and keyrings and builds the providers from its config.
 11. **Built**: signatures switched on for sealed files on servers with accounts (`EditorKeys`,
     signing and checking in the app, files that require signatures), other people's safety
     numbers and key-change warnings.
+12. **Built**: basic accounts (usernames and passwords), the server's name, folders, recent files
+    and previews (server, protocol and engine; the app's screens next).

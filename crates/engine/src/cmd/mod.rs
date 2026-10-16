@@ -107,6 +107,7 @@ fn registry() -> &'static Registry {
         list.extend(crate::online::specs());
         list.extend(crate::accounts::specs());
         list.extend(crate::devices::specs());
+        list.extend(crate::server_files::specs());
         list.extend(crate::invite_links::specs());
         list.extend(crate::templates::specs());
         let mut index = HashMap::new();
