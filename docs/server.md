@@ -6,8 +6,8 @@ to it stays there when everyone has left; people open it with a **share link** t
 restart (or a crash) loses nothing that was confirmed, and apps reconnect where they were. It is
 headless, native only (no web build), and runs on the same platforms as the desktop app.
 
-There are no user accounts yet: a share link is the access to one file, and the **server key**
-manages files (publishing, links, removal). Accounts and per-person permissions come later. A file
+By default a share link is the access to one file, and the **server key**
+manages files (publishing, links, removal), unless the server has [accounts](server-accounts.md). A file
 can also hold a **team library** that other files use through one of its links (see
 [Team libraries](#team-libraries)), and the server can keep a **plugin directory** for the team (see
 [Plugin directory](#plugin-directory)). A server can also be **open to the public**: anyone
@@ -276,6 +276,7 @@ Publishing makes an edit link and a view link labelled `Published (edit)` and `P
 By default people get into files with share links and join codes. With `[auth]` they can sign in
 instead, through **identity providers**, and each file has **members** with a role: owner (manages
 who gets in), editor or viewer. The design is in [`accounts-and-e2e.md`](accounts-and-e2e.md).
+Setting one up, provider by provider: [`server-accounts.md`](server-accounts.md).
 
 ```toml
 [auth]
