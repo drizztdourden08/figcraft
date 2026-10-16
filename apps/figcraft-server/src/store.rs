@@ -6,7 +6,8 @@
 //! <data>/server.json             where the running server listens (for the command line)
 //! <data>/server.key              the server key: managing files (publish, links, removal)
 //! <data>/files/<id>/meta.json    name, created, updated, sequence number; with accounts, its
-//!                                members and invites (see `members`)
+//!                                members and invites (see `members`); a sealed file's name sealed
+//!                                (the server can't read it) and `"sealed": true`
 //! <data>/files/<id>/links.json   share links: id, access, label, created, SHA-256 of the token,
 //!                                and a join code's hash and wrapped token (see `codes`)
 //! <data>/files/<id>/snapshot.bin the session state at the last compaction
@@ -30,6 +31,11 @@
 //! state is written as the next snapshot and the log starts over. Link tokens are stored only as
 //! hashes and compared in constant time. Whatever is damaged at startup is skipped and reported,
 //! never deleted.
+//!
+//! A **sealed** file (end-to-end encrypted, `[e2e] mode` `"optional"` or `"required"`) is kept the
+//! same way, its session being an [`OpaqueServer`]: the snapshot and log hold its structure and
+//! sealed values the server can't read, its name is sealed, and a team library published under it
+//! is kept as the bytes it came as (the apps check it after opening it).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -39,13 +45,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use figcraft_auth::E2eMode;
 use figcraft_auth::Person;
 use figcraft_collab::message::AccountReq;
 use figcraft_collab::message::{
     Access, Admin, AdminReply, ClientMsg, FileInfo, FileRow, FileUsage, HostInfo, LibraryReply, LibraryReq, LinkInfo, MAX_OWNED, NewLink, OwnedFile,
     PluginReply, PluginReq, ReportInfo, Usage,
 };
-use figcraft_collab::{Change, Replica, Server, same_secret};
+use figcraft_collab::sealed::{Sealed as SealedBlob, SealedChange, sealed_name_text};
+use figcraft_collab::{Change, FileServer, OpaqueReplica, OpaqueServer, Replica, Server, same_secret};
 use figcraft_collab_net::hub::{AccountHandled, Admission, Backend, Closing, Handled, OpenFile, ip_key};
 use figcraft_collab_net::token;
 use serde::{Deserialize, Serialize};
@@ -90,6 +98,30 @@ pub const KEY_ONLY: &str = "this server takes files only from people who have it
 
 /// Why a file published without the key can't hold a team library on a public server (a library
 /// is a whole archive checked on the server; strangers' files don't get that).
+pub const SEALED_ONLY: &str = "this server keeps only sealed (end-to-end encrypted) files: publish with a FigCraft that seals files";
+
+/// Why a sealed file is refused on a server that keeps none.
+pub const NO_SEALED: &str = "this server doesn't keep sealed (end-to-end encrypted) files (its `[e2e] mode` is \"off\")";
+
+/// Why a sealed file's name can't be changed in the clear.
+pub const NAME_SEALED: &str = "this file's name is sealed: rename it from FigCraft (with the file open)";
+
+/// Why a plain file's name can't be sealed.
+pub const NAME_PLAIN: &str = "this file isn't sealed: rename it with a plain name";
+
+/// A document to keep as a new file: plain, or sealed (its id chosen by the app, which sealed
+/// its values for it).
+#[derive(Clone, Copy, Debug)]
+pub enum NewFile<'a> {
+    Plain { name: &'a str, snapshot: &'a [Change] },
+    Sealed { file: &'a str, name: &'a SealedBlob, snapshot: &'a [SealedChange] },
+}
+
+/// A file id an app chose for a sealed file: 16 lowercase hex digits, as the server makes them.
+pub fn chosen_id(s: &str) -> bool {
+    s.len() == 16 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 pub const NO_PUBLIC_LIBRARY: &str = "on this public server only files published with the server key can hold a team library";
 
 /// Most files whose usage of one library is kept (the least recently changed go first), and most
@@ -179,9 +211,24 @@ struct Meta {
     /// Its members and invites (servers with accounts).
     #[serde(default, flatten)]
     people: members::People,
+    /// End-to-end encrypted: its snapshot and log hold a sealed session and `name` is empty.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    sealed: bool,
+    /// A sealed file's name, sealed (the apps open it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealed_name: Option<SealedBlob>,
 }
 
 impl Meta {
+    /// The name listings show: the name, or for a sealed file its sealed name as text
+    /// ([`sealed_name_text`]).
+    fn shown_name(&self) -> String {
+        match &self.sealed_name {
+            Some(n) => sealed_name_text(n),
+            None => self.name.clone(),
+        }
+    }
+
     /// When it was last used: made, changed or opened.
     fn used(&self) -> u64 {
         self.created.max(self.updated).max(self.opened)
@@ -451,8 +498,8 @@ impl Store {
         let generation = disk::check_snapshot(&disk::read_capped(&path.join(SNAPSHOT), self.snapshot_cap())?)?;
         // A damaged log only loses its end; it is reported when the file opens.
         if let Ok(bytes) = disk::read_capped(&path.join(LOG), self.cfg.max_file_bytes)
-            && let Ok(log) = disk::read_log(&bytes)
-            && log.generation != generation
+            && let Ok(log_generation) = disk::log_generation(&bytes)
+            && log_generation != generation
         {
             log::info!("file at {}: its log predates the last compaction; it is ignored", path.display());
         }
@@ -541,7 +588,7 @@ impl Store {
         let bytes = self.bytes(id);
         FileInfo {
             id: id.to_string(),
-            name: e.meta.name.clone(),
+            name: e.meta.shown_name(),
             created: e.meta.created,
             updated: e.meta.updated,
             seq: open.map_or(e.meta.seq, |o| o.seq),
@@ -552,12 +599,22 @@ impl Store {
 
     /// Keep a document (its snapshot) as a new file with an edit link and a view link.
     pub fn publish(&mut self, name: &str, snapshot: &[Change]) -> Result<(FileInfo, NewLink, NewLink), String> {
-        self.keep(name, snapshot, None, &|_| Ok(())).map(|(info, edit, view, _)| (info, edit, view))
+        self.publish_new(NewFile::Plain { name, snapshot })
+    }
+
+    /// Keep a document, plain or sealed, as a new file with an edit link and a view link.
+    pub fn publish_new(&mut self, new: NewFile<'_>) -> Result<(FileInfo, NewLink, NewLink), String> {
+        self.keep(new, None, &|_| Ok(())).map(|(info, edit, view, _)| (info, edit, view))
     }
 
     /// Keep a document published without the key from `ip`, within the caps on what one address
     /// and everyone may keep: the file, its links and its owner token.
     pub fn publish_open(&mut self, ip: IpAddr, name: &str, snapshot: &[Change]) -> Result<(FileInfo, NewLink, NewLink, String), String> {
+        self.publish_open_new(ip, NewFile::Plain { name, snapshot })
+    }
+
+    /// [`publish_open`](Self::publish_open), plain or sealed.
+    pub fn publish_open_new(&mut self, ip: IpAddr, new: NewFile<'_>) -> Result<(FileInfo, NewLink, NewLink, String), String> {
         let h = &self.cfg.hosting;
         let (open, max_files, max_ip, max_all) = (h.open, h.max_files_per_ip, h.max_bytes_per_ip, h.max_total_bytes);
         if !open {
@@ -585,7 +642,7 @@ impl Store {
             }
             Ok(())
         };
-        let (info, edit, view, owner) = self.keep(name, snapshot, Some(ip), &fits)?;
+        let (info, edit, view, owner) = self.keep(new, Some(ip), &fits)?;
         Ok((info, edit, view, owner.unwrap_or_default()))
     }
 
@@ -593,40 +650,65 @@ impl Store {
     /// token), else by the operator. `fits` checks its size against the caps that apply.
     fn keep(
         &mut self,
-        name: &str,
-        snapshot: &[Change],
+        new: NewFile<'_>,
         ip: Option<IpAddr>,
         fits: &dyn Fn(u64) -> Result<(), String>,
     ) -> Result<(FileInfo, NewLink, NewLink, Option<String>), String> {
+        match (self.accounts.e2e(), &new) {
+            (E2eMode::Required, NewFile::Plain { .. }) => return Err(SEALED_ONLY.into()),
+            (E2eMode::Off, NewFile::Sealed { .. }) => return Err(NO_SEALED.into()),
+            _ => {}
+        }
         if self.files.len() >= self.cfg.max_files {
             return Err(format!("the server keeps at most {} files", self.cfg.max_files));
         }
         if let Some(why) = self.low_disk() {
             return Err(why);
         }
-        let replica = Replica::from_snapshot(snapshot).map_err(|e| format!("the file couldn't be read: {e}"))?;
-        if replica.document().node_count() > self.cfg.core.max_nodes {
-            return Err(format!("the file has more than {} layers", self.cfg.core.max_nodes));
-        }
-        let mut doc = replica.document().clone();
-        let name = match clean_name(name) {
-            n if n.is_empty() => doc.name.clone(),
-            n => n,
+        let too_many = || format!("the file has more than {} layers", self.cfg.core.max_nodes);
+        let (name, sealed_name, chosen, server): (String, Option<SealedBlob>, Option<&str>, FileServer) = match new {
+            NewFile::Plain { name, snapshot } => {
+                let replica = Replica::from_snapshot(snapshot).map_err(|e| format!("the file couldn't be read: {e}"))?;
+                if replica.document().node_count() > self.cfg.core.max_nodes {
+                    return Err(too_many());
+                }
+                let mut doc = replica.document().clone();
+                let name = match clean_name(name) {
+                    n if n.is_empty() => doc.name.clone(),
+                    n => n,
+                };
+                doc.name = name.clone();
+                (name, None, None, Server::new(doc, "", self.cfg.core).into())
+            }
+            NewFile::Sealed { file, name, snapshot } => {
+                if !chosen_id(file) {
+                    return Err("a sealed file's id must be 16 random lowercase hex digits".into());
+                }
+                if self.files.contains_key(file) || self.dir(file).exists() {
+                    return Err("that file id is taken: pick another and seal the file for it".into());
+                }
+                let replica = OpaqueReplica::from_snapshot(snapshot).map_err(|e| format!("the file couldn't be read: {e}"))?;
+                if replica.node_count() > self.cfg.core.max_nodes {
+                    return Err(too_many());
+                }
+                (String::new(), Some(name.clone()), Some(file), OpaqueServer::with_state(replica, "", self.cfg.core).into())
+            }
         };
-        doc.name = name.clone();
-        let server = Server::new(doc, "", self.cfg.core);
-        let state = server.state().map_err(|e| e.to_string())?;
-        let bytes = disk::encode_snapshot(1, &state)?;
+        let bytes = encode_state(1, &server)?;
         if bytes.len() as u64 > self.cfg.max_file_bytes {
             return Err(format!("the file is {} MiB; this server keeps files up to {} MiB", bytes.len() >> 20, self.cfg.max_file_bytes >> 20));
         }
         fits(bytes.len() as u64)?;
-        let id = loop {
-            let id = token::file_id()?;
-            if !self.files.contains_key(&id) && !self.dir(&id).exists() {
-                break id;
-            }
+        let id = match chosen {
+            Some(id) => id.to_string(),
+            None => loop {
+                let id = token::file_id()?;
+                if !self.files.contains_key(&id) && !self.dir(&id).exists() {
+                    break id;
+                }
+            },
         };
+        let sealed = server.is_sealed();
         let t = now();
         let (edit, edit_token) = new_link(Access::Edit, "Published (edit)", t)?;
         let (view, view_token) = new_link(Access::View, "Published (view)", t)?;
@@ -641,12 +723,14 @@ impl Store {
             ip: ip.map(|i| i.to_string()),
             opened: 0,
             people: members::People::default(),
+            sealed,
+            sealed_name,
         };
         let dir = self.dir(&id);
         let written = fs::create_dir_all(&dir)
             .map_err(|e| e.to_string())
             .and_then(|()| disk::write_atomic(&dir.join(SNAPSHOT), &bytes).map_err(|e| e.to_string()))
-            .and_then(|()| disk::write_atomic(&dir.join(LOG), &disk::log_header(1)).map_err(|e| e.to_string()))
+            .and_then(|()| disk::write_atomic(&dir.join(LOG), &log_header(1, sealed)).map_err(|e| e.to_string()))
             .and_then(|()| write_json(&dir.join(LINKS), &[edit.clone(), view.clone()]))
             // Last: a folder without its description is an upload cut short.
             .and_then(|()| write_json(&dir.join(META), &meta));
@@ -658,8 +742,8 @@ impl Store {
         self.files.insert(id.clone(), entry);
         let info = self.files.get(&id).map(|e| self.info(&id, e, None)).ok_or("the file vanished")?;
         match ip {
-            Some(ip) => log::info!("event=published file={id} bytes={} ip={ip} by=public", bytes.len()),
-            None => log::info!("event=published file={id} bytes={} by=key", bytes.len()),
+            Some(ip) => log::info!("event=published file={id} bytes={} sealed={sealed} ip={ip} by=public", bytes.len()),
+            None => log::info!("event=published file={id} bytes={} sealed={sealed} by=key", bytes.len()),
         }
         Ok((info, NewLink { link: edit.info(&id), token: edit_token }, NewLink { link: view.info(&id), token: view_token }, owner))
     }
@@ -694,7 +778,7 @@ impl Store {
         }
         let one = |(file, owner): &(String, String)| {
             let e = self.files.get(file).filter(|_| self.owns(file, owner))?;
-            Some(OwnedFile { name: e.meta.name.clone(), links: e.links.iter().map(|l| l.id.clone()).collect(), expires: self.expires(&e.meta) })
+            Some(OwnedFile { name: e.meta.shown_name(), links: e.links.iter().map(|l| l.id.clone()).collect(), expires: self.expires(&e.meta) })
         };
         AdminReply::Owned(files.iter().map(one).collect())
     }
@@ -707,9 +791,27 @@ impl Store {
         }
         let path = self.dir(file).join(META);
         let entry = self.entry(file)?;
+        if entry.meta.sealed {
+            return Err(NAME_SEALED.into());
+        }
         let before = std::mem::replace(&mut entry.meta.name, name);
         if let Err(e) = write_json(&path, &entry.meta) {
             entry.meta.name = before;
+            return Err(format!("couldn't rename the file: {e}"));
+        }
+        Ok(())
+    }
+
+    /// Rename a sealed file: its new name, sealed.
+    pub fn rename_sealed(&mut self, file: &str, name: &SealedBlob) -> Result<(), String> {
+        let path = self.dir(file).join(META);
+        let entry = self.entry(file)?;
+        if !entry.meta.sealed {
+            return Err(NAME_PLAIN.into());
+        }
+        let before = entry.meta.sealed_name.replace(name.clone());
+        if let Err(e) = write_json(&path, &entry.meta) {
+            entry.meta.sealed_name = before;
             return Err(format!("couldn't rename the file: {e}"));
         }
         Ok(())
@@ -802,7 +904,7 @@ impl Store {
         if reason.is_empty() {
             return Err("say what is wrong with the file".into());
         }
-        let name = self.entry(file)?.meta.name.clone();
+        let name = self.entry(file)?.meta.shown_name();
         if !self.abuse.allow(ip, Action::Report, Instant::now()) {
             return Err("too many reports from your address lately: try again in an hour".into());
         }
@@ -1003,6 +1105,9 @@ impl Store {
         if archive.len() as u64 > max {
             return Err(format!("the library is {} MiB; this server keeps files up to {} MiB", archive.len() >> 20, max >> 20));
         }
+        if self.entry(file)?.meta.sealed {
+            return self.publish_sealed_library(file, archive);
+        }
         // Everything it unpacks to counts against the same cap, so a small archive can't expand
         // into a large library in memory.
         let lib = match figcraft_format::read_library_within(Cursor::new(archive), max) {
@@ -1044,6 +1149,29 @@ impl Store {
         }
         log::info!("file {file}: published library version {} ({} bytes)", m.version, archive.len());
         Ok(m.version)
+    }
+
+    /// Keep `archive` as a sealed file's team library: sealed bytes the server can't read or
+    /// check (the apps check it after opening it), each publish the next version.
+    fn publish_sealed_library(&mut self, file: &str, archive: &[u8]) -> Result<u64, String> {
+        let dir = self.dir(file);
+        let entry = self.entry(file)?;
+        let version = entry.meta.library.as_ref().map_or(1, |l| l.version.saturating_add(1));
+        let path = dir.join(library_name(version));
+        disk::write_atomic(&path, archive).map_err(|e| format!("couldn't keep the library: {e}"))?;
+        let before = entry.meta.library.replace(LibraryMeta { id: String::new(), name: String::new(), version });
+        if let Err(e) = write_json(&dir.join(META), &entry.meta) {
+            if let Err(r) = fs::remove_file(&path) {
+                log::warn!("file {file}: an unpublished library version couldn't be deleted: {r}");
+            }
+            entry.meta.library = before;
+            return Err(format!("couldn't keep the library: {e}"));
+        }
+        if let Some(Err(e)) = before.map(|old| fs::remove_file(library_file(&dir, old.version))) {
+            log::warn!("file {file}: the previous library version couldn't be deleted: {e}");
+        }
+        log::info!("file {file}: published sealed library version {version} ({} bytes)", archive.len());
+        Ok(version)
     }
 
     /// A library's usage reports in memory (read from disk the first time; a damaged list starts
@@ -1117,7 +1245,7 @@ impl Store {
     /// Whether `file` has room for about `n` more bytes: its cap, and for a file published
     /// without the key its address's share and everyone's. A log that took it over its cap is
     /// compacted first (the state may be smaller than its history).
-    fn room_for(&mut self, file: &str, server: &Server, n: u64) -> Result<(), String> {
+    fn room_for(&mut self, file: &str, server: &FileServer, n: u64) -> Result<(), String> {
         if let Some(why) = self.low_disk() {
             return Err(why);
         }
@@ -1152,34 +1280,26 @@ impl Store {
     }
 
     /// Load a file's session: its snapshot, then its log (a damaged end is dropped and reported).
-    fn load(&mut self, file: &str) -> Result<Server, String> {
+    fn load(&mut self, file: &str) -> Result<FileServer, String> {
         self.touch(file);
         let dir = self.dir(file);
-        let (generation, state) = disk::decode_snapshot(&disk::read_capped(&dir.join(SNAPSHOT), self.snapshot_cap())?)?;
-        let mut server = Server::restore(state, "", self.cfg.core).map_err(|e| format!("the snapshot can't be used: {e}"))?;
+        let sealed = self.entry(file)?.meta.sealed;
+        let snapshot = disk::read_capped(&dir.join(SNAPSHOT), self.snapshot_cap())?;
+        let log = disk::read_capped(&dir.join(LOG), self.cfg.max_file_bytes);
         let mut issues = Vec::new();
-        let mut fresh_log = true;
-        let mut kept = 0;
-        match disk::read_capped(&dir.join(LOG), self.cfg.max_file_bytes).and_then(|b| disk::read_log(&b)) {
-            Ok(log) if log.generation == generation => {
-                fresh_log = false;
-                for entry in log.entries {
-                    if let Err(e) = server.replay(entry) {
-                        issues.push(format!("file {file}: its log stops making sense after {kept} entries ({e}); the rest was dropped"));
-                        fresh_log = true;
-                        break;
-                    }
-                    kept += 1;
-                }
-                if let Some(why) = log.damaged {
-                    issues.push(format!("file {file}: its log ended with {why}; that part was dropped"));
-                    fresh_log = true;
-                }
-            }
-            // From before a compaction that was cut short: the snapshot has it all.
-            Ok(_) => {}
-            Err(why) => issues.push(format!("file {file}: {why}; starting a new log")),
-        }
+        let (generation, mut server, fresh_log, kept) = if sealed {
+            let (generation, state) = disk::decode_sealed_snapshot(&snapshot)?;
+            let mut server = OpaqueServer::restore(state, "", self.cfg.core).map_err(|e| format!("the snapshot can't be used: {e}"))?;
+            let log = log.and_then(|b| disk::read_sealed_log(&b));
+            let (fresh, kept) = replay_log(file, generation, log, &mut issues, |j| server.replay(j));
+            (generation, FileServer::from(server), fresh, kept)
+        } else {
+            let (generation, state) = disk::decode_snapshot(&snapshot)?;
+            let mut server = Server::restore(state, "", self.cfg.core).map_err(|e| format!("the snapshot can't be used: {e}"))?;
+            let log = log.and_then(|b| disk::read_log(&b));
+            let (fresh, kept) = replay_log(file, generation, log, &mut issues, |j| server.replay(j));
+            (generation, FileServer::from(server), fresh, kept)
+        };
         for i in issues {
             log::warn!("{i}");
             self.note(i);
@@ -1206,11 +1326,10 @@ impl Store {
     }
 
     /// Write `server`'s state as snapshot `generation` and start an empty log of it.
-    fn rewrite(&mut self, file: &str, generation: u64, server: &Server) -> Result<Log, RewriteError> {
+    fn rewrite(&mut self, file: &str, generation: u64, server: &FileServer) -> Result<Log, RewriteError> {
         let dir = self.dir(file);
         let kept = |why: String| RewriteError { why, snapshot_replaced: false };
-        let state = server.state().map_err(|e| kept(e.to_string()))?;
-        let bytes = disk::encode_snapshot(generation, &state).map_err(kept)?;
+        let bytes = encode_state(generation, server).map_err(kept)?;
         // Never replace a readable snapshot with one that can't be opened again: the old snapshot
         // and log still hold everything.
         if bytes.len() as u64 > self.snapshot_cap() {
@@ -1222,7 +1341,8 @@ impl Store {
         disk::write_atomic(&dir.join(SNAPSHOT), &bytes).map_err(|e| kept(format!("couldn't write the snapshot: {e}")))?;
         // From here the old log no longer goes with the snapshot on disk.
         let replaced = |why: String| RewriteError { why, snapshot_replaced: true };
-        disk::write_atomic(&dir.join(LOG), &disk::log_header(generation)).map_err(|e| replaced(format!("couldn't start the log: {e}")))?;
+        disk::write_atomic(&dir.join(LOG), &log_header(generation, server.is_sealed()))
+            .map_err(|e| replaced(format!("couldn't start the log: {e}")))?;
         let f = OpenOptions::new().append(true).open(dir.join(LOG)).map_err(|e| replaced(format!("couldn't open the log: {e}")))?;
         if let Ok(e) = self.entry(file) {
             e.bytes = (bytes.len() + LOG_HEADER) as u64;
@@ -1266,7 +1386,7 @@ impl Store {
     }
 
     /// Compact an open file: its state as the next snapshot, an empty log.
-    fn compact(&mut self, file: &str, server: &Server) {
+    fn compact(&mut self, file: &str, server: &FileServer) {
         self.compactions += 1;
         let Some(generation) = self.files.get(file).and_then(|e| e.log.as_ref()).map(|l| l.generation) else { return };
         match self.rewrite(file, generation + 1, server) {
@@ -1310,6 +1430,53 @@ impl Store {
         }
         failed
     }
+}
+
+/// A session's state as snapshot `generation`'s bytes, plain or sealed.
+fn encode_state(generation: u64, server: &FileServer) -> Result<Vec<u8>, String> {
+    match server {
+        FileServer::Plain(s) => disk::encode_snapshot(generation, &s.state().map_err(|e| e.to_string())?),
+        FileServer::Sealed(s) => disk::encode_sealed_snapshot(generation, &s.state().map_err(|e| e.to_string())?),
+    }
+}
+
+/// An empty log of snapshot `generation`, plain or sealed.
+fn log_header(generation: u64, sealed: bool) -> Vec<u8> {
+    if sealed { disk::sealed_log_header(generation) } else { disk::log_header(generation) }
+}
+
+/// Replay a log read back over its snapshot `generation`: whether a new log must be started (the
+/// log is damaged or from another generation… see [`Store::load`]) and how many entries were kept.
+fn replay_log<J>(
+    file: &str,
+    generation: u64,
+    log: Result<disk::LogRead<J>, String>,
+    issues: &mut Vec<String>,
+    mut replay: impl FnMut(J) -> Result<(), figcraft_collab::Error>,
+) -> (bool, usize) {
+    let mut fresh_log = true;
+    let mut kept = 0;
+    match log {
+        Ok(log) if log.generation == generation => {
+            fresh_log = false;
+            for entry in log.entries {
+                if let Err(e) = replay(entry) {
+                    issues.push(format!("file {file}: its log stops making sense after {kept} entries ({e}); the rest was dropped"));
+                    fresh_log = true;
+                    break;
+                }
+                kept += 1;
+            }
+            if let Some(why) = log.damaged {
+                issues.push(format!("file {file}: its log ended with {why}; that part was dropped"));
+                fresh_log = true;
+            }
+        }
+        // From before a compaction that was cut short: the snapshot has it all.
+        Ok(_) => {}
+        Err(why) => issues.push(format!("file {file}: {why}; starting a new log")),
+    }
+    (fresh_log, kept)
 }
 
 /// Why a snapshot and log couldn't be rewritten, and whether the snapshot on disk was replaced
@@ -1396,7 +1563,7 @@ impl Backend for Store {
             .ok_or_else(|| "this link isn't valid (it may have been revoked)".to_string())
     }
 
-    fn open(&mut self, file: &str) -> Result<Server, String> {
+    fn open(&mut self, file: &str) -> Result<FileServer, String> {
         self.load(file).map_err(|e| {
             let why = format!("file {file} can't be opened: {e}");
             log::error!("{why}");
@@ -1405,21 +1572,24 @@ impl Backend for Store {
         })
     }
 
-    fn changed(&mut self, file: &str, server: &mut Server) {
-        let journal = server.take_journal();
-        if journal.is_empty() {
+    fn changed(&mut self, file: &str, server: &mut FileServer) {
+        let records: Vec<Result<Vec<u8>, String>> = match server {
+            FileServer::Plain(s) => s.take_journal().iter().map(disk::record).collect(),
+            FileServer::Sealed(s) => s.take_journal().iter().map(disk::record).collect(),
+        };
+        if records.is_empty() {
             return;
         }
         let (after, max_bytes) = (self.cfg.compact_after, self.cfg.compact_bytes);
         let Some(e) = self.files.get_mut(file) else { return };
         let Some(log) = e.log.as_mut() else { return };
-        for j in &journal {
-            match disk::record(j) {
+        for r in &records {
+            match r {
                 Ok(r) => log.pending.extend(r),
                 Err(err) => log::error!("file {file}: a change couldn't be logged: {err}"),
             }
         }
-        log.entries += journal.len();
+        log.entries += records.len();
         log.dirty = true;
         e.meta.updated = now();
         if log.entries >= after || log.bytes + log.pending.len() as u64 >= max_bytes {
@@ -1432,11 +1602,11 @@ impl Backend for Store {
         self.flush_all()
     }
 
-    fn room(&mut self, file: &str, server: &Server, bytes: usize) -> Result<(), String> {
+    fn room(&mut self, file: &str, server: &FileServer, bytes: usize) -> Result<(), String> {
         self.room_for(file, server, bytes as u64)
     }
 
-    fn idle(&mut self, file: &str, server: &mut Server) -> bool {
+    fn idle(&mut self, file: &str, server: &mut FileServer) -> bool {
         let dirty = self.files.get_mut(file).and_then(|e| e.log.as_mut()).is_some_and(|log| {
             let _ = flush_log(file, log);
             log.dirty
@@ -1454,7 +1624,7 @@ impl Backend for Store {
         true
     }
 
-    fn stop(&mut self, open: Vec<(&str, &mut Server)>) {
+    fn stop(&mut self, open: Vec<(&str, &mut FileServer)>) {
         self.write_usage(true);
         self.flush_all();
         for (file, server) in open {
@@ -1491,7 +1661,14 @@ impl Backend for Store {
     fn message(&mut self, ip: IpAddr, msg: &ClientMsg) -> bool {
         // Cursors and cursor chat (many people behind one address each send ~30 a second while
         // they move) have a budget of their own, beside everything else.
-        let what = if matches!(msg, ClientMsg::Presence(_) | ClientMsg::Signal(_) | ClientMsg::Ping) { Action::Presence } else { Action::Message };
+        let what = if matches!(
+            msg,
+            ClientMsg::Presence(_) | ClientMsg::Signal(_) | ClientMsg::SealedPresence(_) | ClientMsg::SealedSignal(_) | ClientMsg::Ping
+        ) {
+            Action::Presence
+        } else {
+            Action::Message
+        };
         self.abuse.allow(ip, what, Instant::now())
     }
 
@@ -1512,8 +1689,13 @@ impl Backend for Store {
     fn hosted(&mut self, ip: IpAddr, owns: Option<&str>, req: Admin, open: &dyn Fn(&str) -> Option<OpenFile>) -> Handled {
         let failed = |reason: &str| Handled::from(AdminReply::Failed { reason: reason.to_string() });
         let file = match &req {
-            Admin::Publish { name, snapshot } => {
-                return match self.publish_open(ip, name, snapshot) {
+            Admin::Publish { .. } | Admin::PublishSealed { .. } => {
+                let new = match &req {
+                    Admin::PublishSealed { file, name, snapshot } => NewFile::Sealed { file, name, snapshot },
+                    Admin::Publish { name, snapshot } => NewFile::Plain { name, snapshot },
+                    _ => return failed("that needs the server key"),
+                };
+                return match self.publish_open_new(ip, new) {
                     Ok((file, edit, view, owner)) => {
                         let expires = self.files.get(&file.id).and_then(|e| self.expires(&e.meta));
                         AdminReply::Hosted { file, edit, view, owner, expires }.into()
@@ -1529,6 +1711,7 @@ impl Backend for Store {
             | Admin::CreateLink { file, .. }
             | Admin::Revoke { file, .. }
             | Admin::Rename { file, .. }
+            | Admin::RenameSealed { file, .. }
             | Admin::Code { file, .. }
             | Admin::Remove { file } => file,
             _ => return failed("that needs the server key"),
@@ -1550,6 +1733,13 @@ impl Backend for Store {
                 Ok((file, edit, view)) => AdminReply::Published { file, edit, view }.into(),
                 Err(e) => failed(e),
             },
+            Admin::PublishSealed { file, name, snapshot } => {
+                match self.publish_new(NewFile::Sealed { file: &file, name: &name, snapshot: &snapshot }) {
+                    Ok((file, edit, view)) => AdminReply::Published { file, edit, view }.into(),
+                    Err(e) => failed(e),
+                }
+            }
+            Admin::RenameSealed { file, name } => self.rename_sealed(&file, &name).map_or_else(failed, |()| AdminReply::Done.into()),
             Admin::Files => AdminReply::Files(self.list(open)).into(),
             Admin::Links { file } => self.links(&file).map_or_else(failed, |l| AdminReply::Links(l).into()),
             Admin::CreateLink { file, access, label } => self.create_link(&file, access, &label).map_or_else(failed, |l| AdminReply::Link(l).into()),

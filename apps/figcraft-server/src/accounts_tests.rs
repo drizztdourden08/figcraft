@@ -264,8 +264,9 @@ fn links_only_servers_are_unchanged_and_settings_are_checked() {
     raw.send(&ClientMsg::OpenAccount(OpenAccount { protocol: PROTOCOL, client_version: "t".into() }));
     assert!(matches!(raw.next(), ServerMsg::Refused { .. }));
     server.stop();
-    // Settings: accounts need a provider; open publishing and accounts don't mix; sealing isn't
-    // available yet; unknown kinds are refused when the server starts.
+    // Settings: accounts need a provider; open publishing and accounts don't mix; sealed files
+    // are on with "optional" or "required" (anything else is refused); unknown kinds are refused
+    // when the server starts.
     let mut c = accounts_config(dir.path(), "accounts");
     c.auth.provider.clear();
     assert!(c.check().unwrap_err().contains("provider"));
@@ -273,8 +274,12 @@ fn links_only_servers_are_unchanged_and_settings_are_checked() {
     c.open_publish = true;
     assert!(c.check().unwrap_err().contains("open_publish"));
     let mut c = config(dir.path());
-    c.e2e.mode = "required".into();
-    assert!(c.check().is_err());
+    for mode in ["off", "optional", "required"] {
+        c.e2e.mode = mode.into();
+        assert!(c.check().is_ok(), "{mode}");
+    }
+    c.e2e.mode = "on".into();
+    assert!(c.check().unwrap_err().contains("e2e.mode"));
     let mut c = accounts_config(dir.path(), "accounts");
     c.auth.provider[0].kind = "carrier-pigeon".into();
     assert!(crate::start(&c).err().unwrap().contains("unknown kind"));

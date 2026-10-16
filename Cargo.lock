@@ -1790,6 +1790,7 @@ dependencies = [
  "figcraft-auth",
  "figcraft-collab",
  "figcraft-collab-net",
+ "figcraft-collab-seal",
  "figcraft-doc",
  "figcraft-engine",
  "figcraft-format",

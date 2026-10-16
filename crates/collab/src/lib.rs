@@ -30,7 +30,9 @@ pub mod frac;
 mod history;
 pub mod merge;
 pub mod message;
+mod opaque;
 pub mod replica;
+pub mod sealed;
 pub mod server;
 pub mod sim;
 
@@ -42,9 +44,16 @@ pub use client::{Client, HISTORY_LIMIT};
 pub use diff::{Diff, diff};
 pub use figcraft_doc::{Document, NodeId};
 pub use history::{BatchKind, Notice};
-pub use message::{Accepted, Access, CatchUp, ClientMsg, EditingText, Hello, Peer, Presence, Processed, Resume, ServerMsg, Signal};
+pub use message::{
+    Accepted, AcceptedOf, Access, CatchUp, CatchUpOf, ClientMsg, EditingText, Hello, Peer, Presence, Processed, Resume, SealedAccepted,
+    SealedCatchUp, ServerMsg, Signal,
+};
+pub use opaque::OpaqueReplica;
 pub use replica::{Applied, Mode, Replica};
-pub use server::{Journal, Outgoing, Server, SessionState, VIEW_ONLY};
+pub use server::{
+    Batch, FileServer, Journal, JournalOf, OpaqueServer, Outgoing, SealedJournal, SealedSessionState, Server, SessionServer, SessionState,
+    SessionStateOf, Synced, VIEW_ONLY, Welcome,
+};
 
 /// Compare secrets (tokens, keys, their hashes) without stopping at the first difference.
 pub fn same_secret(a: &str, b: &str) -> bool {
@@ -139,6 +148,8 @@ mod journal_tests;
 mod merge_list_tests;
 #[cfg(test)]
 mod merge_tests;
+#[cfg(test)]
+mod opaque_tests;
 #[cfg(test)]
 mod owned_tests;
 #[cfg(test)]

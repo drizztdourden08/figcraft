@@ -35,7 +35,8 @@ use figcraft_collab::message::{
     self, Access, AccountReply, AccountReq, Admin, AdminReply, ClientMsg, Hello, HostInfo, LibraryReply, LibraryReq, Manage, OpenAccount,
     OpenHosting, OpenLibrary, OpenPlugins, PROTOCOL, PluginReply, PluginReq, Presence, Resolve, ServerMsg, reads_hosting,
 };
-use figcraft_collab::{Outgoing, Server};
+use figcraft_collab::sealed::Sealed;
+use figcraft_collab::{FileServer, Outgoing};
 use figcraft_engine::live::{Event, MAX_NAME, PEOPLE, sanitize};
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::protocol::frame::coding::CloseCode;
@@ -166,11 +167,13 @@ pub trait Backend: Send + 'static {
         AccountReply::Failed { reason: "this server has no accounts".into() }.into()
     }
 
-    /// The session for a file that isn't open (after [`admit`](Self::admit) let someone in).
-    fn open(&mut self, file: &str) -> Result<Server, String>;
+    /// The session for a file that isn't open (after [`admit`](Self::admit) let someone in):
+    /// a plain file's [`Server`](figcraft_collab::Server) or a sealed file's
+    /// [`OpaqueServer`](figcraft_collab::OpaqueServer).
+    fn open(&mut self, file: &str) -> Result<FileServer, String>;
 
     /// The hub handled a message for an open file: keep what changed (its server's journal).
-    fn changed(&mut self, _file: &str, _server: &mut Server) {}
+    fn changed(&mut self, _file: &str, _server: &mut FileServer) {}
 
     /// Make what [`changed`](Self::changed) kept durable; the hub sends the servers' answers
     /// after this. The files whose changes couldn't be made durable: nobody hears of them, the
@@ -181,17 +184,17 @@ pub trait Backend: Send + 'static {
 
     /// Whether `file` has room for a batch of about `bytes` (its size on the wire): why not, and
     /// the batch is refused.
-    fn room(&mut self, _file: &str, _server: &Server, _bytes: usize) -> Result<(), String> {
+    fn room(&mut self, _file: &str, _server: &FileServer, _bytes: usize) -> Result<(), String> {
         Ok(())
     }
 
     /// Everyone left `file`: save it. True closes it (the next hello opens it again).
-    fn idle(&mut self, _file: &str, _server: &mut Server) -> bool {
+    fn idle(&mut self, _file: &str, _server: &mut FileServer) -> bool {
         false
     }
 
     /// The hub is stopping: save the open files.
-    fn stop(&mut self, _open: Vec<(&str, &mut Server)>) {}
+    fn stop(&mut self, _open: Vec<(&str, &mut FileServer)>) {}
 
     /// A managing connection's key: whether it may manage files.
     fn manage(&mut self, _key: &str) -> Result<(), String> {
@@ -470,7 +473,7 @@ enum HubIn {
 /// The person hosting an app session: in the file's session without a socket.
 pub(crate) struct Local {
     pub file: String,
-    pub server: Server,
+    pub server: FileServer,
     /// Their client id (they joined `server` already).
     pub id: u32,
     pub inbox: Inbox,
@@ -1089,7 +1092,7 @@ fn read_loop(
                     return end(Some("too many messages"));
                 }
                 // Typing sends a chat signal per keystroke; more than this is dropped.
-                if matches!(msg, ClientMsg::Signal(_)) && !signals.take(now) {
+                if matches!(msg, ClientMsg::Signal(_) | ClientMsg::SealedSignal(_)) && !signals.take(now) {
                     log::debug!("live session: connection {conn} sends signals too fast; dropping one");
                     continue;
                 }
@@ -1189,14 +1192,39 @@ struct Conn {
     ip: IpAddr,
 }
 
+/// Someone's presence: plain, or sealed on a sealed file (passed on as it came).
+#[derive(Clone, Debug)]
+enum Seen {
+    Plain(Presence),
+    Sealed(Sealed),
+}
+
+impl Seen {
+    /// What the session server takes.
+    fn msg(self) -> ClientMsg {
+        match self {
+            Seen::Plain(p) => ClientMsg::Presence(p),
+            Seen::Sealed(b) => ClientMsg::SealedPresence(b),
+        }
+    }
+
+    /// What a newcomer is told.
+    fn to(&self, client_id: u32) -> ServerMsg {
+        match self {
+            Seen::Plain(p) => ServerMsg::Presence { client_id, presence: p.clone() },
+            Seen::Sealed(b) => ServerMsg::SealedPresence { client_id, blob: b.clone() },
+        }
+    }
+}
+
 /// One open file's session.
 struct Room {
-    server: Server,
+    server: FileServer,
     /// Client id → connection.
     ids: BTreeMap<u32, u64>,
-    throttles: BTreeMap<u32, Throttle<Presence>>,
+    throttles: BTreeMap<u32, Throttle<Seen>>,
     /// Everyone's latest presence (for newcomers).
-    latest: BTreeMap<u32, Presence>,
+    latest: BTreeMap<u32, Seen>,
     /// Default names handed out ("Guest 1", "Guest 2"…).
     guests: u32,
     /// The person hosting (app sessions): their client id and inbox.
@@ -1204,7 +1232,7 @@ struct Room {
 }
 
 impl Room {
-    fn new(server: Server) -> Self {
+    fn new(server: FileServer) -> Self {
         Self { server, ids: BTreeMap::new(), throttles: BTreeMap::new(), latest: BTreeMap::new(), guests: 0, local: None }
     }
 
@@ -1337,7 +1365,7 @@ impl<B: Backend> Hub<B> {
             HubIn::Gone { conn } => self.gone(conn),
             HubIn::Local(p) | HubIn::LocalMsg(ClientMsg::Presence(p)) => {
                 if let Some((file, id)) = self.local_id() {
-                    self.presence(&file, id, p);
+                    self.presence(&file, id, Seen::Plain(p));
                 }
             }
             HubIn::LocalMsg(msg) => {
@@ -1446,16 +1474,28 @@ impl<B: Backend> Hub<B> {
     /// A message from client `id` of `file`.
     /// A message from client `id` of `file`; `bytes`: its size on the wire (a socket's).
     fn client_message(&mut self, file: &str, id: u32, msg: ClientMsg, bytes: Option<usize>) {
-        if let ClientMsg::Presence(p) = msg {
-            return self.presence(file, id, p);
-        }
+        let sealed = self.rooms.get(file).is_some_and(|r| r.server.is_sealed());
+        let msg = match msg {
+            ClientMsg::Presence(p) if !sealed => return self.presence(file, id, Seen::Plain(p)),
+            ClientMsg::SealedPresence(b) if sealed => return self.presence(file, id, Seen::Sealed(b)),
+            other => other,
+        };
         // A batch the file has no room for is refused before the session takes it (the client
         // rolls it back with the reason).
-        if let (ClientMsg::Changes { batch_id, .. }, Some(n)) = (&msg, bytes)
+        let batch = match &msg {
+            ClientMsg::Changes { batch_id, .. } if !sealed => Some(*batch_id),
+            ClientMsg::SealedChanges { batch_id, .. } if sealed => Some(*batch_id),
+            _ => None,
+        };
+        if let (Some(batch_id), Some(n)) = (batch, bytes)
             && let Some(room) = self.rooms.get(file)
             && let Err(reason) = self.backend.room(file, &room.server, n)
         {
-            let reject = ServerMsg::Reject { batch_id: *batch_id, reason, fixes: Vec::new() };
+            let reject = if sealed {
+                ServerMsg::SealedReject { batch_id, reason, fixes: Vec::new() }
+            } else {
+                ServerMsg::Reject { batch_id, reason, fixes: Vec::new() }
+            };
             return self.queue(file, vec![Outgoing::To(id, reject)]);
         }
         let Some(room) = self.rooms.get_mut(file) else { return };
@@ -1513,7 +1553,7 @@ impl<B: Backend> Hub<B> {
                 if let Some(me) = room.server.peers().find(|p| p.client_id == id) {
                     more.push(Outgoing::To(id, ServerMsg::PeerJoined(me.clone())));
                 }
-                more.extend(room.latest.iter().map(|(&from, p)| Outgoing::To(id, ServerMsg::Presence { client_id: from, presence: p.clone() })));
+                more.extend(room.latest.iter().map(|(&from, p)| Outgoing::To(id, p.to(from))));
                 // A client that reads it hears about the server's hosting (operator, terms, expiry).
                 more.extend(info.map(|i| Outgoing::To(id, ServerMsg::Hosting(Box::new(i)))));
                 if let Some(c) = old.and_then(|old| self.conns.remove(&old)) {
@@ -1828,12 +1868,15 @@ impl<B: Backend> Hub<B> {
         }
     }
 
-    fn presence(&mut self, file: &str, id: u32, p: Presence) {
+    fn presence(&mut self, file: &str, id: u32, p: Seen) {
         let Some(room) = self.rooms.get_mut(file) else { return };
-        let p = sanitize(p);
+        let p = match p {
+            Seen::Plain(p) => Seen::Plain(sanitize(p)),
+            sealed => sealed,
+        };
         room.latest.insert(id, p.clone());
         if let Some(p) = room.throttles.entry(id).or_insert_with(|| Throttle::new(PRESENCE_INTERVAL)).offer(p, Instant::now()) {
-            let outs = room.server.receive(id, ClientMsg::Presence(p));
+            let outs = room.server.receive(id, p.msg());
             self.queue(file, outs);
         }
     }
@@ -1841,9 +1884,9 @@ impl<B: Backend> Hub<B> {
     fn flush_due(&mut self, now: Instant) {
         let mut outs = Vec::new();
         for (file, room) in &mut self.rooms {
-            let due: Vec<(u32, Presence)> = room.throttles.iter_mut().filter_map(|(id, t)| t.take_due(now).map(|p| (*id, p))).collect();
+            let due: Vec<(u32, Seen)> = room.throttles.iter_mut().filter_map(|(id, t)| t.take_due(now).map(|p| (*id, p))).collect();
             for (id, p) in due {
-                outs.extend(room.server.receive(id, ClientMsg::Presence(p)).into_iter().map(|o| (file.clone(), o)));
+                outs.extend(room.server.receive(id, p.msg()).into_iter().map(|o| (file.clone(), o)));
             }
         }
         self.outbox.extend(outs);
@@ -1867,7 +1910,8 @@ impl<B: Backend> Hub<B> {
                 let mut bytes = None;
                 // One count against the server's budget, and each block's, for every copy of this
                 // message; welcomes aren't counted against blocks.
-                let mut held = Charges { skip_blocks: matches!(msg, ServerMsg::Welcome { .. }), ..Charges::default() };
+                let mut held =
+                    Charges { skip_blocks: matches!(msg, ServerMsg::Welcome { .. } | ServerMsg::SealedWelcome { .. }), ..Charges::default() };
                 for id in to {
                     if let Some((local, inbox)) = room.local.as_ref().filter(|(l, _)| *l == id) {
                         to_local(inbox, *local, &msg);

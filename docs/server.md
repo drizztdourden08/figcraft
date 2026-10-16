@@ -341,6 +341,38 @@ someone the allow-lists still admit can sign in again (as a new account, in no f
 the same managing requests (`People`, `RemovePerson`, `EndSessions`, `FileMembers`,
 `SetFileRole`, `AddFileMember`, `ServerStatus`), which servers older than them can't read.
 
+## Sealed files
+
+With `[e2e]` the server also keeps **sealed** (end-to-end encrypted) files: the apps encrypt their
+contents with a key the server never sees (in links mode it travels in the link after `#`, which
+browsers and the app never send to a server).
+
+```toml
+[e2e]
+mode = "optional"   # "off" (default): plain files only; "optional": both; "required": sealed only
+```
+
+- `"off"` refuses sealed files, `"required"` refuses plain ones (publishing from an app that can't
+  seal says so). Servers with share links only can keep sealed files too.
+- A sealed file works like any other: links, join codes (a code can't carry the key, so people
+  joining by code still need the key from its owner), members, renaming, removal, expiry, team
+  libraries, reports. Its session is ordered, checked and saved the same way; the server checks its
+  **structure** (the layer tree, kinds of layers, ids) but can't read its **contents**: names,
+  text, styles, comments, cursor chat, presence and its team library are ciphertext to it.
+- **What you can't do as the operator**: read, moderate or recover a sealed file's content. A
+  report about one gives you its id and the reporter's reason, not what is in it; you can still
+  remove it or block an address. Listings show its name as `sealed:` followed by unreadable text.
+- **Backups** (the data directory) hold sealed files as ciphertext: restoring them works, reading
+  them needs the people's keys. A sealed file's `meta.json` says `"sealed": true`, and its
+  `snapshot.bin`/`log.bin` have format byte 2 (older servers refuse to open them rather than
+  misread them).
+- What sealing doesn't hide from you: how many layers a file has and their tree, each layer's kind
+  (frame, text…), which properties change and when, value sizes (rounded up), who is connected and
+  when. Details in [`accounts-and-e2e.md`](accounts-and-e2e.md#sealed-files).
+
+*The app's side (sealing, keys in links, keyrings with accounts) is being built (steps 8 and 9 of
+[`accounts-and-e2e.md`](accounts-and-e2e.md#steps)); the server side described here is done.*
+
 ## Configuration
 
 Every flag is also a key of a TOML file given with `--config server.toml` (flags win; unknown keys

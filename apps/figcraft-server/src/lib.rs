@@ -130,6 +130,8 @@ mod owned_tests;
 #[cfg(test)]
 mod public_tests;
 #[cfg(test)]
+mod sealed_tests;
+#[cfg(test)]
 mod server_tests;
 #[cfg(test)]
 mod settings_tests;

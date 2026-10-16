@@ -90,11 +90,16 @@ impl Store {
 
     /// Keep a document as a new file `who` owns.
     pub fn publish_as(&mut self, who: &Person, name: &str, snapshot: &[Change]) -> Result<figcraft_collab::message::FileInfo, String> {
+        self.publish_new_as(who, super::NewFile::Plain { name, snapshot })
+    }
+
+    /// Keep a document, plain or sealed, as a new file `who` owns.
+    pub fn publish_new_as(&mut self, who: &Person, new: super::NewFile<'_>) -> Result<figcraft_collab::message::FileInfo, String> {
         let owned = self.files_where(|p| p.role(&who.account) == Some(Role::Owner)).len();
         if owned >= MAX_OWNED_FILES {
             return Err(format!("you own {owned} files here, the most one person may: remove one first"));
         }
-        let (info, edit, view) = self.publish(name, snapshot)?;
+        let (info, edit, view) = self.publish_new(new)?;
         let entry = self.entry(&info.id)?;
         entry.meta.people.members.push(MemberRec { account: who.account.clone(), role: Role::Owner });
         self.save_meta(&info.id)?;
@@ -263,6 +268,13 @@ impl Store {
                 Ok(file) => AccountReply::Published { file }.into(),
                 Err(e) => failed(e),
             },
+            AccountReq::PublishSealed { file, name, snapshot } => {
+                match self.publish_new_as(who, super::NewFile::Sealed { file: &file, name: &name, snapshot: &snapshot }) {
+                    Ok(file) => AccountReply::Published { file }.into(),
+                    Err(e) => failed(e),
+                }
+            }
+            AccountReq::RenameSealed { file, name } => done(self.owner(&file, who).and_then(|()| self.rename_sealed(&file, &name))),
             AccountReq::Members { file } => self.members(&file, who).map_or_else(failed, Into::into),
             AccountReq::Invite { file, email, role } => done(self.invite(&file, who, &email, role)),
             AccountReq::SetRole { file, account, role } => done(self.set_role(&file, who, &account, role)),
@@ -340,7 +352,7 @@ impl Store {
         self.files
             .iter()
             .filter(|(_, e)| e.meta.people.role(account) == Some(Role::Owner) && e.meta.people.owners() == 1)
-            .map(|(id, e)| OwnerlessFile { id: id.clone(), name: e.meta.name.clone() })
+            .map(|(id, e)| OwnerlessFile { id: id.clone(), name: e.meta.shown_name() })
             .collect()
     }
 

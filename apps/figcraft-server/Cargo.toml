@@ -54,4 +54,6 @@ wat = { workspace = true }
 ring = "0.17"
 figcraft-engine = { workspace = true }
 figcraft-doc = { workspace = true }
+# Sealing test files as an app would (sealed files' tests).
+figcraft-collab-seal = { workspace = true }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
