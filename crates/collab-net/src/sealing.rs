@@ -34,7 +34,7 @@ use figcraft_collab::Change;
 use figcraft_collab::message::{AcceptedOf, CatchUpOf, ClientMsg, LibraryReply, LibraryReq, ServerMsg, Signal};
 use figcraft_collab::sealed::{Sealed, SealedChange};
 use figcraft_collab_seal::{
-    AnyEditor, DeviceKeys, EditorKeys, FileKey, Keyring, SealError, Slot, check_batch, open, open_change, open_presence, open_signal, seal,
+    AnyEditor, DeviceKeys, EditorKeys, FileKey, Keyring, SealError, Slot, check_batch_at, open, open_change, open_presence, open_signal, seal,
     seal_change, seal_presence, seal_signal, sign_batch,
 };
 pub use figcraft_engine::devices::NEW_EPOCH;
@@ -107,7 +107,7 @@ impl<'a> Seal<'a> {
     /// Check a batch's signature, then open it. `Err`: the session can't go on.
     fn open_accepted(&self, a: AcceptedOf<SealedChange>) -> Result<AcceptedOf<Change>, String> {
         let editors: &dyn EditorKeys = self.keys.editors.as_deref().unwrap_or(&AnyEditor);
-        let body = check_batch(editors, self.file, a.batch_id, &a.changes).map_err(|e| {
+        let body = check_batch_at(editors, self.file, a.seq, a.batch_id, &a.changes).map_err(|e| {
             log::warn!("live session: sealed batch {} from client {} refused: {e:?}", a.seq, a.author);
             e.to_string()
         })?;

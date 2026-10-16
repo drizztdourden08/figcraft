@@ -80,3 +80,54 @@ fn arriving_batches_are_checked_against_the_editors() {
         assert!(matches!(incoming(&inv, &SealingKeys::default(), ServerMsg::SealedChanges(m)), Ok(Some(ServerMsg::Changes(_)))));
     }
 }
+
+/// A server's list of editors: signatures required only after `signed_from`, and a device the list
+/// doesn't know fetched for once before its batch is refused.
+#[test]
+fn member_editors_require_signatures_from_a_point_and_refresh_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use figcraft_collab::message::EditorDevice;
+
+    use crate::editors::{EditorList, MemberEditors};
+    use crate::inbox::Inbox;
+
+    let key = FileKey::generate().unwrap();
+    let (ann, cy) = (Arc::new(DeviceKeys::generate().unwrap()), DeviceKeys::generate().unwrap());
+    let entry =
+        |account: &str, d: &DeviceKeys| EditorDevice { account: account.into(), device: "d".into(), public: d.public().unwrap(), recovery: false };
+    let (ann_entry, cy_entry) = (entry("a", &ann), entry("c", &cy));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = asked.clone();
+    // Cy shows up in the list from the second answer on.
+    let fetch = move |_: &str| {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        let mut editors = vec![ann_entry.clone()];
+        if n > 0 {
+            editors.push(cy_entry.clone());
+        }
+        Ok(EditorList { signed_from: Some(1), editors })
+    };
+    let m = Arc::new(MemberEditors::new("ws://x/".into(), ann.clone(), Box::new(fetch)));
+    let inbox = Inbox::new(Arc::new(|| {}));
+    assert!(m.load(FILE, inbox.clone()).unwrap(), "this device is an editor's: it signs");
+    assert!(inbox.drain().iter().any(|e| matches!(e, figcraft_engine::live::Event::Editors { .. })));
+    let keys = SealingKeys { signer: None, editors: Some(m.clone()) };
+    let inv = invite(&key);
+    let at = |seq: u64, signer: Option<&DeviceKeys>, batch_id: u64| {
+        let mut a = arriving(&key, signer, batch_id);
+        a.seq = seq;
+        ServerMsg::SealedChanges(a)
+    };
+    // Up to batch 1 unsigned batches are taken (made before the file required signatures).
+    assert!(incoming(&inv, &keys, at(1, None, 1)).is_ok());
+    assert_eq!(incoming(&inv, &keys, at(2, None, 2)).unwrap_err(), BatchRefused::Unsigned.to_string());
+    // Cy isn't known yet: fetched again, and taken.
+    assert!(incoming(&inv, &keys, at(3, Some(&cy), 3)).is_ok());
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    // Someone the list never has: fetched again once, then refused without asking again.
+    let eve = DeviceKeys::generate().unwrap();
+    assert_eq!(incoming(&inv, &keys, at(4, Some(&eve), 4)).unwrap_err(), BatchRefused::NotEditor.to_string());
+    assert_eq!(incoming(&inv, &keys, at(5, Some(&eve), 5)).unwrap_err(), BatchRefused::NotEditor.to_string());
+    assert_eq!(asked.load(Ordering::SeqCst), 3);
+}

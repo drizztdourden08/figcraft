@@ -27,10 +27,11 @@ use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, Role as WsRole, WebSocket};
 use tungstenite::{Bytes, Message};
 
+use crate::editors::MemberEditors;
 use crate::inbox::Inbox;
 use crate::invite::{Endpoint, Invite, Keys};
 pub use crate::join::GuestConfig;
-use crate::join::{Next, Outcome, Resuming, Seen, Taken, after, closed, hello, outgoing, resolved, sign_in, take, unresolved};
+use crate::join::{Next, Outcome, Resuming, Seen, Taken, after, closed, hello, outgoing, prepare_signing, resolved, sign_in, take, unresolved};
 use crate::manage;
 use crate::net::{Duplex, NetLimits, config, open, shutdown};
 use crate::throttle::{PRESENCE_INTERVAL, Throttle, earliest};
@@ -63,6 +64,8 @@ pub struct Guest {
     thread: Option<JoinHandle<()>>,
     /// A sealed file's keys, shared with the connection ([`Guest::rekey`]).
     keys: Keys,
+    /// Its editors on a server with accounts ([`Guest::editors`]).
+    editors: Option<Arc<MemberEditors>>,
 }
 
 enum Cmd {
@@ -80,6 +83,7 @@ impl Guest {
     /// Start joining (returns at once; progress arrives in `inbox`).
     pub fn start(mut cfg: GuestConfig, inbox: Inbox) -> io::Result<Guest> {
         let keys = cfg.invite.key.clone().unwrap_or_default();
+        let editors = cfg.editors.clone();
         let (tx, rx) = channel();
         let me = tx.clone();
         let thread = std::thread::Builder::new().name("live-guest".into()).spawn(move || {
@@ -98,9 +102,10 @@ impl Guest {
                     return;
                 }
             }
+            prepare_signing(&mut cfg, &inbox);
             supervise(&cfg, &inbox, &rx, &me);
         })?;
-        Ok(Guest { cmd: tx, thread: Some(thread), keys })
+        Ok(Guest { cmd: tx, thread: Some(thread), keys, editors })
     }
 
     /// Upload `job.doc` to the server as a new file, then join it with its edit link (returns at
@@ -111,6 +116,7 @@ impl Guest {
         let me = tx.clone();
         let keys = Keys::default();
         let shared_keys = keys.clone();
+        let editors = cfg.editors.clone();
         let thread = std::thread::Builder::new().name("live-publish".into()).spawn(move || {
             inbox.push(Event::Status(Status::Connecting));
             let (mut cfg, published, hosting) = match upload(&job, cfg) {
@@ -153,9 +159,10 @@ impl Guest {
             for c in waiting {
                 let _ = me.send(c);
             }
+            prepare_signing(&mut cfg, &inbox);
             supervise(&cfg, &inbox, &rx, &me);
         })?;
-        Ok(Guest { cmd: tx, thread: Some(thread), keys })
+        Ok(Guest { cmd: tx, thread: Some(thread), keys, editors })
     }
 
     /// Add epochs of a sealed file's key (from its keyring): what is sent from now on is sealed
@@ -166,6 +173,12 @@ impl Guest {
         }
         self.keys.add(ring);
         Ok(())
+    }
+
+    /// The sealed file's editors on a server with accounts, when this session checks against
+    /// them.
+    pub fn editors(&self) -> Option<&Arc<MemberEditors>> {
+        self.editors.as_ref()
     }
 
     /// Your latest presence.

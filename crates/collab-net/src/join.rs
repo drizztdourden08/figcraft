@@ -3,7 +3,7 @@
 //! in what the host sends. A sealed file's messages are sealed and opened here too
 //! ([`outgoing`], and in [`take`]; see [`crate::sealing`]).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use figcraft_auth::{SignIn, SignInReply};
@@ -11,6 +11,7 @@ use figcraft_collab::Client;
 use figcraft_collab::message::{ClientMsg, Peer, Resume, ServerMsg};
 use figcraft_engine::live::{Event, Role, SessionInfo, Status};
 
+use crate::editors::MemberEditors;
 use crate::inbox::Inbox;
 use crate::invite::Invite;
 use crate::limits::NetLimits;
@@ -53,6 +54,9 @@ pub struct GuestConfig {
     /// A sealed file's signing key and editors (see [`SealingKeys`]; empty: unsigned batches,
     /// signatures checked only for integrity).
     pub sealing: SealingKeys,
+    /// Signed in on a server with accounts, with this device's keys there: where a sealed file's
+    /// editors come from ([`prepare_signing`] fills `sealing` from it before connecting).
+    pub editors: Option<Arc<MemberEditors>>,
 }
 
 impl GuestConfig {
@@ -69,12 +73,33 @@ impl GuestConfig {
             resume: None,
             session: None,
             sealing: SealingKeys::default(),
+            editors: None,
         }
     }
 
     /// The pause before reconnect `attempt` (from 1).
     pub(crate) fn backoff(&self, attempt: u32) -> Duration {
         self.backoff.saturating_mul(1u32 << attempt.saturating_sub(1).min(16)).min(self.max_backoff)
+    }
+}
+
+/// Before a session of a sealed file on a server with accounts connects: fetch the file's editors
+/// (what the batches that arrive are checked against) and sign with this device's keys when it is
+/// one of them. A server that can't list them (older than signed batches) gets unsigned batches,
+/// and any intact signature or none is taken, as before. Links-mode files (no sign-in, or a key
+/// in the link only) have nobody to bind signatures to and stay unsigned.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn prepare_signing(cfg: &mut GuestConfig, inbox: &Inbox) {
+    let Some(editors) = cfg.editors.clone() else { return };
+    if cfg.invite.key.is_none() || cfg.session.is_none() || cfg.invite.file.is_empty() {
+        return;
+    }
+    match editors.load(&cfg.invite.file, inbox.clone()) {
+        Ok(signs) => {
+            cfg.sealing.signer = signs.then(|| editors.device());
+            cfg.sealing.editors = Some(editors);
+        }
+        Err(e) => log::info!("live session: no editors' list for file {} ({e}): its batches go unsigned", cfg.invite.file),
     }
 }
 

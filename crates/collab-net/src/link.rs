@@ -6,12 +6,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use figcraft_collab::code;
-use figcraft_collab::message::{Access, Admin, AdminReply, ClientMsg, LibraryReply, LibraryReq, PluginReply, PluginReq};
+use figcraft_collab::message::{Access, AccountReply, AccountReq, Admin, AdminReply, ClientMsg, LibraryReply, LibraryReq, PluginReply, PluginReq};
+use figcraft_collab_seal::DeviceKeys;
 use figcraft_engine::live::{
     Bind, Event, Flow, HostInfo, HostOptions, LiveLink, NO_SESSION, NetReply, NetRequest, PageInfo, Presence, PublishOptions, Published, Resume,
     Role, SessionId, SessionInfo, Shared, SignIn,
 };
 
+use crate::editors::{EditorList, MemberEditors};
 use crate::guest::{Guest, GuestConfig, Publish, upload_file};
 use crate::host::{Host, HostConfig};
 use crate::inbox::{Inbox, Waker};
@@ -55,13 +57,23 @@ pub struct NetLink {
     fetching: Arc<AtomicBool>,
     /// Where you are signed in: each server's address (as [`Endpoint::url`]) and your session token.
     sign_ins: Vec<(String, String)>,
+    /// This device's keys, by the servers it is registered with (as [`Endpoint::url`]).
+    devices: Vec<(String, Arc<DeviceKeys>)>,
 }
 
 impl NetLink {
     /// `wake` is called (from network threads) whenever something arrives for the UI.
     pub fn new(wake: Waker) -> Self {
         let libraries = Inbox::new(wake.clone());
-        Self { limits: NetLimits::default(), sessions: Sessions::new(wake), guest: |c| c, libraries, fetching: Arc::default(), sign_ins: Vec::new() }
+        Self {
+            limits: NetLimits::default(),
+            sessions: Sessions::new(wake),
+            guest: |c| c,
+            libraries,
+            fetching: Arc::default(),
+            sign_ins: Vec::new(),
+            devices: Vec::new(),
+        }
     }
 
     /// With other transport limits.
@@ -79,9 +91,27 @@ impl NetLink {
     /// How this link joins `invite` (after asking its server about `code`, if there is one).
     fn guest_config(&self, invite: Invite, code: Option<String>, name: &str) -> GuestConfig {
         let session = self.session_for(&invite.server);
-        let mut cfg = (self.guest)(GuestConfig { code, session, ..GuestConfig::new(invite, name.to_string()) });
+        let editors = self.editors_for(&invite.server, session.as_deref());
+        let mut cfg = (self.guest)(GuestConfig { code, session, editors, ..GuestConfig::new(invite, name.to_string()) });
         cfg.limits = self.limits;
         cfg
+    }
+
+    /// Where a sealed file's editors on `server` come from: signed in there with `session`, and
+    /// this device registered there.
+    fn editors_for(&self, server: &Endpoint, session: Option<&str>) -> Option<Arc<MemberEditors>> {
+        let url = server.url();
+        let device = self.devices.iter().find(|(s, _)| *s == url).map(|(_, k)| k.clone())?;
+        let (endpoint, session, limits) = (server.clone(), session?.to_string(), self.limits);
+        let fetch = move |file: &str| {
+            let req = AccountReq::EditorKeys { file: file.to_string() };
+            match manage::account(&endpoint, &session, vec![req], &limits, CONNECT)?.into_iter().next() {
+                Some(AccountReply::EditorKeys { signed_from, editors }) => Ok(EditorList { signed_from, editors }),
+                Some(AccountReply::Failed { reason }) => Err(reason),
+                _ => Err("the server answered something else".to_string()),
+            }
+        };
+        Some(Arc::new(MemberEditors::new(url, device, Box::new(fetch))))
     }
 
     /// Your session token on `server`, if you are signed in there.
@@ -206,6 +236,33 @@ impl LiveLink for NetLink {
 
     fn sign_ins(&mut self, list: Vec<(String, String)>) {
         self.sign_ins = list.into_iter().filter_map(|(s, t)| Endpoint::parse(&s).ok().map(|(e, _)| (e.url(), t))).collect();
+    }
+
+    fn device_key(&mut self, server: &str, keys: Option<DeviceKeys>) {
+        let Ok((endpoint, _)) = Endpoint::parse(server) else { return };
+        let url = endpoint.url();
+        self.devices.retain(|(s, _)| *s != url);
+        if let Some(k) = keys {
+            self.devices.push((url, Arc::new(k)));
+        }
+    }
+
+    fn editors_changed(&mut self, server: &str) {
+        let Ok((endpoint, _)) = Endpoint::parse(server) else { return };
+        let url = endpoint.url();
+        for id in self.sessions.ids() {
+            let Some(Active::Guest(g)) = self.sessions.get(id) else { continue };
+            let Some(editors) = g.editors().filter(|e| e.server == url).cloned() else { continue };
+            // Off the UI thread: it asks the server.
+            let spawned = std::thread::Builder::new().name("editors".into()).spawn(move || {
+                if let Err(e) = editors.reload() {
+                    log::info!("live session: the file's editors weren't fetched again: {e}");
+                }
+            });
+            if let Err(e) = spawned {
+                log::warn!("live session: can't start a thread to fetch the file's editors: {e}");
+            }
+        }
     }
 
     fn browser_sign_in(&mut self, server: &str, provider: &str, flow: &Flow) -> Result<String, String> {

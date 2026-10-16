@@ -56,6 +56,10 @@ const LINGER: Duration = Duration::from_secs(2);
 pub const SIGNAL_RATE: f64 = 20.0;
 pub const SIGNAL_BURST: f64 = 40.0;
 
+/// Why an unsigned batch to a file whose changes must be signed is refused.
+pub const UNSIGNED: &str =
+    "this encrypted file takes only changes signed by its editors' devices: update FigCraft (apps from before signed changes can only view it)";
+
 /// Most messages the hub handles before it sends what they produced (bounds the delay a burst
 /// adds).
 const BURST: usize = 256;
@@ -171,6 +175,14 @@ pub trait Backend: Send + 'static {
     /// a plain file's [`Server`](figcraft_collab::Server) or a sealed file's
     /// [`OpaqueServer`](figcraft_collab::OpaqueServer).
     fn open(&mut self, file: &str) -> Result<FileServer, String>;
+
+    /// Whether sealed `file`'s batches must be signed (they end with a
+    /// [`SealedChange::Signature`](figcraft_collab::sealed::SealedChange::Signature)): the hub
+    /// refuses the others before the session takes them, so an app that doesn't sign can't end
+    /// everyone else's session. The apps check what the signatures say.
+    fn signatures_required(&mut self, _file: &str) -> bool {
+        false
+    }
 
     /// The hub handled a message for an open file: keep what changed (its server's journal).
     fn changed(&mut self, _file: &str, _server: &mut FileServer) {}
@@ -1496,6 +1508,14 @@ impl<B: Backend> Hub<B> {
             } else {
                 ServerMsg::Reject { batch_id, reason, fixes: Vec::new() }
             };
+            return self.queue(file, vec![Outgoing::To(id, reject)]);
+        }
+        if let ClientMsg::SealedChanges { batch_id, changes, .. } = &msg
+            && sealed
+            && !matches!(changes.last(), Some(figcraft_collab::sealed::SealedChange::Signature(_)))
+            && self.backend.signatures_required(file)
+        {
+            let reject = ServerMsg::SealedReject { batch_id: *batch_id, reason: UNSIGNED.into(), fixes: Vec::new() };
             return self.queue(file, vec![Outgoing::To(id, reject)]);
         }
         let Some(room) = self.rooms.get_mut(file) else { return };

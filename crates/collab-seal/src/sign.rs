@@ -98,6 +98,18 @@ pub trait EditorKeys: Send + Sync {
     /// Whether the device with Ed25519 public key `device` belongs to someone who may edit the
     /// file.
     fn is_editor(&self, device: &[u8; 32]) -> bool;
+    /// Whether the batch the server numbered `seq` must be signed by a known editor device (a
+    /// file whose batches must be signed from some point on: those before it were made by apps
+    /// that didn't sign). Default: [`required`](Self::required).
+    fn required_at(&self, _seq: u64) -> bool {
+        self.required()
+    }
+    /// A batch came signed by `device`, which isn't one of the editors' this list knows: fetch the
+    /// list again (an editor added a moment ago) and say whether it may have changed. Called once
+    /// per device before the batch is refused. Default: a fixed list.
+    fn refresh(&self, _device: &[u8; 32]) -> bool {
+        false
+    }
 }
 
 /// No list of editors (a link to a file on a server without accounts: whoever holds an edit link
@@ -159,10 +171,24 @@ pub enum BatchRefused {
 /// Check a sealed batch's signature against `editors`: the batch's changes without the signature
 /// when it may be opened.
 pub fn check_batch<'a>(editors: &dyn EditorKeys, file: &str, batch_id: u64, changes: &'a [SealedChange]) -> Result<&'a [SealedChange], BatchRefused> {
+    check_batch_at(editors, file, u64::MAX, batch_id, changes)
+}
+
+/// [`check_batch`] for the batch the server numbered `seq` ([`EditorKeys::required_at`]); a
+/// device the list doesn't know gets one [`EditorKeys::refresh`] before the batch is refused.
+pub fn check_batch_at<'a>(
+    editors: &dyn EditorKeys,
+    file: &str,
+    seq: u64,
+    batch_id: u64,
+    changes: &'a [SealedChange],
+) -> Result<&'a [SealedChange], BatchRefused> {
     match verify_batch(file, batch_id, changes) {
         Signed::Bad => Err(BatchRefused::Bad),
-        Signed::Unsigned if editors.required() => Err(BatchRefused::Unsigned),
-        Signed::By(device) if !editors.is_editor(&device) => Err(BatchRefused::NotEditor),
+        Signed::Unsigned if editors.required_at(seq) => Err(BatchRefused::Unsigned),
+        Signed::By(device) if !editors.is_editor(&device) && !(editors.refresh(&device) && editors.is_editor(&device)) => {
+            Err(BatchRefused::NotEditor)
+        }
         Signed::Unsigned | Signed::By(_) => Ok(split_signature(changes).map(|(body, _)| body).unwrap_or_default()),
     }
 }

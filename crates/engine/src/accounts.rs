@@ -118,6 +118,8 @@ impl Session {
         if let Some(link) = self.live.link() {
             link.sign_ins(list);
         }
+        // And this device's keys where it is registered (sealed files' sessions sign with them).
+        self.share_device_keys();
     }
 
     /// Keep a sign-in (replacing the one to the same server).
@@ -352,7 +354,7 @@ fn status(s: &mut Session, _p: &Value) -> Result<Value> {
             json!({"server": server, "flow": "device", "userCode": user_code, "verificationUri": verification_uri})
         }
     };
-    Ok(json!({"accounts": accounts, "pending": pending, "last": last_json(s)}))
+    Ok(json!({"accounts": accounts, "pending": pending, "last": last_json(s), "keyChanges": crate::devices::key_changes_json(s)}))
 }
 
 fn role_id(r: Role) -> &'static str {
@@ -407,8 +409,9 @@ fn invite(s: &mut Session, p: &Value) -> Result<Value> {
     let email = req_string(CMD, p, "email")?;
     let role = role(CMD, p)?;
     s.account_request(CMD, &server, AccountReq::Invite { file, email: email.clone(), role })?;
-    // A sealed file's key goes to their devices (`devices`).
+    // A sealed file's key goes to their devices (`devices`); its sessions learn the new editor.
     s.keys_changed(&server);
+    s.editors_changed(&server);
     Ok(json!({"invited": email, "role": role.id()}))
 }
 
@@ -418,6 +421,8 @@ fn set_role(s: &mut Session, p: &Value) -> Result<Value> {
     let account = req_string(CMD, p, "account")?;
     let role = role(CMD, p)?;
     s.account_request(CMD, &server, AccountReq::SetRole { file, account: account.clone(), role })?;
+    // Who may sign a sealed file's changes changed.
+    s.editors_changed(&server);
     Ok(json!({"account": account, "role": role.id()}))
 }
 
@@ -430,8 +435,9 @@ fn remove_member(s: &mut Session, p: &Value) -> Result<Value> {
         (None, None) => return Err(bad(CMD, "give `account` (a member) or `email` (an invite)")),
     };
     s.account_request(CMD, &server, req)?;
-    // A sealed file starts a new epoch of its key (`devices`).
+    // A sealed file starts a new epoch of its key (`devices`), and has one editor fewer.
     s.keys_changed(&server);
+    s.editors_changed(&server);
     Ok(json!({"removed": true}))
 }
 
@@ -469,7 +475,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "account.status",
             "Sign-ins",
-            "{} → {accounts: [{server, account, name, email, admin, expires}], pending: {server, flow, url | userCode, verificationUri} | null, last: {signedInAs} | {error} | null}",
+            "{} → {accounts: [{server, account, name, email, admin, expires}], pending: {server, flow, url | userCode, verificationUri} | null, last: {signedInAs} | {error} | null, keyChanges: [{server, account, was, now}] (people whose devices changed since this app last saw them: compare safety numbers, `account.safetyNumber {account}`)}",
             false,
             status
         ),

@@ -518,6 +518,14 @@ it public keys or ciphertext the server can't open
                                online since)
 ```
 
+A sealed file's `meta.json` also gets `"signed_from": <sequence number>` once its changes must
+be signed by its editors' devices (the first time an app that signs opens it while every owner and
+editor has registered a device; see
+[`accounts-and-e2e.md`](accounts-and-e2e.md#editor-signatures-built-steps-10-and-11)). From then on
+the server refuses unsigned changes to it (apps older than signed changes can view it, not edit:
+update them together with the server), and share links to it only view. Taking the field out by
+hand turns the requirement off until an app opens the file again.
+
 Session tokens (256 random bits) are kept only as hashes: a copy of the data directory doesn't let
 anyone sign in as someone. Emails and names are personal data: treat the directory accordingly.
 Wrapped keys and recovery copies don't open without a device's private key (kept on that device,

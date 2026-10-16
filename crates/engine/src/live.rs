@@ -329,6 +329,14 @@ pub enum Event {
         server: String,
         reply: std::result::Result<SignInReply, String>,
     },
+    /// The owners' and editors' devices of sealed file `file` on the server at `server`, as the
+    /// server listed them for the session's signature checks (`AccountReq::EditorKeys`): the app
+    /// notices whose devices changed since it last saw them (their safety number).
+    Editors {
+        server: String,
+        file: String,
+        editors: Vec<figcraft_collab::message::EditorDevice>,
+    },
 }
 
 /// A request to a server outside a live session: its plugin directory, a team library, or keeping
@@ -556,6 +564,14 @@ pub trait LiveLink: Send {
     /// The servers you are signed in to and your session tokens there: joining a file on one of
     /// them signs in first (the engine tells the link before it joins or publishes).
     fn sign_ins(&mut self, _list: Vec<(String, String)>) {}
+    /// This device's keys for sealed files on `server` (registered there; `None`: forget them):
+    /// a session of a sealed file there signs its batches with them, once the server says this
+    /// device is an editor's (`docs/accounts-and-e2e.md` › *Editor signatures*). The engine tells
+    /// the link before it joins or publishes, as with [`sign_ins`](Self::sign_ins).
+    fn device_key(&mut self, _server: &str, _keys: Option<figcraft_collab_seal::DeviceKeys>) {}
+    /// People or roles changed in a file on `server` (or it is time to check): the sessions of
+    /// sealed files there fetch their editors again.
+    fn editors_changed(&mut self, _server: &str) {}
     /// Add epochs of a sealed file's key to session `session`, which joined it: `keys` is a link
     /// fragment (`k=…&k=…`, see `figcraft_collab_seal::ring_fragment`). What the session sends
     /// from now on is sealed with the newest. Errors: no such sealed session, or keys that aren't.
@@ -1015,6 +1031,7 @@ impl Session {
             Event::Library { link, reply } => return self.library_answer(&link, reply),
             Event::Net { job, reply } => return self.background_answer(job, *reply),
             Event::SignIn { server, reply } => return self.account_signed_in(&server, reply),
+            Event::Editors { server, file, editors } => return self.editors_seen(&server, &file, &editors),
             e => e,
         };
         // A session left meanwhile: what was still on its way is dropped.
@@ -1128,7 +1145,7 @@ impl Session {
                     Some(error.map_or_else(|| "Your report was sent to the server's operator".into(), |e| format!("The report wasn't sent: {e}")));
             }
             // Answered above.
-            Event::Library { .. } | Event::Net { .. } | Event::SignIn { .. } => {}
+            Event::Library { .. } | Event::Net { .. } | Event::SignIn { .. } | Event::Editors { .. } => {}
         }
     }
 
@@ -1730,6 +1747,14 @@ fn start_publish(s: &mut Session, cmd: &str, server: &str, p: &Value, share: boo
         Some(v) => Some(v.as_bool().ok_or_else(|| bad(cmd, "`sealed` must be true or false"))?),
     };
     s.share_sign_ins();
+    // Signed in, perhaps sealed: this device registered there first, so the new file's first
+    // session can sign its batches (`docs/accounts-and-e2e.md` › *Editor signatures*).
+    if session.is_some()
+        && sealed != Some(false)
+        && let Err(e) = s.device_id(cmd, server)
+    {
+        log::info!("devices: not registered with {server} before publishing: {e}");
+    }
     let opts =
         PublishOptions { server: server.trim().to_string(), key, name: name.unwrap_or_else(|| doc.name.clone()), me, doc, share, session, sealed };
     let (id, ()) = s.live.start(cmd, |l, id| l.publish(id, opts).map_err(|e| bad(cmd, e)))?;

@@ -219,6 +219,10 @@ struct Meta {
     /// A sealed file's name, sealed (the apps open it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sealed_name: Option<SealedBlob>,
+    /// A sealed file on a server with accounts whose batches must be signed by an editor's device
+    /// from the one after this sequence number on (`keyrings`, *Editor signatures*).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signed_from: Option<u64>,
 }
 
 impl Meta {
@@ -730,6 +734,7 @@ impl Store {
             people: members::People::default(),
             sealed,
             sealed_name,
+            signed_from: None,
         };
         let dir = self.dir(&id);
         let written = fs::create_dir_all(&dir)
@@ -1543,16 +1548,46 @@ fn new_link(access: Access, label: &str, created: u64) -> Result<(Link, String),
     Ok((Link { id: token::file_id()?, access, label: label.to_string(), created, hash: hash(&token), code: None }, token))
 }
 
+/// Tests: files whose server is hostile (it lets every signed-in member edit and passes on
+/// unsigned batches), to show what the apps refuse when the server doesn't.
+#[cfg(test)]
+pub(crate) static HOSTILE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn hostile(file: &str) -> bool {
+    HOSTILE.lock().is_ok_and(|h| h.iter().any(|f| f == file))
+}
+
 impl Backend for Store {
     fn admit_as(&mut self, file: &str, token: &str, who: Option<&Person>) -> Result<Admission, String> {
+        #[cfg(test)]
+        if hostile(file) && who.is_some() {
+            return Ok(Admission { access: Access::Edit, link: None });
+        }
         let mode = self.accounts.mode();
         if !mode.accounts() {
             return self.admit(file, token);
         }
-        if mode.links() && !token.is_empty() {
-            return self.admit(file, token);
+        let mut admission = if mode.links() && !token.is_empty() { self.admit(file, token)? } else { self.admit_member(file, who)? };
+        // A file whose changes must be signed takes them from its editors only: a share link
+        // (or an admin who isn't in the file) only views it.
+        let editor = who.is_some_and(|w| {
+            self.people(file)
+                .and_then(|p| p.role(&w.account))
+                .is_some_and(|r| matches!(r, figcraft_collab::message::Role::Owner | figcraft_collab::message::Role::Editor))
+        });
+        if self.signatures_required(file) && !editor {
+            admission.access = Access::View;
         }
-        self.admit_member(file, who)
+        Ok(admission)
+    }
+
+    fn signatures_required(&mut self, file: &str) -> bool {
+        #[cfg(test)]
+        if hostile(file) {
+            return false;
+        }
+        self.files.get(file).is_some_and(|e| e.meta.signed_from.is_some())
     }
 
     fn manage_as(&mut self, key: &str, who: Option<&Person>) -> Result<(), String> {

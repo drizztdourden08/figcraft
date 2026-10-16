@@ -323,7 +323,9 @@ impl Store {
             | AccountReq::PutKeys { .. }
             | AccountReq::PendingKeys
             | AccountReq::PutRecovery { .. }
-            | AccountReq::GetRecovery) => self.key_request(who, req),
+            | AccountReq::GetRecovery
+            | AccountReq::DevicesOf { .. }) => self.key_request(who, req),
+            AccountReq::EditorKeys { file } => self.editor_keys(who, &file, open).map_or_else(failed, Into::into),
         }
     }
 

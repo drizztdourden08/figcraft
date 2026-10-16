@@ -69,6 +69,7 @@ fn device_prefs_survive_junk() {
         name: "Laptop".into(),
         secret: "c2VjcmV0".into(),
         registered: vec![Registered { server: "wss://a/".into(), device: "d1".into(), public: "pk".into() }],
+        seen: vec![crate::devices::SeenNumber { server: "wss://a/".into(), account: "a1".into(), number: "1234 5678 9012".into() }],
     };
     let back: Prefs = serde_json::from_value(json!({"device": serde_json::to_value(&p).unwrap()})).unwrap();
     assert_eq!(back.device, p);
@@ -93,4 +94,31 @@ fn the_commands_need_a_sign_in() {
         assert!(s.execute(cmd, &p).is_err(), "{cmd}");
     }
     assert!(!s.live_summary()["waitingForAccess"].as_bool().unwrap());
+}
+
+/// The editors a session's server lists: the first devices seen of someone are remembered, a
+/// different set later is a key change (`account.status` lists it), the same set again isn't.
+#[test]
+fn a_change_in_someones_devices_is_noticed() {
+    use figcraft_collab::message::EditorDevice;
+    use figcraft_collab_seal::DeviceKeys;
+
+    let mut s = Session::new();
+    let entry = |d: &DeviceKeys| EditorDevice { account: "a1".into(), device: "d".into(), public: d.public().unwrap(), recovery: false };
+    let (one, two) = (DeviceKeys::generate().unwrap(), DeviceKeys::generate().unwrap());
+    s.editors_seen("ws://h/", "f", &[entry(&one)]);
+    assert!(s.keys.changes.is_empty(), "first seen: trusted");
+    assert_eq!(s.prefs.device.seen.len(), 1);
+    s.editors_seen("WS://h", "f", &[entry(&one)]);
+    assert!(s.keys.changes.is_empty(), "the same devices");
+    s.editors_seen("ws://h/", "f", &[entry(&one), entry(&two)]);
+    assert_eq!(s.keys.changes.len(), 1);
+    assert_eq!(s.message.as_deref(), Some(crate::devices::KEY_CHANGED));
+    let status = s.execute("account.status", &json!({})).unwrap();
+    assert_eq!(status["keyChanges"][0]["account"], "a1");
+    assert_ne!(status["keyChanges"][0]["was"], status["keyChanges"][0]["now"]);
+    // Kept with the preferences, junk dropped.
+    let text = serde_json::to_string(&s.prefs).unwrap();
+    let back: Prefs = serde_json::from_str(&text).unwrap();
+    assert_eq!(back.device.seen, s.prefs.device.seen);
 }

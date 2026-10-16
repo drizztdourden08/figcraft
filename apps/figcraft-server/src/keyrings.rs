@@ -15,9 +15,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use figcraft_auth::{E2eMode, Person};
-use figcraft_collab::message::{AccountReply, AccountReq, KeyWant, KeyWrap, PendingFile, RecoveryCopy, Role};
+use figcraft_collab::message::{AccountReply, AccountReq, EditorDevice, KeyWant, KeyWrap, PendingFile, RecoveryCopy, Role};
 use figcraft_collab::sealed::Wrapped;
-use figcraft_collab_net::hub::AccountHandled;
+use figcraft_collab_net::hub::{AccountHandled, OpenFile};
 use serde::{Deserialize, Serialize};
 
 use super::{Store, read_json_or_default, write_json};
@@ -224,6 +224,53 @@ impl Store {
         Ok(())
     }
 
+    /// The owners' and editors' devices of sealed `file` (every member may ask: viewers check
+    /// signatures too), and from which batch on its changes must be signed. A file starts
+    /// requiring signatures the first time this is asked (only apps that sign ask) once every
+    /// owner and editor has registered a device: from the batch after its latest one, so batches
+    /// made before by apps that didn't sign stay as they are.
+    pub(crate) fn editor_keys(&mut self, who: &Person, file: &str, open: &dyn Fn(&str) -> Option<OpenFile>) -> Result<AccountReply, String> {
+        if self.accounts.e2e() == E2eMode::Off {
+            return Err(NO_E2E.into());
+        }
+        if self.role_of(file, who)?.is_none() && !who.admin {
+            return Err(NOT_IN.into());
+        }
+        if !self.sealed(file) {
+            return Err("this file isn't end-to-end encrypted: its changes aren't signed".into());
+        }
+        let people = self.people(file).cloned().unwrap_or_default();
+        let editors: Vec<&str> = people.members.iter().filter(|m| matches!(m.role, Role::Owner | Role::Editor)).map(|m| m.account.as_str()).collect();
+        let mut list = Vec::new();
+        let mut everyone = !editors.is_empty();
+        for account in &editors {
+            let devices = self.accounts.devices_of(account);
+            everyone &= devices.iter().any(|d| !d.recovery);
+            list.extend(devices.into_iter().map(|d| EditorDevice { account: d.account, device: d.id, public: d.public, recovery: d.recovery }));
+        }
+        let entry = self.entry(file)?;
+        if entry.meta.signed_from.is_none() && everyone {
+            let seq = open(file).map_or(entry.meta.seq, |o| o.seq);
+            entry.meta.signed_from = Some(seq);
+            self.save_meta(file)?;
+            log::info!("event=signatures_required file={file} after={seq}");
+        }
+        let signed_from = self.entry(file)?.meta.signed_from;
+        Ok(AccountReply::EditorKeys { signed_from, editors: list })
+    }
+
+    /// The devices of `account`, for `who`'s safety number of them: theirs, someone who shares a
+    /// file with them, or an admin.
+    fn devices_of(&self, who: &Person, account: &str) -> Result<AccountReply, String> {
+        let shares = account == who.account
+            || who.admin
+            || self.file_ids().iter().any(|f| self.people(f).is_some_and(|p| p.role(&who.account).is_some() && p.role(account).is_some()));
+        if !shares {
+            return Err("you share no file with them here".into());
+        }
+        Ok(AccountReply::Devices(self.accounts.devices_of(account).iter().map(DeviceRec::info).collect()))
+    }
+
     /// The device, keyring and recovery requests of an account connection.
     pub(crate) fn key_request(&mut self, who: &Person, req: AccountReq) -> AccountHandled {
         let failed = |reason: String| AccountHandled::from(AccountReply::Failed { reason });
@@ -241,6 +288,7 @@ impl Store {
                 Err(e) => failed(e),
             },
             AccountReq::Devices => AccountReply::Devices(self.accounts.devices_of(&who.account).iter().map(DeviceRec::info).collect()).into(),
+            AccountReq::DevicesOf { account } => self.devices_of(who, &account).map_or_else(failed, Into::into),
             AccountReq::RevokeDevice { device } => done(self.revoke_device(who, &device)),
             AccountReq::PutKeys { file, epoch, rotate, wrapped } => done(self.keys_put(who, &file, epoch, rotate, wrapped)),
             AccountReq::PendingKeys => AccountReply::PendingKeys(self.keys_pending(who)).into(),
