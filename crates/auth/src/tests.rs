@@ -10,7 +10,9 @@ fn modes_parse_and_say_what_they_allow() {
         assert_eq!(AuthMode::parse(m.id()), Some(m));
     }
     assert_eq!(AuthMode::parse(" Accounts+Links "), Some(AuthMode::AccountsAndLinks));
-    assert_eq!(AuthMode::parse("open"), None);
+    // "open" is what apps call a server of links only.
+    assert_eq!(AuthMode::parse("open"), Some(AuthMode::Links));
+    assert_eq!(AuthMode::parse("closed"), None);
     assert!(AuthMode::Links.links() && !AuthMode::Links.accounts());
     assert!(!AuthMode::Accounts.links() && AuthMode::Accounts.accounts());
     assert!(AuthMode::AccountsAndLinks.links() && AuthMode::AccountsAndLinks.accounts());
@@ -147,4 +149,30 @@ fn wire_types_round_trip_as_json() {
         let text = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<SignInReply>(&text).unwrap(), r);
     }
+}
+
+#[test]
+fn basic_accounts_flows_are_kept_from_older_apps() {
+    let p = |flows: Vec<Flow>| ProviderInfo { id: "p".into(), label: "P".into(), flows };
+    let info = ServerInfo {
+        auth: AuthMode::Accounts,
+        providers: vec![p(vec![Flow::Password { label: "Account".into() }, Flow::SignUp]), p(vec![Flow::Device])],
+        e2e: E2eMode::Off,
+    };
+    assert_eq!(info.access(), "basic+sso");
+    let old = info.clone().for_older_apps();
+    assert_eq!(old.providers.len(), 2);
+    assert!(old.providers[0].flows.is_empty());
+    assert_eq!(old.providers[1].flows, vec![Flow::Device]);
+    assert_eq!(ServerInfo::default().access(), "open");
+    let basic = ServerInfo { auth: AuthMode::Accounts, providers: vec![p(vec![Flow::Password { label: "A".into() }])], e2e: E2eMode::Off };
+    assert_eq!(basic.access(), "basic");
+    // `Debug` leaves secrets out.
+    let s = format!(
+        "{:?} {:?} {:?}",
+        SignIn::Password { provider: "p".into(), username: "ann".into(), password: "hunter2-secret".into() },
+        SignIn::Token { provider: "p".into(), token: "tok-secret".into() },
+        SignIn::Session { token: "sess-secret".into() }
+    );
+    assert!(!s.contains("secret") && s.contains("ann"), "{s}");
 }

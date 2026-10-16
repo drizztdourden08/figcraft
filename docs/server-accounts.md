@@ -1,8 +1,10 @@
 # Setting up a server with accounts
 
 This guide takes a running `figcraft-server` (see [`server.md`](server.md)) and turns on
-**accounts**: people sign in with an identity provider (Google, your company's Keycloak or Entra ID,
-GitLab, a verifier of your own…) and each file has members with a role. The design behind it is in
+**accounts**: people sign in with a username and password the server keeps (**basic** accounts)
+or with an identity provider (**SSO**: Google, your company's Keycloak or Entra ID, GitLab, a
+verifier of your own…), and each file has members with a role. A server without accounts is
+**open**: share links and join codes, nobody signs in. The design behind it is in
 [`accounts-and-e2e.md`](accounts-and-e2e.md); this page is for the operator.
 
 - [What accounts give you](#what-accounts-give-you)
@@ -10,10 +12,12 @@ GitLab, a verifier of your own…) and each file has members with a role. The de
 - [Choosing a provider](#choosing-a-provider)
 - [Step by step](#step-by-step): [Google](#google), [Keycloak](#keycloak),
   [other OpenID Connect issuers](#other-openid-connect-issuers),
-  [an external verifier](#an-external-verifier)
+  [an external verifier](#an-external-verifier),
+  [basic accounts (usernames and passwords)](#basic-accounts-usernames-and-passwords)
 - [The settings](#the-settings)
 - [Who may sign in](#who-may-sign-in)
 - [Day to day](#day-to-day)
+- [Folders, recent files and previews](#folders-recent-files-and-previews)
 - [Data and backups](#data-and-backups)
 - [Security notes](#security-notes)
 - [Troubleshooting](#troubleshooting)
@@ -24,7 +28,7 @@ GitLab, a verifier of your own…) and each file has members with a role. The de
 
 | Mode | How people get in |
 |---|---|
-| `links` (default) | Share links and join codes, as described in [`server.md`](server.md). No sign-in. |
+| `links` (default; `"open"` is the same) | An **open** server: share links and join codes, as described in [`server.md`](server.md). No sign-in. |
 | `accounts` | Signing in is required. A person opens a file only when they are one of its members (or an admin). Share links and join codes don't work. |
 | `accounts+links` | Both: members sign in, and a file's owners can still make share links and join codes; someone with a link gets in without signing in. |
 
@@ -113,6 +117,7 @@ apps show them all.
 
 | You have | Use | Kind |
 |---|---|---|
+| No identity provider, a small team | Usernames and passwords the server keeps | `password` (see [Basic accounts](#basic-accounts-usernames-and-passwords)) |
 | Google Workspace or Google accounts | Google's OpenID Connect | `oidc` with `preset = "google"` |
 | GitLab.com accounts | GitLab's OpenID Connect | `oidc` with `preset = "gitlab"` |
 | Keycloak, Authentik, Microsoft Entra ID, Okta, Auth0, Zitadel, a self-hosted GitLab… | Any OpenID Connect issuer | `oidc` with `issuer = "https://…"` |
@@ -353,6 +358,74 @@ verify_url = "http://127.0.0.1:8787/verify"
 Run it as a user of its own (a systemd unit like the server's), listening on the loopback interface
 only. A verifier on another machine must be behind HTTPS.
 
+### Basic accounts (usernames and passwords)
+
+With `kind = "password"` the server keeps usernames and passwords itself: nothing to register
+anywhere, for a team without an identity provider. At most one such provider per server; it takes
+only `id`, `label` and `allow_signup`:
+
+```toml
+name = "Acme design"              # what apps show for the server (optional)
+
+[auth]
+mode = "accounts"
+admins = ["you@example.com"]      # admins by the email you give them below
+
+[[auth.provider]]
+id = "basic"                      # never rename it: accounts hang on it
+kind = "password"
+label = "Acme account"            # default "Username and password"
+allow_signup = false              # default false: only admins add people
+```
+
+**Adding people** (on the stopped data directory, or through the running server; run as the
+`figcraft` user):
+
+```sh
+figcraft-server --config /etc/figcraft-server/server.toml users add ann --email ann@example.com --name "Ann Lee"
+# Added ann.
+# Their password (shown only now: the server keeps only a hash):
+#   k7mqp-x3hrt-9wafe-c2ndv
+figcraft-server --config … users list            # username, email, name, account, temporary / locked
+figcraft-server --config … users reset ann       # a new temporary password (shown once); signs her out
+figcraft-server --config … users remove ann      # she can't sign in any more (signed out; files stay)
+```
+
+Give the password to the person privately; they sign in with the username and it, then change it
+(the app's account settings; `account.changePassword`). Admins do the same from the app
+(`Admin::CreateUser`, `ResetPassword`, `RemoveUser`, `Users`). `people remove ACCOUNT` also takes
+the username away.
+
+- **Usernames** are 1–64 letters, digits, `.`, `-`, `_` or `@`, any case (kept lowercase). A person
+  is *(the provider's id, the username)*.
+- **Emails** you give with `--email` count as verified: admins, the allow-lists and invites go by
+  them. Without one, a person can't be invited by email (an admin adds them to a file with
+  `members role FILE ACCOUNT ROLE`) and, on a
+  server whose allow-lists aren't empty, can't sign in: give everyone an email there.
+- **Passwords** are 10 to 256 characters and not the username. The server keeps only an Argon2id
+  hash (19 MiB of memory, 2 passes, 1 lane: about 30 ms of a core per try; each hash records its
+  parameters, so they can be raised later without breaking old passwords) with a random salt.
+- **Signing up** (`allow_signup = true`): people make their own account from the app with a
+  username and password (and optionally an email, which isn't verified). On a server whose
+  allow-lists aren't empty, signing up is refused (an unverified email can't pass them): add people
+  yourself there. An address may sign up 5 times an hour.
+- **Guessing**: 5 wrong passwords in a row lock a username out of password sign-in for 15 minutes,
+  and 20 from one address (an IPv6 /64) lock the address out; an address tries at most 10 a
+  minute. A wrong username and a wrong password get the same answer. The counters are in memory (a
+  restart forgets them). `users list` shows who is locked out; `users reset` lifts it. Someone can
+  keep a username locked out by guessing at it: the lockout is the price of slowing guessing down;
+  the person's sessions keep working meanwhile.
+- **TLS only**: the server speaks plain `ws://`, so it takes a password only on a connection from
+  its own machine (your reverse proxy there, `figcraft-server` commands) or through
+  `trusted_proxy`. Anything else gets `this server takes passwords only over TLS`. The app also
+  refuses to send a password to a `ws://` address on another machine. A proxy that doesn't
+  terminate TLS (plain HTTP on the network) defeats this: don't run one. `figcraft-server check`
+  warns when a `password` provider is on, the server listens on the network and `public_url` isn't
+  `wss://`.
+- **Never logged**: passwords don't appear in logs, results or `Debug` output; the log says
+  `event=password_wrong ip=…`, `event=signed_in provider=basic account=…`, `event=user_added`,
+  `event=password_reset`.
+
 ## The settings
 
 Everything for accounts in `server.toml`, with each key's default. Unknown keys are errors, as in
@@ -360,6 +433,7 @@ the rest of the file. The server reads it when it starts: restart after a change
 
 ```toml
 # The server as in server.md: listen on the loopback interface behind the proxy.
+name = "Acme design"                # default "": what apps show for the server (at most 80 characters)
 listen = "127.0.0.1:47900"
 data = "/var/lib/figcraft-server"
 public_url = "wss://figcraft.example.com/"
@@ -367,7 +441,7 @@ trusted_proxy = "127.0.0.1"
 open_publish = false                # must be false with accounts
 
 [auth]
-mode = "accounts"                   # "links" (default) | "accounts" | "accounts+links"
+mode = "accounts"                   # "links" (default; also "open") | "accounts" | "accounts+links"
 admins = ["you@example.com"]        # default []: verified emails that manage the server without the key
 allow_emails = []                   # default []: verified emails that may sign in
 allow_domains = ["example.com"]     # default []: domains whose verified emails may sign in
@@ -396,13 +470,20 @@ label = "Company token"
 verify_url = "http://127.0.0.1:8787/verify"   # external only, required: https://, or http:// on this machine
 trust_email = false                 # as above, for answers without "email_verified"
 
+[[auth.provider]]
+id = "basic"
+kind = "password"                   # usernames and passwords the server keeps (at most one)
+label = "Username and password"     # the default
+allow_signup = false                # password only, default false: people may make their own account
+
 [e2e]
 mode = "off"                        # "off" | "optional" | "required" (see server.md › Sealed files)
 ```
 
 Which keys each kind reads: `oidc` reads `label`, `preset`, `issuer`, `client_id`,
 `client_secret` or `client_secret_file`, `scopes`, `params`, `flows` and `trust_email`; `external`
-reads `label`, `verify_url` and `trust_email`. Keys a kind doesn't read are ignored. A kind of your
+reads `label`, `verify_url` and `trust_email`; `password` takes only `label` and `allow_signup`
+(any other key is an error). Keys `oidc` and `external` don't read are ignored. A kind of your
 own reads what its factory reads. These settings exist only in the file: unlike the server's other
 settings they have no command-line flags.
 
@@ -420,6 +501,8 @@ receive invites meant for that address, or become an admin.
   two providers with one id, a provider without a `kind`, an entry of `admins` or `allow_emails`
   that isn't an email address;
 - `open_publish` with an accounts mode;
+- more than one `password` provider, `allow_signup` on another kind, a `password` provider with
+  other kinds' keys, a `name` over 80 characters;
 - an `[e2e]` mode other than `"off"`, `"optional"` or `"required"`;
 - each provider, built without the network: an unknown `kind` or `preset`, a missing `issuer` or
   `client_id`, an `issuer` that isn't `https://`, a secret file it can't read, both
@@ -486,6 +569,22 @@ provider asks for the token. *The sign-in in the app and the CLI is being built 
 - **accounts+links**: owners make, list and revoke a file's share links and join codes from their
   account, and anyone with a link gets in without signing in, as on a server without accounts.
 
+## Folders, recent files and previews
+
+On a server with accounts, people's files can be filed in **folders** and have **previews**:
+
+- A file has **one** folder (`Marketing/2026`: names joined by `/`, at most 8 deep), the same for
+  everyone in it; its owners and editors move it. A folder exists while a file is in it; people see
+  the folders of the files they're in. An empty folder someone makes is theirs until a file is put
+  there. Renaming a folder moves the files in it that you may edit; a folder you remove must be
+  empty of files you're in. Folder names are plain text on the server, also for sealed files: name
+  folders knowing the operator can read them.
+- When someone opens a file, the server notes when (`recents.json`): the app shows a Recent row.
+- The app sends a small **preview** of each file it publishes or edits (a 256-pixel PNG of the
+  first page, at most 256 KiB, again every two minutes while it changes). For a sealed file the
+  preview is sealed with the file's key before it leaves the app: the server keeps bytes it can't
+  open.
+
 ## Data and backups
 
 Accounts add to the data directory ([`server.md`](server.md#the-data-directory)):
@@ -496,8 +595,15 @@ Accounts add to the data directory ([`server.md`](server.md#the-data-directory))
                                their name, when they first and last signed in
 <data>/accounts/sessions.json  their sessions: the SHA-256 of each session token, whose it is,
                                when it was made and when it ends
-<data>/files/<id>/meta.json    gains "members" (account id and role: owner, editor or viewer) and
-                               "invited" (email and role)
+<data>/files/<id>/meta.json    gains "members" (account id and role: owner, editor or viewer),
+                               "invited" (email and role), "folder" and "thumbnail" (when its
+                               preview was set)
+<data>/files/<id>/thumbnail.bin its preview: a PNG, or for a sealed file that PNG sealed
+<data>/accounts/passwords.json basic accounts: each username, its Argon2id hash
+                               ($argon2id$v=19$m=19456,t=2,p=1$salt$hash), email, name, when it
+                               was added and its password set, and whether that is temporary
+<data>/folders.json            the empty folders people made (account and path)
+<data>/recents.json            when each person last opened each file (account, file, time)
 ```
 
 With sealed files (`[e2e] mode = "optional"` or `"required"`) the apps also keep keys here, all of
@@ -543,6 +649,9 @@ anyone read a sealed file.
 - **Restoring** an older copy brings back the people, sessions and memberships of that day (and the
   devices and keyrings: a device registered or an epoch started since is missing until the apps
   register and wrap again, which they do by themselves).
+- **Passwords**: `passwords.json` holds only hashes, but they can be guessed at offline (slowly:
+  Argon2id): keep backups as private as the server. Restoring an old copy brings back the
+  passwords of that day.
 - **Ending every session** (after a leak, say): stop the server, delete
   `<data>/accounts/sessions.json`, start it. Everyone signs in again; memberships stay.
 - **Moving to another machine**: stop the server, copy the data directory and
@@ -575,6 +684,9 @@ anyone read a sealed file.
   refusals as `event=sign_in_refused provider=… reason=policy`, plus invites taken and files
   published by account id. Codes, ID tokens, session tokens and secrets are never logged, and travel
   inside messages, never in URLs (the proxy's access logs don't see them).
+- **Basic accounts**: see [Basic accounts](#basic-accounts-usernames-and-passwords) for the
+  hashing, the lockouts and why passwords are taken only over TLS. A password is only as strong as
+  its owner made it: prefer an identity provider with two-factor sign-in for anything sensitive.
 - **The provider's answers are checked**: ID tokens must be signed by the issuer's published keys
   (RS256/384/512, ES256/384 or EdDSA), name the issuer and your client, and be within their times;
   the app's redirect must be a loopback address.
@@ -637,6 +749,12 @@ denied`` (make it owned by `figcraft`, and run `check` as `figcraft`), `unknown 
 `unknown kind`. **The server doesn't start** with ``can't read the certificates in
 FIGCRAFT_CA_FILE``: the file named there is missing, unreadable by `figcraft`, or not a PEM
 certificate. `journalctl -u figcraft-server -n 20` shows the reason.
+
+**`this server takes passwords only over TLS (wss://, through its reverse proxy) or from its own
+machine`**: someone signed in with a password on a plain `ws://` connection from another machine.
+Put the server behind the TLS proxy (`public_url = "wss://…"`, `trusted_proxy`) and have people use
+the `wss://` address. **`too many wrong passwords: …`**: the username or the address is locked out
+for 15 minutes; `figcraft-server users reset USERNAME` gives a new password and lifts it.
 
 **`you aren't in this file: ask its owner to invite you`**: the person is signed in but not a
 member. An owner (or an admin) invites them; with `accounts+links`, a share link also works.

@@ -10,7 +10,8 @@ use crate::wire::{AuthMode, E2eMode};
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
-    /// `"links"` (default), `"accounts"` or `"accounts+links"`.
+    /// `"links"` (default; also called `"open"`: nobody signs in), `"accounts"` or
+    /// `"accounts+links"`.
     pub mode: String,
     /// Emails that manage the server (like the server key).
     pub admins: Vec<String>,
@@ -70,6 +71,9 @@ pub struct ProviderConfig {
     /// run): with any other, someone could claim an address that isn't theirs and pass the
     /// allow-lists or become an admin. An explicit `email_verified: false` is never overridden.
     pub trust_email: bool,
+    /// `password` (the server's own usernames and passwords): people may make their own account
+    /// from the app. Default false: only admins add people (`figcraft-server users add`).
+    pub allow_signup: bool,
 }
 
 /// `[e2e]`.
@@ -92,12 +96,17 @@ impl E2eConfig {
     }
 }
 
+/// The kind of the server's own usernames and passwords (built by the server, which keeps them in
+/// its data directory: not in the `registry`).
+pub const PASSWORD_KIND: &str = "password";
+
 /// Most providers one server configures.
 pub const MAX_PROVIDERS: usize = 32;
 
 impl AuthConfig {
     pub fn mode(&self) -> Result<AuthMode, String> {
-        AuthMode::parse(&self.mode).ok_or_else(|| format!("`auth.mode` must be \"links\", \"accounts\" or \"accounts+links\", not {:?}", self.mode))
+        AuthMode::parse(&self.mode)
+            .ok_or_else(|| format!("`auth.mode` must be \"links\" (or \"open\"), \"accounts\" or \"accounts+links\", not {:?}", self.mode))
     }
 
     pub fn policy(&self) -> Policy {
@@ -132,8 +141,14 @@ impl AuthConfig {
             }
             seen.push(p.id.clone());
             if p.kind.trim().is_empty() {
-                return Err(format!("provider {:?} needs a `kind` (\"oidc\", \"external\"…)", p.id));
+                return Err(format!("provider {:?} needs a `kind` (\"oidc\", \"external\", \"password\"…)", p.id));
             }
+            if p.allow_signup && !p.kind.trim().eq_ignore_ascii_case(PASSWORD_KIND) {
+                return Err(format!("provider {:?}: `allow_signup` is only for `kind = \"password\"`", p.id));
+            }
+        }
+        if self.provider.iter().filter(|p| p.kind.trim().eq_ignore_ascii_case(PASSWORD_KIND)).count() > 1 {
+            return Err("at most one `[[auth.provider]]` with `kind = \"password\"` (the server keeps one list of usernames)".into());
         }
         for e in self.admins.iter().chain(&self.allow_emails) {
             if !e.contains('@') || e.chars().any(char::is_whitespace) {

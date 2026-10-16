@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use figcraft_auth::{ServerInfo, SignIn, SignInReply};
+use figcraft_auth::{ServerAbout, ServerInfo, SignIn, SignInReply};
 use figcraft_collab::message::{
     self, Access, AccountReply, AccountReq, Admin, AdminReply, ClientMsg, HostInfo, LibraryReply, LibraryReq, Manage, NewLink, OpenAccount,
     OpenHosting, OpenLibrary, OpenPlugins, PROTOCOL, PluginReply, PluginReq, Resolve, ServerMsg,
@@ -128,9 +128,45 @@ pub fn info(server: &Endpoint, limits: &NetLimits, timeout: Duration) -> Result<
     Ok(answer)
 }
 
+/// Ask the server at `server` what it says about itself: its name and everything it accepts
+/// (also the flows of basic accounts). A server older than this question is asked [`info`]
+/// instead (no name).
+pub fn about(server: &Endpoint, limits: &NetLimits, timeout: Duration) -> Result<ServerAbout, String> {
+    let mut ws = connect(server, limits, timeout)?;
+    send(&mut ws, &ClientMsg::About)?;
+    let answer = reply(&mut ws, limits, |m| match m {
+        ServerMsg::About(a) => Some(*a),
+        _ => None,
+    });
+    match answer {
+        Ok(a) => {
+            close(ws);
+            Ok(a)
+        }
+        // An older server closed the connection: ask the older question on a new one.
+        Err(e) if e.contains("couldn't be read") => Ok(ServerAbout { info: info(server, limits, timeout)?, ..ServerAbout::default() }),
+        Err(e) => Err(e),
+    }
+}
+
+/// Why a password isn't sent to `server`: it would cross the network in the clear (plain
+/// `ws://` to another machine). The server refuses such passwords too.
+pub const PASSWORD_IN_CLEAR: &str =
+    "this server isn't reached over TLS (its address is ws://, not wss://): FigCraft sends passwords only over TLS or to this machine";
+
+/// Is a password sent to `server` safe from the network? Over TLS, or to this machine.
+pub fn password_safe(server: &Endpoint) -> bool {
+    server.secure || server.loopback()
+}
+
 /// One sign-in step with the server at `server`, on a connection of its own (a session token from
-/// it signs in later connections). A server older than accounts can't read it.
+/// it signs in later connections). A server older than accounts can't read it. A password
+/// ([`SignIn::Password`], [`SignIn::SignUp`]) goes only over TLS or to this machine
+/// ([`PASSWORD_IN_CLEAR`]).
 pub fn sign_in(server: &Endpoint, req: SignIn, limits: &NetLimits, timeout: Duration) -> Result<SignInReply, String> {
+    if matches!(req, SignIn::Password { .. } | SignIn::SignUp { .. }) && !password_safe(server) {
+        return Err(PASSWORD_IN_CLEAR.into());
+    }
     let mut ws = connect(server, limits, timeout)?;
     send(&mut ws, &ClientMsg::SignIn(req))?;
     let answer = reply(&mut ws, limits, |m| match m {
@@ -144,7 +180,7 @@ pub fn sign_in(server: &Endpoint, req: SignIn, limits: &NetLimits, timeout: Dura
 
 /// Send `requests` on an account connection to the server at `server`, signed in with `session`:
 /// the replies, in order. Fails when the sign-in has ended or the server has no accounts. Never
-/// echoes the token.
+/// echoes the token. A password change goes only over TLS or to this machine.
 pub fn account(
     server: &Endpoint,
     session: &str,
@@ -152,6 +188,9 @@ pub fn account(
     limits: &NetLimits,
     timeout: Duration,
 ) -> Result<Vec<AccountReply>, String> {
+    if requests.iter().any(|r| matches!(r, AccountReq::ChangePassword { .. })) && !password_safe(server) {
+        return Err(PASSWORD_IN_CLEAR.into());
+    }
     let mut ws = connect(server, limits, timeout)?;
     send(&mut ws, &ClientMsg::SignIn(SignIn::Session { token: session.to_string() }))?;
     match reply(&mut ws, limits, |m| match m {

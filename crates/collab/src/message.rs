@@ -5,7 +5,7 @@ use figcraft_doc::NodeId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use figcraft_auth::{ServerInfo, SignIn, SignInReply};
+use figcraft_auth::{ServerAbout, ServerInfo, SignIn, SignInReply};
 
 use crate::Error;
 use crate::change::Change;
@@ -348,6 +348,49 @@ pub enum Admin {
     PublishSealed { file: String, name: Sealed, snapshot: Vec<SealedChange> },
     /// Rename a sealed file: its new name sealed like [`Admin::PublishSealed`]'s.
     RenameSealed { file: String, name: Sealed },
+    // ---- Basic accounts (m9/server-folders): appended, keep this block together. ----
+    // On a server with a `kind = "password"` provider, with the server key or as an admin.
+    // Servers older than basic accounts can't read these.
+    /// Add someone who signs in with a username and password: `password` as given, else one is
+    /// made and shown once ([`AdminReply::User`]). `email`, when given, counts as verified (an
+    /// admin typed it): the allow-lists and admins go by it.
+    CreateUser { username: String, email: Option<String>, name: String, password: Option<Secret> },
+    /// Give `username` a new temporary password, shown once ([`AdminReply::User`]); their
+    /// sessions end.
+    ResetPassword { username: String },
+    /// Take `username`'s password away: they can't sign in any more and their sessions end (their
+    /// account and files stay until [`Admin::RemovePerson`]).
+    RemoveUser { username: String },
+    /// The usernames ([`AdminReply::Users`]).
+    Users,
+}
+
+/// A secret travelling in a message (a password): its text, never shown by `Debug`.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
+/// Someone with a username and password on a server ([`Admin::Users`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserInfo {
+    pub username: String,
+    /// Their account, once they signed in.
+    pub account: Option<String>,
+    pub email: Option<String>,
+    pub name: String,
+    /// When they were added, and their password last set (seconds since 1970).
+    pub created: u64,
+    pub changed: u64,
+    /// Their password was made by the server (added without one, or reset) and not changed since.
+    pub temporary: bool,
+    /// Locked out after too many wrong passwords: seconds left.
+    pub locked: u64,
 }
 
 /// Someone who signed in on a server with accounts, as its admins see them ([`Admin::People`]).
@@ -501,6 +544,14 @@ pub enum AdminReply {
     },
     /// The answer to [`Admin::ServerStatus`].
     ServerStatus(ServerStatus),
+    // ---- Basic accounts (m9/server-folders): appended, keep this block together. ----
+    /// A user added, or their password reset: the password the server made, shown this once
+    /// (`None`: the one given was kept).
+    User {
+        username: String,
+        password: Option<Secret>,
+    },
+    Users(Vec<UserInfo>),
 }
 
 /// A file with what its operator moderates by.
@@ -919,6 +970,52 @@ pub enum AccountReq {
     DevicesOf {
         account: String,
     },
+    // ---- Basic accounts, folders, recents and thumbnails (m9/server-folders): appended, keep
+    // this block together. Servers older than them can't read these. ----
+    /// Change your password (you signed in with a username and password): [`AccountReply::Done`].
+    /// A wrong `old` counts like a wrong sign-in.
+    ChangePassword {
+        old: Secret,
+        new: Secret,
+    },
+    /// The folders you see ([`AccountReply::Folders`]): those of the files you're in (and their
+    /// parents), and the folders you made.
+    Folders,
+    /// Make an empty folder (`"Marketing/2026"`: names joined by `/`). It is yours: others see a
+    /// folder once a file they're in is in it.
+    CreateFolder {
+        path: String,
+    },
+    /// Rename a folder: the files in it (and below) that you may edit move, and your folders.
+    RenameFolder {
+        from: String,
+        to: String,
+    },
+    /// Remove a folder of yours: only when no file you're in is in it (or below).
+    RemoveFolder {
+        path: String,
+    },
+    /// Put a file in a folder (`""`: at the top); owners and editors. A file has one folder,
+    /// the same for everyone in it.
+    MoveFile {
+        file: String,
+        folder: String,
+    },
+    /// Your files with their folders, thumbnails and when you last opened them, and your folders
+    /// ([`AccountReply::Browse`]): what a file browser shows ([`AccountReq::Files`] stays as it
+    /// was).
+    Browse,
+    /// Keep a preview of a file (owners and editors): a PNG of at most [`MAX_THUMBNAIL`] bytes;
+    /// for a sealed file the PNG sealed for slot `Meta { what: "thumbnail" }` (the server keeps it
+    /// as it comes).
+    SetThumbnail {
+        file: String,
+        image: Vec<u8>,
+    },
+    /// A file's preview ([`AccountReply::Thumbnail`]); everyone in it.
+    GetThumbnail {
+        file: String,
+    },
 }
 
 /// A device of an owner or editor of a sealed file ([`AccountReq::EditorKeys`]).
@@ -930,6 +1027,24 @@ pub struct EditorDevice {
     pub public: DevicePublic,
     /// The device a recovery key stands for.
     pub recovery: bool,
+}
+
+/// Largest file preview kept ([`AccountReq::SetThumbnail`]).
+pub const MAX_THUMBNAIL: usize = 256 << 10;
+
+/// A file you're in, as a file browser shows it ([`AccountReq::Browse`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub info: FileInfo,
+    pub role: Role,
+    /// Its folder (`""`: at the top).
+    pub folder: String,
+    /// End-to-end encrypted.
+    pub sealed: bool,
+    /// When its preview was last set (`None`: it has none): ask with [`AccountReq::GetThumbnail`].
+    pub thumbnail: Option<u64>,
+    /// When you last opened it (`None`: never on this server).
+    pub opened: Option<u64>,
 }
 
 /// A device registered under an account ([`AccountReq::Devices`]).
@@ -1028,6 +1143,17 @@ pub enum AccountReply {
         signed_from: Option<u64>,
         editors: Vec<EditorDevice>,
     },
+    // ---- Folders, recents and thumbnails (m9/server-folders): appended, keep together. ----
+    Folders(Vec<String>),
+    Browse {
+        files: Vec<FileEntry>,
+        folders: Vec<String>,
+    },
+    /// A file's preview (empty: none) and when it was set.
+    Thumbnail {
+        image: Vec<u8>,
+        set: u64,
+    },
 }
 
 /// Client → server.
@@ -1094,7 +1220,11 @@ pub enum ClientMsg {
     SealedPresence(Sealed),
     /// A cursor chat [`Signal`] on a sealed file, sealed for slot `Signal { client }` (a spotlight
     /// stays a plain [`ClientMsg::Signal`], so the server can tell newcomers who is spotlighting).
-    SealedSignal(Sealed),
+    SealedSignal(Sealed), // ---- Server names (m9/server-folders): appended. ----
+    /// Ask what the server says about itself (before a connection's first message; answered with
+    /// [`ServerMsg::About`]): its name and everything it accepts. Servers older than it refuse it:
+    /// ask [`ClientMsg::Info`] then.
+    About,
 }
 
 /// Server → client.
@@ -1199,7 +1329,9 @@ pub enum ServerMsg {
     SealedSignal {
         client_id: u32,
         blob: Sealed,
-    },
+    }, // ---- Server names (m9/server-folders): appended. ----
+    /// The answer to [`ClientMsg::About`].
+    About(Box<ServerAbout>),
 }
 
 /// `YYYY-MM-DD HH:MM UTC` for seconds since 1970 (how servers and apps show the times in these

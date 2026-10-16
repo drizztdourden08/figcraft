@@ -31,6 +31,9 @@ figcraft-format = { workspace = true }
 # Checking plugin bundles before the plugin directory keeps them (never run here).
 figcraft-plugin = { workspace = true }
 log = { workspace = true }
+# Basic accounts: password hashes (Argon2id, RustCrypto) and their encoding.
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
+base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -45,8 +48,6 @@ ctrlc = { version = "3", features = ["termination"] }
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 
 [dev-dependencies]
-# A test authority's certificate as PEM (FIGCRAFT_CA_FILE).
-base64 = { workspace = true }
 # Crafting hostile archives (zip bombs) in tests.
 zip = { workspace = true }
 wat = { workspace = true }

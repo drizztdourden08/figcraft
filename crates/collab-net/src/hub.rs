@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use figcraft_auth::{Gate, Links, Person};
+use figcraft_auth::{Gate, Links, Origin, Person};
 use figcraft_collab::message::{
     self, Access, AccountReply, AccountReq, Admin, AdminReply, ClientMsg, Hello, HostInfo, LibraryReply, LibraryReq, Manage, OpenAccount,
     OpenHosting, OpenLibrary, OpenPlugins, PROTOCOL, PluginReply, PluginReq, Presence, Resolve, ServerMsg, reads_hosting,
@@ -927,13 +927,15 @@ fn before_first(
     out: &Line,
     max: usize,
     gate: &dyn Gate,
+    from: Origin,
     person: &mut Option<Person>,
 ) -> Result<Option<(ClientMsg, usize)>, String> {
     for _ in 0..MAX_STEPS {
         match next_message(ws, max)? {
             Some((ClientMsg::Info, _)) => say(out, &ServerMsg::Info(Box::new(gate.info()))),
+            Some((ClientMsg::About, _)) => say(out, &ServerMsg::About(Box::new(gate.about()))),
             Some((ClientMsg::SignIn(req), _)) => {
-                let (reply, who) = gate.sign_in(req);
+                let (reply, who) = gate.sign_in_from(req, from);
                 if who.is_some() {
                     *person = who;
                 }
@@ -1036,7 +1038,10 @@ fn serve(mut stream: TcpStream, conn: u64, hub: &Sender<HubIn>, limits: NetLimit
         end(Some("too many connections from your address: close some and try again"));
     } else {
         let mut person = None;
-        match before_first(&mut ws, &out, limits.max_hello, shared.gate.as_ref(), &mut person) {
+        // A password on this connection wasn't in the clear: it came from this machine, or through
+        // the trusted proxy (which terminates TLS).
+        let from = Origin { ip, private: proxied || peer.is_loopback() };
+        match before_first(&mut ws, &out, limits.max_hello, shared.gate.as_ref(), from, &mut person) {
             Ok(Some((
                 first @ (ClientMsg::Hello(_)
                 | ClientMsg::Manage(_)

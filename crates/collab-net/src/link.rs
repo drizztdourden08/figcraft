@@ -394,7 +394,7 @@ impl LiveLink for NetLink {
 /// What the server says it accepts, a sign-in step, or a request on your account there.
 fn accounts(req: NetRequest, limits: &NetLimits) -> NetReply {
     match req {
-        NetRequest::Info { server } => NetReply::Info(Endpoint::parse(&server).and_then(|(e, _)| manage::info(&e, limits, CONNECT))),
+        NetRequest::Info { server } => NetReply::Info(Endpoint::parse(&server).and_then(|(e, _)| manage::about(&e, limits, CONNECT))),
         NetRequest::SignIn { server, req } => NetReply::SignIn(Endpoint::parse(&server).and_then(|(e, _)| manage::sign_in(&e, req, limits, CONNECT))),
         NetRequest::Account { server, session, req } => NetReply::Account(
             Endpoint::parse(&server)

@@ -17,9 +17,14 @@
 //! <data>/files/<id>/usage.json   how other files use that library, as their apps report it
 //! <data>/files/<id>/keyring.json a sealed file's key wrapped to each member device, by epoch
 //!                                (servers with accounts; see `keyrings`): ciphertext only
+//! <data>/files/<id>/thumbnail.bin its preview (servers with accounts; see `folders`): a PNG, or
+//!                                for a sealed file the PNG sealed (the server can't open it)
 //! <data>/plugins/                the plugin directory (see `directory`)
 //! <data>/blocked.json            addresses the operator blocked
 //! <data>/reports.json            reports people sent about files
+//! <data>/folders.json            empty folders people made (servers with accounts; a file's
+//!                                folder is in its `meta.json`)
+//! <data>/recents.json            when each person last opened each file (servers with accounts)
 //! ```
 //!
 //! A server open to the public ([`HostingConfig::open`]) also keeps files anyone published
@@ -223,6 +228,12 @@ struct Meta {
     /// from the one after this sequence number on (`keyrings`, *Editor signatures*).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signed_from: Option<u64>,
+    /// Its folder (servers with accounts; `""`: at the top). Plain text, also for a sealed file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    folder: String,
+    /// When its preview (`thumbnail.bin`) was last set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thumbnail: Option<u64>,
 }
 
 impl Meta {
@@ -334,6 +345,9 @@ pub struct Store {
     free: Option<(Instant, Option<u64>)>,
     /// Who signs in (none on a server of share links only).
     accounts: Arc<Accounts>,
+    /// Empty folders people made, and when each person last opened each file (see `folders`).
+    folders: Vec<folders::FolderRec>,
+    recents: Vec<folders::Recent>,
     _lock: File,
 }
 
@@ -342,6 +356,9 @@ pub mod members;
 
 #[path = "keyrings.rs"]
 pub mod keyrings;
+
+#[path = "folders.rs"]
+pub mod folders;
 
 /// Seconds since 1970.
 pub fn now() -> u64 {
@@ -436,6 +453,8 @@ impl Store {
             cut_short: Vec::new(),
             free: None,
             accounts: Arc::new(Accounts::links_only(root)),
+            folders: Vec::new(),
+            recents: Vec::new(),
             _lock: lock,
         };
         for problem in startup_problems {
@@ -444,6 +463,8 @@ impl Store {
         store.scan(&dir);
         store.blocked = store.read_list::<String>(BLOCKED).iter().filter_map(|s| s.parse().ok()).map(ip_key).collect();
         store.reports = store.read_list(REPORTS);
+        store.folders = store.read_list(folders::FOLDERS);
+        store.recents = store.read_list(folders::RECENTS);
         store.sweep();
         Ok(Some(store))
     }
@@ -495,7 +516,7 @@ impl Store {
     /// A file folder's description and links, after checking its snapshot and log. Leftover
     /// temporary files (writes cut short) are removed.
     fn check(&self, path: &Path) -> Result<Entry, String> {
-        for name in [SNAPSHOT, LOG, META, LINKS] {
+        for name in [SNAPSHOT, LOG, META, LINKS, folders::THUMBNAIL] {
             let tmp = disk::temp_of(&path.join(name));
             if tmp.exists() {
                 let _ = fs::remove_file(&tmp);
@@ -735,6 +756,8 @@ impl Store {
             sealed,
             sealed_name,
             signed_from: None,
+            folder: String::new(),
+            thumbnail: None,
         };
         let dir = self.dir(&id);
         let written = fs::create_dir_all(&dir)
@@ -1569,6 +1592,10 @@ impl Backend for Store {
             return self.admit(file, token);
         }
         let mut admission = if mode.links() && !token.is_empty() { self.admit(file, token)? } else { self.admit_member(file, who)? };
+        // Someone signed in opened it: their recent files say so.
+        if let Some(who) = who {
+            self.opened_by(file, &who.account);
+        }
         // A file whose changes must be signed takes them from its editors only: a share link
         // (or an admin who isn't in the file) only views it.
         let editor = who.is_some_and(|w| {
@@ -1813,7 +1840,11 @@ impl Backend for Store {
             | Admin::FileMembers { .. }
             | Admin::SetFileRole { .. }
             | Admin::AddFileMember { .. }
-            | Admin::ServerStatus) => self.admin_people(req),
+            | Admin::ServerStatus
+            | Admin::CreateUser { .. }
+            | Admin::ResetPassword { .. }
+            | Admin::RemoveUser { .. }
+            | Admin::Users) => self.admin_people(req),
             // The hub removes people itself (it knows who is connected); it never asks the store.
             Admin::RemovePeer { .. } => failed("removing someone from a file is done by the server's hub".into()),
             Admin::Remove { file } => {

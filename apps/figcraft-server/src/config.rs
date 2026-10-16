@@ -23,6 +23,9 @@ pub struct Config {
     pub listen: String,
     /// The data directory (files, links, the server key).
     pub data: PathBuf,
+    /// The server's name, for people to tell servers apart ("Acme design"): apps show it when
+    /// you haven't named the server yourself (at most 80 characters, one line; empty: none).
+    pub name: String,
     /// How share links name this server when it isn't reached at `listen` (a reverse proxy:
     /// `wss://figcraft.example.com/`).
     pub public_url: Option<String>,
@@ -83,6 +86,7 @@ impl Default for Config {
         Self {
             listen: format!("127.0.0.1:{DEFAULT_PORT}"),
             data: PathBuf::from("figcraft-data"),
+            name: String::new(),
             public_url: None,
             max_files: 1000,
             max_file_mb: None,
@@ -144,6 +148,13 @@ impl Config {
     /// abuse contact, or one whose clients would all count as its proxy).
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
+        let passwords = self.auth.provider.iter().any(|p| p.kind.trim().eq_ignore_ascii_case(figcraft_auth::config::PASSWORD_KIND));
+        let tls = self.public().ok().flatten().is_some_and(|e| e.secure);
+        if passwords && !tls && !self.addr().is_ok_and(|a| a.ip().is_loopback()) {
+            out.push(
+                "a `password` provider is on but the server isn't behind TLS (no wss:// public_url, listening on the network): passwords are refused unless they come from this machine or the trusted proxy".into(),
+            );
+        }
         if !self.open_publish {
             return out;
         }
@@ -233,8 +244,15 @@ impl Config {
         if self.max_plugins > 10_000 || self.max_plugins_mb > 1 << 20 {
             return Err("`max_plugins` is at most 10000 and `max_plugins_mb` at most 1048576".into());
         }
+        if self.name.chars().count() > 80 || self.name.chars().any(char::is_control) {
+            return Err("`name` is at most 80 characters, on one line".into());
+        }
         for p in &self.auth.provider {
-            registry.check(p)?;
+            if p.kind.trim().eq_ignore_ascii_case(figcraft_auth::config::PASSWORD_KIND) {
+                crate::passwords::check_config(p)?;
+            } else {
+                registry.check(p)?;
+            }
         }
         Ok(())
     }

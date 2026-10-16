@@ -8,6 +8,8 @@
 //! - **device**: the server asks the provider for a code to type on another device; the app shows
 //!   it and asks the server until the person has entered it.
 //! - **token**: a token the person pasted goes to the server, which asks the provider.
+//! - **password**: a username and password go to the server (only over TLS or to this machine),
+//!   which checks them itself (`kind = "password"`) or asks its directory.
 //!
 //! What the person must see on the way ([`Step`]) is handed to a callback (the app opens the page
 //! or shows the code); the result is the server's [`Me`] with its session token.
@@ -36,8 +38,8 @@ pub enum Step {
     Code(DeviceCode),
 }
 
-/// Which flow to use.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Which flow to use (`Debug` leaves the token and password out).
+#[derive(Clone, PartialEq, Eq)]
 pub enum Via {
     /// The provider's page in the browser (the default when the provider offers it).
     Browser,
@@ -45,6 +47,19 @@ pub enum Via {
     Device,
     /// A token the person has.
     Token(String),
+    /// A username and password.
+    Password { username: String, password: String },
+}
+
+impl std::fmt::Debug for Via {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Via::Browser => f.write_str("Browser"),
+            Via::Device => f.write_str("Device"),
+            Via::Token(_) => f.write_str("Token(..)"),
+            Via::Password { username, .. } => f.debug_struct("Password").field("username", username).finish_non_exhaustive(),
+        }
+    }
 }
 
 /// The provider `id` among `providers` (or the first one).
@@ -64,14 +79,17 @@ pub fn choose(provider: &ProviderInfo, asked: Option<Via>) -> Result<Via, String
     let has_browser = provider.flows.iter().any(|f| matches!(f, Flow::Browser { .. }));
     let has_device = provider.flows.contains(&Flow::Device);
     let has_token = provider.flows.iter().any(|f| matches!(f, Flow::Token { .. }));
+    let has_password = provider.flows.iter().any(|f| matches!(f, Flow::Password { .. }));
     match asked {
         Some(Via::Browser) if has_browser => Ok(Via::Browser),
         Some(Via::Device) if has_device => Ok(Via::Device),
         Some(Via::Token(t)) if has_token => Ok(Via::Token(t)),
+        Some(Via::Password { username, password }) if has_password => Ok(Via::Password { username, password }),
         Some(_) => Err(format!("{} doesn't offer that way of signing in here", provider.label)),
         None if has_browser => Ok(Via::Browser),
         None if has_device => Ok(Via::Device),
         None if has_token => Err(format!("{} signs in with a token: paste it", provider.label)),
+        None if has_password => Err(format!("{} signs in with a username and password", provider.label)),
         None => Err(format!("{} can't be used to sign in right now (try again in a moment)", provider.label)),
     }
 }
@@ -86,7 +104,7 @@ pub fn sign_in(
     limits: &NetLimits,
     timeout: Duration,
 ) -> Result<Me, String> {
-    let info = manage::info(server, limits, timeout)?;
+    let info = manage::about(server, limits, timeout)?.info;
     if !info.auth.accounts() {
         return Err(format!("{} has no accounts: join its files with links or codes", server.display()));
     }
@@ -98,6 +116,9 @@ pub fn sign_in(
     };
     match choose(p, via)? {
         Via::Token(token) => signed(manage::sign_in(server, SignIn::Token { provider: p.id.clone(), token }, limits, timeout)?),
+        Via::Password { username, password } => {
+            signed(manage::sign_in(server, SignIn::Password { provider: p.id.clone(), username, password }, limits, timeout)?)
+        }
         Via::Device => {
             let code = match manage::sign_in(server, SignIn::DeviceStart { provider: p.id.clone() }, limits, timeout)? {
                 SignInReply::Device(c) => c,

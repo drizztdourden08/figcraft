@@ -482,6 +482,7 @@ impl Client {
             | ServerMsg::Reported { .. }
             | ServerMsg::Resolved { .. }
             | ServerMsg::Info(_)
+            | ServerMsg::About(_)
             | ServerMsg::SignIn(_)
             | ServerMsg::Account(_)
             // A sealed file's messages are opened into the plain ones before they get here.

@@ -1,10 +1,14 @@
 //! Signing in to servers with accounts, and the people in your files there (milestone M9;
 //! `docs/accounts-and-e2e.md`).
 //!
-//! A server with accounts lets people in by who they are. `account.signIn` signs in through one of
-//! the server's identity providers: in the browser (the provider's page opens; the app waits for
-//! it to come back), with a code typed on another device (`account.signInPoll` asks whether it
-//! was entered: what scripts and agents use), or with a token. The server hands back a session
+//! A server is **open** (share links and join codes, nobody signs in), or has accounts: **basic**
+//! (usernames and passwords the server keeps), **SSO** (an identity provider: Google, Keycloak…)
+//! or both (`account.info`'s `access`). `account.signIn` signs in through one of the server's
+//! providers: in the browser (the provider's page opens; the app waits for it to come back), with
+//! a code typed on another device (`account.signInPoll` asks whether it was entered: what scripts
+//! and agents use), with a token, or with a username and password (sent only over TLS or to this
+//! machine, never echoed in a result; `account.signUp` makes an account where the server allows
+//! it, `account.changePassword` changes it). The server hands back a session
 //! token, kept with the preferences ([`Prefs::accounts`](crate::Prefs)) on this computer only,
 //! like the owner tokens of your online files: no command result or summary carries it, and
 //! `Debug` leaves it out. Joining or publishing a file on that server then signs in first.
@@ -18,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cmd::CommandSpec;
-use crate::live::{Flow, Me, NetReply, NetRequest, ServerInfo, SignIn, SignInReply};
+use crate::live::{Flow, Me, NetReply, NetRequest, ServerAbout, ServerInfo, SignIn, SignInReply};
 use crate::params::{req_string, string};
 use crate::{EngineError, Result, Session, bad, spec};
 
@@ -68,6 +72,8 @@ pub struct Accounts {
     pub pending: Option<Pending>,
     /// The last sign-in's outcome, for the UI: who, or why not.
     pub last: Option<std::result::Result<String, String>>,
+    /// The previews of files on servers this app sent ([`crate::server_files`]).
+    pub(crate) thumbs: crate::server_files::Thumbs,
 }
 
 /// How a server's address is kept and compared: trimmed, without a query, lowercase scheme and
@@ -123,7 +129,7 @@ impl Session {
     }
 
     /// Keep a sign-in (replacing the one to the same server).
-    fn keep_sign_in(&mut self, server: &str, me: Me) -> Value {
+    pub(crate) fn keep_sign_in(&mut self, server: &str, me: Me) -> Value {
         let key = server_key(server);
         let session = match (me.session.is_empty(), self.signed_in(&key)) {
             (true, Some(old)) => old.session.clone(),
@@ -158,13 +164,18 @@ impl Session {
     }
 
     fn server_info(&mut self, server: &str) -> Result<ServerInfo> {
+        Ok(self.server_about(server)?.info)
+    }
+
+    /// What `server` says about itself: its name and everything it accepts.
+    pub(crate) fn server_about(&mut self, server: &str) -> Result<ServerAbout> {
         match self.net(NetRequest::Info { server: server.to_string() })?.0 {
             NetReply::Info(r) => r.map_err(EngineError::Other),
             _ => Err(EngineError::Other("the link answered something else".into())),
         }
     }
 
-    fn sign_in_step(&mut self, server: &str, req: SignIn) -> Result<SignInReply> {
+    pub(crate) fn sign_in_step(&mut self, server: &str, req: SignIn) -> Result<SignInReply> {
         match self.net(NetRequest::SignIn { server: server.to_string(), req })?.0 {
             NetReply::SignIn(r) => r.map_err(EngineError::Other),
             _ => Err(EngineError::Other("the link answered something else".into())),
@@ -199,30 +210,43 @@ impl Session {
     }
 }
 
+/// A flow's id in command parameters and results.
+fn flow_id(f: &Flow) -> &'static str {
+    match f {
+        Flow::Browser { .. } => "browser",
+        Flow::Device => "device",
+        Flow::Token { .. } => "token",
+        Flow::Password { .. } => "password",
+        Flow::SignUp => "signUp",
+    }
+}
+
 fn info_json(info: &ServerInfo) -> Value {
     let providers: Vec<Value> = info
         .providers
         .iter()
         .map(|p| {
-            let flows: Vec<&str> = p
-                .flows
-                .iter()
-                .map(|f| match f {
-                    Flow::Browser { .. } => "browser",
-                    Flow::Device => "device",
-                    Flow::Token { .. } => "token",
-                })
-                .collect();
+            let flows: Vec<&str> = p.flows.iter().map(flow_id).collect();
             json!({"id": p.id, "label": p.label, "flows": flows})
         })
         .collect();
-    json!({"auth": info.auth.id(), "accounts": info.auth.accounts(), "links": info.auth.links(), "providers": providers, "e2e": info.e2e.id()})
+    json!({
+        "auth": info.auth.id(),
+        "access": info.access(),
+        "open": !info.auth.accounts(),
+        "accounts": info.auth.accounts(),
+        "links": info.auth.links(),
+        "providers": providers,
+        "e2e": info.e2e.id(),
+    })
 }
 
 fn info(s: &mut Session, p: &Value) -> Result<Value> {
     let server = s.account_server("account.info", p)?;
-    let info = s.server_info(&server)?;
-    let mut v = info_json(&info);
+    let about = s.server_about(&server)?;
+    let mut v = info_json(&about.info);
+    v["name"] = json!(about.name);
+    v["version"] = json!(about.version);
     v["server"] = json!(server);
     v["signedIn"] = s.signed_in(&server).map_or(Value::Null, SignedIn::json);
     Ok(v)
@@ -237,20 +261,23 @@ fn sign_in(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let provider = match string(p, "provider") {
         Some(id) => info.providers.iter().find(|x| x.id == id).ok_or_else(|| bad(CMD, format!("this server has no sign-in called {id:?}")))?,
+        // A password given: the provider that takes one.
+        None if p.get("password").is_some() => info
+            .providers
+            .iter()
+            .find(|x| x.flows.iter().any(|f| matches!(f, Flow::Password { .. })))
+            .ok_or_else(|| bad(CMD, "this server doesn't sign in with a username and password"))?,
         None => info.providers.first().ok_or_else(|| bad(CMD, "this server has no sign-in providers"))?,
     };
-    let has = |want: &str| {
-        provider
-            .flows
-            .iter()
-            .any(|f| matches!((f, want), (Flow::Browser { .. }, "browser") | (Flow::Device, "device") | (Flow::Token { .. }, "token")))
-    };
+    let has = |want: &str| provider.flows.iter().any(|f| flow_id(f) == want);
     let token = string(p, "token");
     let flow = match (string(p, "flow"), &token) {
         (Some(f), _) => f,
         (None, Some(_)) => "token".into(),
+        (None, None) if p.get("password").is_some() => "password".into(),
         (None, None) if has("browser") => "browser".into(),
         (None, None) if has("device") => "device".into(),
+        (None, None) if has("password") => "password".into(),
         (None, None) => "token".into(),
     };
     if !has(&flow) {
@@ -285,6 +312,18 @@ fn sign_in(s: &mut Session, p: &Value) -> Result<Value> {
             SignInReply::Refused { reason } => Err(EngineError::Other(reason)),
             _ => Err(EngineError::Other("the server didn't start a device sign-in".into())),
         },
+        "password" => {
+            let username = req_string(CMD, p, "username")?;
+            let password = req_string(CMD, p, "password")?;
+            match s.sign_in_step(&server, SignIn::Password { provider: provider_id, username, password })? {
+                SignInReply::SignedIn(me) => Ok(json!({"status": "signedIn", "account": s.keep_sign_in(&server, me)})),
+                SignInReply::Refused { reason } => {
+                    s.accounts.last = Some(Err(reason.clone()));
+                    Err(EngineError::Other(reason))
+                }
+                _ => Err(EngineError::Other("the server didn't sign you in".into())),
+            }
+        }
         "browser" => {
             let Some(page) = provider.flows.iter().find(|f| matches!(f, Flow::Browser { .. })).cloned() else {
                 return Err(bad(CMD, "no sign-in page"));
@@ -295,7 +334,7 @@ fn sign_in(s: &mut Session, p: &Value) -> Result<Value> {
             s.request_ui("open.url", json!({"url": url}));
             Ok(json!({"status": "waitingForBrowser", "url": url}))
         }
-        other => Err(bad(CMD, format!("`flow` is browser, device or token, not {other:?}"))),
+        other => Err(bad(CMD, format!("`flow` is browser, device, token or password, not {other:?}"))),
     }
 }
 
@@ -446,14 +485,14 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "account.info",
             "Server accounts",
-            "{server? (default: the server in Preferences)} → {server, auth: links | accounts | accounts+links, accounts, links, providers: [{id, label, flows: [browser | device | token]}], e2e: off | optional | required, signedIn: {server, account, name, email, admin, expires} | null}: what the server accepts",
+            "{server? (default: the server in Preferences)} → {server, name (what its operator calls it; empty: nothing — show your own name for the server first, then this, then its address), version, auth: links | accounts | accounts+links, access: open (no sign-in: links and codes) | basic (username and password) | sso (an identity provider) | basic+sso, open, accounts, links, providers: [{id, label, flows: [browser | device | token | password | signUp]}], e2e: off | optional | required, signedIn: {server, account, name, email, admin, expires} | null}: what the server accepts",
             false,
             info
         ),
         spec!(
             "account.signIn",
             "Sign in to server",
-            "{server?, provider? (an id from `account.info`; default the first), flow? (browser | device | token; default browser when offered), token? (the token flow)} → {status: signedIn, account} (token), {status: enterCode, userCode, verificationUri, interval, expiresIn} (device: type the code there, then `account.signInPoll`), or {status: waitingForBrowser, url} (the provider's page opens in the browser; `account.status` tells when it came back). The session token is kept on this computer only and never returned",
+            "{server?, provider? (an id from `account.info`; default the first), flow? (browser | device | token | password; default browser when offered, password when `password` is given), token? (the token flow), username?, password? (the password flow: sent only over wss:// or to this machine, never returned)} → {status: signedIn, account} (token, password), {status: enterCode, userCode, verificationUri, interval, expiresIn} (device: type the code there, then `account.signInPoll`), or {status: waitingForBrowser, url} (the provider's page opens in the browser; `account.status` tells when it came back). The session token is kept on this computer only and never returned",
             false,
             sign_in
         ),

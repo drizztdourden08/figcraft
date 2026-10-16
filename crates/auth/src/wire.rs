@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AuthMode {
-    /// Share links and join codes only (no accounts): every server before accounts.
+    /// Share links and join codes only (no accounts): every server before accounts. Apps call
+    /// such a server **open** (`mode = "open"` in `server.toml` is the same).
     #[default]
     Links,
     /// Signing in is required, and people have a role per file.
@@ -27,10 +28,10 @@ impl AuthMode {
         }
     }
 
-    /// From [`id`](Self::id) (any case, surrounding spaces ignored).
+    /// From [`id`](Self::id) (any case, surrounding spaces ignored; `"open"` is `"links"`).
     pub fn parse(s: &str) -> Option<AuthMode> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "links" => Some(AuthMode::Links),
+            "links" | "open" => Some(AuthMode::Links),
             "accounts" => Some(AuthMode::Accounts),
             "accounts+links" | "links+accounts" => Some(AuthMode::AccountsAndLinks),
             _ => None,
@@ -94,6 +95,13 @@ pub enum Flow {
     Device,
     /// Paste a token the provider issues ([`SignIn::Token`]); `label` names it ("Company token").
     Token { label: String },
+    // Appended for basic (username and password) accounts. Apps from before them can't read these:
+    // a server lists them only in [`ServerAbout`], never in the answer to `Info`.
+    /// Type a username and password ([`SignIn::Password`]); `label` names the sign-in ("Server
+    /// account"). Apps send a password only over TLS (`wss://`) or to this machine.
+    Password { label: String },
+    /// People may make their own account here ([`SignIn::SignUp`]).
+    SignUp,
 }
 
 /// A provider a server accepts.
@@ -106,7 +114,9 @@ pub struct ProviderInfo {
     pub flows: Vec<Flow>,
 }
 
-/// What a server accepts: the answer to `Info`.
+/// What a server accepts: the answer to `Info`. A server of share links only
+/// ([`AuthMode::Links`]) is an **open** server: nobody signs in, a link or a join code is the
+/// access.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerInfo {
     pub auth: AuthMode,
@@ -114,8 +124,49 @@ pub struct ServerInfo {
     pub e2e: E2eMode,
 }
 
-/// A sign-in step (before a connection's first message).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl ServerInfo {
+    /// Only the flows apps from before basic accounts can read ([`Flow::Browser`], [`Flow::Device`],
+    /// [`Flow::Token`]): what a server answers `Info` with. A provider left with no flow is still
+    /// listed (older apps say it can't be used from them).
+    pub fn for_older_apps(mut self) -> ServerInfo {
+        for p in &mut self.providers {
+            p.flows.retain(|f| matches!(f, Flow::Browser { .. } | Flow::Device | Flow::Token { .. }));
+        }
+        self
+    }
+
+    /// How people get in, in one word for the app: `"open"` (no sign-in: share links and join
+    /// codes), `"basic"` (usernames and passwords), `"sso"` (an identity provider: Google,
+    /// Keycloak…), or `"basic+sso"` (both).
+    pub fn access(&self) -> &'static str {
+        if !self.auth.accounts() {
+            return "open";
+        }
+        let basic = self.providers.iter().any(|p| p.flows.iter().any(|f| matches!(f, Flow::Password { .. })));
+        let sso = self.providers.iter().any(|p| p.flows.iter().any(|f| !matches!(f, Flow::Password { .. } | Flow::SignUp)));
+        match (basic, sso) {
+            (true, true) => "basic+sso",
+            (true, false) => "basic",
+            _ => "sso",
+        }
+    }
+}
+
+/// What a server says about itself: the answer to `About` (servers from before it refuse the
+/// question: ask `Info` then). New fields go in a new message, never here.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerAbout {
+    /// The name its operator gave it (`name` in `server.toml`; empty: none). Apps show the name
+    /// people gave the server first, then this, then its address.
+    pub name: String,
+    /// What it accepts, with every flow (also [`Flow::Password`] and [`Flow::SignUp`]).
+    pub info: ServerInfo,
+    /// Its version.
+    pub version: String,
+}
+
+/// A sign-in step (before a connection's first message). `Debug` leaves the secrets out.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SignIn {
     /// A session token the server gave earlier ([`Me::session`]).
@@ -131,6 +182,34 @@ pub enum SignIn {
     Token { provider: String, token: String },
     /// End this session token (signing out on this device).
     SignOut { token: String },
+    // Appended for basic accounts (servers from before them can't read these).
+    /// A username and password (the [`Flow::Password`] flow). Never logged.
+    Password { provider: String, username: String, password: String },
+    /// Make an account with this username and password and sign in with it (the [`Flow::SignUp`]
+    /// flow, on a server that lets people sign up). An email given here isn't verified: the
+    /// allow-lists don't count it.
+    SignUp { provider: String, username: String, password: String, email: Option<String>, name: String },
+}
+
+impl std::fmt::Debug for SignIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignIn::Session { .. } => f.write_str("Session { .. }"),
+            SignIn::Code { provider, redirect_uri, .. } => {
+                f.debug_struct("Code").field("provider", provider).field("redirect_uri", redirect_uri).finish_non_exhaustive()
+            }
+            SignIn::DeviceStart { provider } => f.debug_struct("DeviceStart").field("provider", provider).finish(),
+            SignIn::DevicePoll { provider, .. } => f.debug_struct("DevicePoll").field("provider", provider).finish_non_exhaustive(),
+            SignIn::Token { provider, .. } => f.debug_struct("Token").field("provider", provider).finish_non_exhaustive(),
+            SignIn::SignOut { .. } => f.write_str("SignOut { .. }"),
+            SignIn::Password { provider, username, .. } => {
+                f.debug_struct("Password").field("provider", provider).field("username", username).finish_non_exhaustive()
+            }
+            SignIn::SignUp { provider, username, .. } => {
+                f.debug_struct("SignUp").field("provider", provider).field("username", username).finish_non_exhaustive()
+            }
+        }
+    }
 }
 
 /// Someone signed in.

@@ -17,6 +17,7 @@ pub mod config;
 pub mod directory;
 pub mod disk;
 pub mod fetch;
+pub mod passwords;
 pub mod store;
 
 use std::net::{SocketAddr, TcpListener};
@@ -75,7 +76,7 @@ pub fn start_with(cfg: &Config, registry: &Registry) -> Result<Running, String> 
     cfg.check_with(registry)?;
     let fetch = Arc::new(Https::new()?);
     let mut store = Store::open(&cfg.data, cfg.store())?;
-    let accounts = Arc::new(Accounts::open(&cfg.data, &cfg.auth, cfg.e2e.mode()?, registry, fetch)?);
+    let accounts = Arc::new(Accounts::open(&cfg.data, &cfg.auth, cfg.e2e.mode()?, registry, fetch)?.with_name(&cfg.name));
     store.set_accounts(accounts.clone());
     for p in store.problems() {
         log::warn!("{p}");
@@ -116,11 +117,15 @@ mod app_sealed_tests;
 #[cfg(test)]
 mod background_tests;
 #[cfg(test)]
+mod basic_tests;
+#[cfg(test)]
 mod cli_tests;
 #[cfg(test)]
 mod codes_tests;
 #[cfg(test)]
 mod directory_tests;
+#[cfg(test)]
+mod folders_tests;
 #[cfg(test)]
 mod hardening_tests;
 #[cfg(test)]
