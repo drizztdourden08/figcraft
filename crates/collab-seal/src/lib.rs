@@ -47,7 +47,9 @@ pub use figcraft_collab::sealed::{
 pub use keys::{FileKey, Keyring, MAX_LINK_EPOCHS, entry_id, link_fragment, parse_link_fragment, parse_ring_fragment, ring_fragment};
 pub use recovery::RecoveryKey;
 pub use seal::{Slot, open, seal};
-pub use sign::{AnyEditor, BatchRefused, EditorKeys, KnownEditors, Signed, batch_message, check_batch, safety_number, sign_batch, verify_batch};
+pub use sign::{
+    AnyEditor, BatchRefused, EditorKeys, KnownEditors, Signed, batch_message, check_batch, check_batch_at, safety_number, sign_batch, verify_batch,
+};
 
 /// Why something couldn't be sealed, opened, decoded or unwrapped.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

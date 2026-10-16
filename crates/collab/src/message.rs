@@ -907,6 +907,29 @@ pub enum AccountReq {
     },
     /// Your recovery copy ([`AccountReply::Recovery`]).
     GetRecovery,
+    /// The devices of a sealed file's owners and editors, the keys its batches must be signed with
+    /// ([`AccountReply::EditorKeys`]; any member may ask: viewers check signatures too). Only
+    /// servers that read signed batches answer it (older ones can't read the request), so an
+    /// answer is also what tells an app it may sign.
+    EditorKeys {
+        file: String,
+    },
+    /// The devices of someone who shares a file with you (or yours), for their safety number
+    /// ([`AccountReply::Devices`]).
+    DevicesOf {
+        account: String,
+    },
+}
+
+/// A device of an owner or editor of a sealed file ([`AccountReq::EditorKeys`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditorDevice {
+    pub account: String,
+    pub device: String,
+    /// Its public keys: `signing` checks its batch signatures (both go into safety numbers).
+    pub public: DevicePublic,
+    /// The device a recovery key stands for.
+    pub recovery: bool,
 }
 
 /// A device registered under an account ([`AccountReq::Devices`]).
@@ -998,6 +1021,13 @@ pub enum AccountReply {
     },
     PendingKeys(Vec<PendingFile>),
     Recovery(Option<RecoveryCopy>),
+    /// The devices of a sealed file's owners and editors (revoked ones are gone), and from which
+    /// batch on its changes must be signed by one of them: every batch with a sequence number
+    /// above `signed_from` (`None`: not yet, unsigned batches are taken).
+    EditorKeys {
+        signed_from: Option<u64>,
+        editors: Vec<EditorDevice>,
+    },
 }
 
 /// Client → server.

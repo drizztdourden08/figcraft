@@ -15,6 +15,7 @@
 
 #[cfg(any(target_arch = "wasm32", test))]
 mod driver;
+pub mod editors;
 pub mod inbox;
 pub mod invite;
 mod join;

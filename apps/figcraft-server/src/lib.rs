@@ -140,6 +140,8 @@ mod server_tests;
 #[cfg(test)]
 mod settings_tests;
 #[cfg(test)]
+mod signatures_tests;
+#[cfg(test)]
 mod store_tests;
 #[cfg(test)]
 mod test_util;

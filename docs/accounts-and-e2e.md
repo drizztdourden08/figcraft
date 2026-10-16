@@ -22,9 +22,13 @@ new epochs when someone is taken out or a device revoked, and recovery keys. **S
 (hardening, see *Same checks everywhere*, *Editor signatures*, *Safety numbers* and *Edges*): every
 app checks a sealed file's values with the same versioned rules and resets what breaks them
 instead of failing the session, the server refuses apps with other rules, batches can carry their
-device's signature and apps check it against the editors they know (`EditorKeys`; the app doesn't
-sign or require signatures yet), `account.safetyNumber`, sealed team libraries, and agents joining
-sealed files by link. Sections say what is built as the implementation lands. Builds on
+device's signature and apps check it against the editors they know (`EditorKeys`),
+`account.safetyNumber`, sealed team libraries, and agents joining sealed files by link. **Step 11
+is built** (signatures switched on, see *Editor signatures*): on a server with accounts the apps of
+a sealed file's owners and editors sign every batch, the server lists their devices
+(`AccountReq::EditorKeys`) and marks the file as requiring signatures, every app refuses a batch
+that isn't signed by one of those devices, and safety numbers cover other people, with a warning
+when their devices change. Sections say what is built as the implementation lands. Builds on
 [`collab-protocol.md`](collab-protocol.md)
 (live sessions) and [`server.md`](server.md) (running `figcraft-server`).
 
@@ -301,7 +305,7 @@ before step 10 (which fail the session on a bad value instead) and apps with lat
 share a file with different results. Plain files don't look at the word. Changing the rules means
 a new `SEALED_RULES` and, as with the protocol, updating servers and apps together.
 
-### Editor signatures (built, step 10; the app doesn't sign or require them yet)
+### Editor signatures (built, steps 10 and 11)
 
 Viewers hold the file key too, so a viewer working with a compromised server could seal changes
 and have the server pass them on as an editor's. Editors therefore sign their batches:
@@ -313,28 +317,79 @@ and have the server pass them on as an editor's. Editors therefore sign their ba
   length ‖ UTF-8) ‖ epoch (u32 LE) ‖ base_seq (u64 LE) ‖ batch_id (u64 LE) ‖ device (32) ‖ the
   batch's other changes (postcard)` (`figcraft_collab_seal::sign_batch`, `batch_message`). Being a
   change of the batch, it travels everywhere the batch does: live, in a reconnect's catch-up, in
-  the server's log and journal. The server checks only that it is last and alone, and never keeps
-  it in the file (it isn't in snapshots or fixes).
-- **Checking.** Every batch that arrives is checked before it opens (`check_batch` against
+  the server's log and journal. The server never keeps it in the file (it isn't in snapshots or
+  fixes).
+- **Checking.** Every batch that arrives is checked before it opens (`check_batch_at` against
   `GuestConfig::sealing.editors`, an `EditorKeys`): a signature that doesn't hold (changed bytes,
-  another file or batch), an unsigned batch where editors must sign (`EditorKeys::required`), or a
-  device that isn't an editor's **ends the session** with the reason. Ending rather than skipping:
-  two apps' lists of editors can differ for a moment (a device added a second ago), and skipping on
-  one and not the other would leave their copies different.
-- **What is enforced today, and what plugs in.** `EditorKeys` is the interface: `is_editor(device)`
-  and `required()`. Built: `AnyEditor` (the default: no list, as on links-mode files where whoever
-  holds an edit link edits: signatures that are there must hold, unsigned batches are taken) and
-  `KnownEditors` (a fixed list, `required`: what the tests use). The app passes neither a signer nor
-  a list yet (`GuestConfig::sealing` is empty), so it sends unsigned batches, takes unsigned ones,
-  and **nothing is enforced against a viewer today**. What's left to wire: the step 9 device key as
-  `signer` (the engine holds it in `KeyState`; the transport needs it handed over with the join,
-  where `NetLink` builds a join's config), and the editors' list, which needs the server to list
-  the devices of a file's owners and editors (a new `AccountReq`; today `Devices` lists only your
-  own and `PendingKeys` only devices missing a key). Requiring signatures (`required`) should wait
-  until every app in a file signs.
-- **Servers.** Only a server from step 10 on reads a batch that ends with a signature (older ones,
-  step 9's included, can't decode the change and drop the connection); those servers also refuse
-  apps without `rules1`. Wiring the signer therefore wants servers updated first.
+  another file or batch), an unsigned batch where editors must sign (`EditorKeys::required_at`, by
+  the batch's sequence number), or a device that isn't an editor's **ends the session** with the
+  reason (`BatchRefused`: "…wasn't signed by an editor…", "…signed by a device that isn't one of
+  its editors' (yet)…", "…has a signature that doesn't hold…"). Ending rather than skipping: two
+  apps' lists of editors can differ for a moment, and skipping on one and not the other would leave
+  their copies different. A device the list doesn't know is fetched for once first
+  (`EditorKeys::refresh`: an editor added a second ago), then refused.
+
+**Who signs, and the editors' list (step 11).** On a server with accounts:
+
+- `AccountReq::EditorKeys { file }` → `AccountReply::EditorKeys { signed_from: Option<u64>, editors:
+  Vec<EditorDevice { account, device, public, recovery }> }`: every registered device of the
+  file's owners and editors (revoked ones are gone from the registry, so they are left out; the
+  recovery device is listed like the others, so the numbers below match). Any member may ask
+  (viewers check signatures too); others, and plain files, get `Failed`.
+- **The capability.** Only servers from step 11 answer `EditorKeys` (a step 9 or 10 server can't
+  read the request and drops the connection), and those read signed batches. So the transport
+  asks it before a sealed session connects (`join::prepare_signing`, for the join of a member's
+  link and the join after a sealed publish, signed in, with this device registered there) and signs
+  **only when the answer lists this device**; without an answer it sends unsigned batches and takes
+  any intact signature or none, exactly as before. An app therefore never sends a signed batch to
+  a server that can't read it.
+- **The device key** comes from the engine: `LiveLink::device_key(server, Some(DeviceKeys))`,
+  handed to the link with the sign-ins (`share_sign_ins`) and whenever the device registers (or is
+  found registered) with a server (`device_id`). `collab.publish` signed in registers the device
+  first, so a sealed file's first session signs. `NetLink` keeps the keys per server and builds a
+  `MemberEditors` (`crates/collab-net/src/editors.rs`) for each join on a server where you are
+  signed in.
+- **Fetched again** when people or roles change (`collab.invite`, `collab.setRole`,
+  `collab.removeMember` → `LiveLink::editors_changed(server)`), at every key sync (`account.syncKeys`,
+  in the background every minute), and once for an unknown signer before its batch is refused.
+  Each answer goes to the engine as `Event::Editors` (safety numbers, below).
+
+**Signatures required: the rule.** The server marks a sealed file `signed_from = <its latest
+sequence number>` (`meta.json`) the first time `EditorKeys` is asked for it (only apps that sign
+ask) **while every owner and editor has a registered device** (a recovery device doesn't count).
+For a file published by such an app that is at once, at sequence 0. From then on:
+
+1. Every app requires every batch numbered above `signed_from` to be signed by a listed device;
+   batches before it (made by apps that didn't sign) are taken as they are.
+2. The server refuses an unsigned batch to that file before the session takes it
+   (`hub::UNSIGNED`: "this encrypted file takes only changes signed by its editors' devices: update
+   FigCraft…"), so an app from before step 11 can't end everyone else's session; it can still
+   view the file.
+3. Only members with the owner or editor role may edit it: a share link (on `accounts+links`) or
+   an admin who isn't in the file joins view-only. Their batches couldn't be signed by an editor's
+   device, so the apps would refuse them anyway.
+
+The mark is never taken back (a later editor's app registers its device when it first joins).
+
+**Links-mode sealed files stay unsigned.** Without accounts there is no registry of who edits:
+whoever holds an edit link (`#k=`) edits, and there is no identity to bind a device key to. Such
+sessions keep `AnyEditor` (intact signatures or none are taken) and send unsigned batches; the
+same goes for a share link to a sealed file on an `accounts+links` server joined without being a
+member (the app can't ask the server for the editors).
+
+**What is enforced now.** Against a viewer (or anyone holding the key who isn't an editor's
+device) working with a compromised server: their forged batches, live and in a reconnect's
+catch-up, end every member app's session with the reason, signed with their own device or
+unsigned. A revoked device's batches are refused once the apps fetched the editors again (the
+next sync, or at once for a device they no longer list). **Not enforced**: the snapshot a joining
+app opens (see *What sealing doesn't protect against*), and links-mode files.
+
+The end-to-end tests are `apps/figcraft-server/src/signatures_tests.rs` (a real server with a fake
+identity provider: owner and editor sign, an app that doesn't sign is refused by the server, a
+share link only views, an editor added later is taken after the refresh, a revoked device's batch
+ends the sessions that see it, and a viewer's forged batches, signed or not, are refused by the
+apps when a server patched in the test passes them on); `sealing_tests.rs` (`crates/collab-net`)
+covers `MemberEditors`.
 
 ### Safety numbers (built, step 10)
 
@@ -344,11 +399,20 @@ and each device's public keys (agreement ‖ signing), sorted, duplicates once. 
 the number for one person's devices out of band (in person, on a call): if a server slipped in a
 device of its own, the numbers differ.
 
-`account.safetyNumber {server?}` → `{server, safetyNumber, devices}`: the number of the devices the
-server lists for you (`AccountReq::Devices`, the recovery device included), the same on each of
-your devices. **Not built**: another person's number (`account?`, refused for now: the server
-doesn't list someone else's devices) and key-change warnings (a member's devices changed since you
-last saw them), which both need that listing.
+`account.safetyNumber {server?, account?}` → `{server, account, you, safetyNumber, devices,
+changed}`: the number of the devices the server lists for someone: you (`AccountReq::Devices`, the
+recovery device included; the same on each of your devices) or, step 11, someone who shares a file
+with you (`AccountReq::DevicesOf { account }` → `AccountReply::Devices`; the server refuses others).
+Both people see the same number for the same devices.
+
+**Key-change warnings (step 11).** The engine remembers the number it last saw for each (server,
+account) in the preferences (`device.seen`: `[{server, account, number}]`, at most 1000), from
+`account.safetyNumber` and from each editors' list a session fetched (`Event::Editors`: one number
+per owner or editor from their listed devices). The first number seen is trusted; a different one
+later is a **key change**: `account.status` lists it (`keyChanges: [{server, account, was, now}]`)
+and the app's message says "The devices of someone in an encrypted file changed…: compare safety
+numbers". Looking at that person's number (`account.safetyNumber {account}`) clears it
+(`changed: true` that once). The list of changes lasts for the run; the numbers last.
 
 ### Edges (built, step 10)
 
@@ -367,12 +431,13 @@ last saw them), which both need that listing.
 
 - A hostile server can drop, delay, reorder or roll back edits, replay an editor's signed batch
   later, refuse service, or hand out a fake device key when someone is added (or add one to your
-  account). Safety numbers let people catch that by comparing out of band, but only for your own
-  devices so far (`account.safetyNumber`); nobody is warned when a key changes.
+  account). Safety numbers let people catch that by comparing out of band (`account.safetyNumber`,
+  yours or anyone's you share a file with), and apps say when someone's devices changed since they
+  last saw them; the first devices an app sees of someone are trusted until compared.
 - **Forged edits.** Viewers hold the file key, so a viewer working with a compromised server can
-  seal changes. Editor signatures stop forged *batches* (live and in catch-ups) once apps sign and
-  check against the editors' devices, which isn't wired yet (see *Editor signatures*): **today
-  apps take unsigned batches and nothing stops such a viewer.** Even then, **a snapshot isn't signed**: an app that
+  seal changes. Editor signatures stop forged *batches* (live and in catch-ups) on servers with
+  accounts (see *Editor signatures*); links-mode files have no list of editors, so there a viewer
+  working with the server can still forge. And **a snapshot isn't signed**: an app that
   joins (or rejoins after a long time away) opens the server's merged copy, and a compromised
   server working with a viewer can put forged values there. Signing each sealed value instead of
   each batch would close that; it isn't built.
@@ -624,7 +689,7 @@ key).
 | `account.recoveryKey {server?, replace?}` | `{server, created: true, device, recoveryKey, wrapped}` or `{server, created: false, device, made}` |
 | `account.recover {server?, recoveryKey}` | `{server, device, recovered, files: [file]}` |
 | `account.syncKeys {server? \| all?}` | `{server, wrapped, rotated, refreshed, joined, errors}` (`all`: `{servers: […]}`) |
-| `account.safetyNumber {server?}` (step 10) | `{server, safetyNumber, devices}` |
+| `account.safetyNumber {server?, account?}` (steps 10, 11) | `{server, account, you, safetyNumber, devices, changed}` |
 
 **What the UI should show.** In the account panel: your devices (`account.devices`, this one
 marked, the recovery device as "Recovery key"), each with Revoke; a warning when `keyStore` is
@@ -638,7 +703,7 @@ syncing (it is silent; its errors are logged).
 
 **Limits.** A revoked device's sessions aren't ended by the server (sessions are per person, not
 per device): sign it out too. A hostile server can still hand out a fake device key when someone
-is added (safety numbers, step 10, let people check; key-change warnings aren't built). Until a member's app has synced, the writes of
+is added (safety numbers let people check, and apps warn when someone's devices change). Until a member's app has synced, the writes of
 members who haven't picked up a new epoch are sealed with the old one (readable by the person
 taken out, should they get the server's data).
 
@@ -676,6 +741,7 @@ members and keyrings and builds the providers from its config.
 9. **Built**: sealed files with accounts: keyrings, invites, devices, recovery (device approval
    with a 6-digit comparison not yet).
 10. **Built**: edges (sealed team libraries, CLI and MCP) and hardening (the same versioned value
-    rules in every app, editor signatures behind `EditorKeys`, safety numbers). Not yet: the app
-    signing its batches and requiring editors' signatures (it needs a way to list the editors'
-    devices, and every server to read signed batches), key-change warnings.
+    rules in every app, editor signatures behind `EditorKeys`, safety numbers).
+11. **Built**: signatures switched on for sealed files on servers with accounts (`EditorKeys`,
+    signing and checking in the app, files that require signatures), other people's safety
+    numbers and key-change warnings.

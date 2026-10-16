@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use figcraft_collab::message::{AccountReply, AccountReq, DeviceInfo, PendingFile};
+use figcraft_collab::message::{AccountReply, AccountReq, DeviceInfo, EditorDevice, PendingFile};
 use figcraft_collab_seal::{DeviceKeys, FileKey, Keyring, RecoveryKey, parse_ring_fragment, ring_fragment, unwrap, wrap};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -56,6 +56,9 @@ pub const NEW_EPOCH: &str = "This file's key changed (someone was taken out of i
 
 /// What a join says when a change came with a key epoch that the file's keyring doesn't have.
 pub const NO_SUCH_EPOCH: &str = "A change in this file is sealed with a key the file doesn't have (someone sent damaged changes): ask its owner";
+
+/// What the app says when someone's devices changed.
+pub const KEY_CHANGED: &str = "The devices of someone in an encrypted file changed (a new device, or one the server added): compare safety numbers with them (account.status lists who)";
 
 /// How often keys are synced in the background (`account.syncKeys`).
 pub const SYNC_EVERY: Duration = Duration::from_secs(60);
@@ -104,7 +107,33 @@ pub struct DevicePrefs {
     /// The servers it is registered with.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub registered: Vec<Registered>,
+    /// The safety number last seen of each person's devices, by server and account: a different
+    /// one is a key change ([`KeyChange`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub seen: Vec<SeenNumber>,
 }
+
+/// The safety number of someone's devices on a server, as this app last saw it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SeenNumber {
+    pub server: String,
+    pub account: String,
+    pub number: String,
+}
+
+/// Someone's devices changed since this app last saw them (this run): their safety number went
+/// from `was` to `now`. A new device of theirs, or one a server slipped in: compare numbers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyChange {
+    pub server: String,
+    pub account: String,
+    pub was: String,
+    pub now: String,
+}
+
+/// Most safety numbers remembered.
+const MAX_SEEN: usize = 1000;
 
 impl std::fmt::Debug for DevicePrefs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -114,7 +143,7 @@ impl std::fmt::Debug for DevicePrefs {
 
 impl DevicePrefs {
     pub fn is_empty(&self) -> bool {
-        self.name.is_empty() && self.secret.is_empty() && self.registered.is_empty()
+        self.name.is_empty() && self.secret.is_empty() && self.registered.is_empty() && self.seen.is_empty()
     }
 }
 
@@ -131,6 +160,8 @@ pub(crate) fn read<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Devic
     }
     p.registered.retain(|r| r.server.len() <= 512 && r.device.len() <= 64 && r.public.len() <= 64 && !r.server.is_empty());
     p.registered.truncate(MAX_REGISTERED);
+    p.seen.retain(|n| n.server.len() <= 512 && n.account.len() <= 128 && n.number.len() <= 32);
+    p.seen.truncate(MAX_SEEN);
     Ok(p)
 }
 
@@ -163,11 +194,22 @@ pub struct KeyState {
     rotations: Vec<((String, String, u32), FileKey)>,
     /// When the next background sync is due.
     next_sync: Option<web_time::Instant>,
+    /// Whose devices changed this run (`account.status` › `keyChanges`).
+    pub changes: Vec<KeyChange>,
 }
 
 impl Default for KeyState {
     fn default() -> Self {
-        Self { keychain: None, sync_every: SYNC_EVERY, device: None, store: None, waiting: Vec::new(), rotations: Vec::new(), next_sync: None }
+        Self {
+            keychain: None,
+            sync_every: SYNC_EVERY,
+            device: None,
+            store: None,
+            waiting: Vec::new(),
+            rotations: Vec::new(),
+            next_sync: None,
+            changes: Vec::new(),
+        }
     }
 }
 
@@ -297,7 +339,9 @@ impl Session {
         let public = public_text(&keys)?;
         let server = server_key(server);
         if let Some(r) = self.prefs.device.registered.iter().find(|r| r.server == server && r.public == public) {
-            return Ok(r.device.clone());
+            let id = r.device.clone();
+            self.hand_device_key(&server, keys);
+            return Ok(id);
         }
         let name = if self.prefs.device.name.trim().is_empty() { computer_name() } else { self.prefs.device.name.clone() };
         let req = AccountReq::RegisterDevice { name, public: keys.public().map_err(other)?, recovery: false };
@@ -306,10 +350,89 @@ impl Session {
             _ => return Err(other("the server answered something else")),
         };
         self.prefs.device.registered.retain(|r| r.server != server);
-        self.prefs.device.registered.insert(0, Registered { server, device: id.clone(), public });
+        self.prefs.device.registered.insert(0, Registered { server: server.clone(), device: id.clone(), public });
         self.prefs.device.registered.truncate(MAX_REGISTERED);
         self.live.unsaved = true;
+        self.hand_device_key(&server, keys);
         Ok(id)
+    }
+
+    /// Tell the link this device's keys for `server`, where it is registered: its sessions of
+    /// sealed files there sign their batches (once the server lists the device as an editor's).
+    fn hand_device_key(&mut self, server: &str, keys: DeviceKeys) {
+        if let Some(link) = self.live.link() {
+            link.device_key(server, Some(keys));
+        }
+    }
+
+    /// Tell the link this device's keys for every server it is registered with and you are
+    /// signed in to (before it joins or publishes, with the sign-ins).
+    pub(crate) fn share_device_keys(&mut self) {
+        let servers: Vec<String> = self
+            .prefs
+            .device
+            .registered
+            .iter()
+            .filter(|r| self.prefs.accounts.iter().any(|a| a.server == r.server))
+            .map(|r| r.server.clone())
+            .collect();
+        if servers.is_empty() {
+            return;
+        }
+        let Ok(keys) = self.device_keys() else { return };
+        let Ok(public) = public_text(&keys) else { return };
+        for server in servers {
+            if self.prefs.device.registered.iter().any(|r| r.server == server && r.public == public) {
+                self.hand_device_key(&server, keys.clone());
+            }
+        }
+    }
+
+    /// People or roles changed in a file on `server`: its sealed sessions fetch their editors
+    /// again.
+    pub(crate) fn editors_changed(&mut self, server: &str) {
+        if let Some(link) = self.live.link() {
+            link.editors_changed(&server_key(server));
+        }
+    }
+
+    /// Someone's devices as seen now (`number`, their safety number): remembered, and a key
+    /// change when it isn't what was seen before (the number seen before).
+    fn seen_number(&mut self, server: &str, account: &str, number: &str) -> Option<String> {
+        let server = server_key(server);
+        let found = self.prefs.device.seen.iter_mut().find(|n| n.server == server && n.account == account);
+        let was = match found {
+            Some(n) if n.number == number => return None,
+            Some(n) => Some(std::mem::replace(&mut n.number, number.to_string())),
+            None => {
+                self.prefs.device.seen.insert(0, SeenNumber { server: server.clone(), account: account.to_string(), number: number.to_string() });
+                self.prefs.device.seen.truncate(MAX_SEEN);
+                None
+            }
+        };
+        self.live.unsaved = true;
+        let was = was?;
+        log::info!("devices: the devices of account {account} on {server} changed");
+        self.keys.changes.retain(|c| !(c.server == server && c.account == account));
+        self.keys.changes.push(KeyChange { server, account: account.to_string(), was: was.clone(), now: number.to_string() });
+        Some(was)
+    }
+
+    /// A session's server listed the editors of sealed `file` ([`crate::live::Event::Editors`]):
+    /// whose devices changed since last seen.
+    pub(crate) fn editors_seen(&mut self, server: &str, file: &str, editors: &[EditorDevice]) {
+        let mut by: BTreeMap<&str, Vec<figcraft_collab::sealed::DevicePublic>> = BTreeMap::new();
+        for e in editors {
+            by.entry(e.account.as_str()).or_default().push(e.public.clone());
+        }
+        let mut changed = false;
+        for (account, keys) in by {
+            changed |= self.seen_number(server, account, &figcraft_collab_seal::safety_number(&keys)).is_some();
+        }
+        if changed {
+            log::info!("devices: editors of file {file} have new devices");
+            self.message = Some(KEY_CHANGED.into());
+        }
     }
 
     /// Keep `ring` as `file`'s keys on `server` (every epoch held: links, names, the next join).
@@ -369,7 +492,19 @@ impl Session {
         let plain = |s: &Session| Ok(JoinKeys::Link(s.link_with_key(link)));
         let member = !link.contains('#') && !member_free(link);
         let Some((server, file)) = server_of(link).zip(link_file(link).map(str::to_string)) else { return plain(self) };
-        if !member || self.signed_in(&server).is_none() {
+        if self.signed_in(&server).is_none() {
+            return plain(self);
+        }
+        if !member {
+            // A member's link with the key in it (the owner's, or one passed on): this device
+            // registered first, so its batches can be signed as an editor's.
+            if crate::file_keys::sealed_link(link) && !member_free(link) {
+                match self.device_id(cmd, &server) {
+                    Ok(_) => {}
+                    Err(EngineError::Waiting) => return Err(EngineError::Waiting),
+                    Err(e) => log::info!("devices: not registered with {server} before joining: {e}"),
+                }
+            }
             return plain(self);
         }
         match self.file_ring(cmd, &server, &file) {
@@ -585,6 +720,8 @@ impl Session {
                 Err(e) => out.errors.push(format!("{}: {e}", w.file)),
             }
         }
+        // Roles may have changed meanwhile: the sealed sessions here check who edits again.
+        self.editors_changed(server);
         Ok(out)
     }
 
@@ -656,21 +793,41 @@ fn devices(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
-/// The safety number of your devices on a server (`figcraft_collab_seal::safety_number`, step 10):
-/// what you read out to someone checking that the devices the server lists for you are yours.
+/// The safety number of your devices on a server, or of someone who shares a file with you
+/// (`figcraft_collab_seal::safety_number`, step 10): what you read out to someone checking that the
+/// devices the server lists for you are yours, or compare with them for theirs. Seeing it is also
+/// what clears a key change for that person.
 fn safety_number(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "account.safetyNumber";
     let server = s.account_server(CMD, p)?;
-    if string(p, "account").is_some() {
-        return Err(bad(CMD, "only your own devices' number for now: the server doesn't list another person's devices yet"));
-    }
+    let me =
+        s.signed_in(&server).map(|a| a.account.clone()).ok_or_else(|| bad(CMD, "you aren't signed in to this server: `account.signIn` first"))?;
+    let account = string(p, "account").filter(|a| !a.trim().is_empty()).unwrap_or_else(|| me.clone());
     s.device_id(CMD, &server)?;
-    let list = match s.account_request(CMD, &server, AccountReq::Devices)? {
+    let req = if account == me { AccountReq::Devices } else { AccountReq::DevicesOf { account: account.clone() } };
+    let list = match s.account_request(CMD, &server, req)? {
         AccountReply::Devices(l) => l,
         _ => return Err(other("the server answered something else")),
     };
     let keys: Vec<_> = list.iter().map(|d| d.public.clone()).collect();
-    Ok(json!({"server": server, "safetyNumber": figcraft_collab_seal::safety_number(&keys), "devices": list.len()}))
+    let number = figcraft_collab_seal::safety_number(&keys);
+    let was = s.seen_number(&server, &account, &number);
+    let changed = was.is_some() || s.keys.changes.iter().any(|c| c.server == server && c.account == account);
+    // Seen now: no longer a change to warn about.
+    s.keys.changes.retain(|c| !(c.server == server && c.account == account));
+    Ok(json!({
+        "server": server,
+        "account": account,
+        "you": account == me,
+        "safetyNumber": number,
+        "devices": list.len(),
+        "changed": changed,
+    }))
+}
+
+/// Whose devices changed this run, for `account.status`.
+pub(crate) fn key_changes_json(s: &Session) -> Value {
+    Value::Array(s.keys.changes.iter().map(|c| json!({"server": c.server, "account": c.account, "was": c.was, "now": c.now})).collect())
 }
 
 fn revoke_device(s: &mut Session, p: &Value) -> Result<Value> {
@@ -842,7 +999,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "account.safetyNumber",
             "Safety number",
-            "{server?} → {server, safetyNumber (12 digits, \"1234 5678 9012\"), devices (how many it covers)}: a short number for the devices registered for you on a server with accounts (recovery device included). Read it out to someone who checks it the same way: a device the server added without you changes it",
+            "{server?, account? (someone who shares a file with you; default you)} → {server, account, you, safetyNumber (12 digits, \"1234 5678 9012\"), devices (how many it covers), changed (their devices changed since this app last saw them)}: a short number for the devices registered for someone on a server with accounts (recovery device included). Compare it with them (in person, on a call): a device the server added without them changes it. Seeing it clears the key change `account.status` lists",
             false,
             safety_number
         ),
